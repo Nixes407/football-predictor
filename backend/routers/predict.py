@@ -22,6 +22,8 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from scipy.stats import poisson
+import subprocess
+import sys
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -406,4 +408,95 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         "feature_vector_used": {
             k: round(v, 4) for k, v in vector.items()
         },
+    }
+
+
+@router.post("/admin/run-pipeline")
+def run_pipeline(secret: str = "") -> dict:
+    """
+    Trigger the full data pipeline remotely.
+    Runs collector -> builder -> trainer in sequence.
+    Protected by a secret key set in environment.
+
+    Call with:
+    POST /predict/admin/run-pipeline?secret=YOUR_SECRET
+    """
+    import os
+
+    expected = os.getenv("PIPELINE_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or missing secret key."
+        )
+
+    backend_dir = str(BACKEND_DIR)
+    steps = [
+        ("collector", ["python", "data/collector.py"]),
+        ("builder",   ["python", "features/builder.py"]),
+        ("trainer",   ["python", "models/trainer.py"]),
+    ]
+
+    results = {}
+    for name, cmd in steps:
+        print(f"[pipeline] Starting {name}...")
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=backend_dir,
+                capture_output=True,
+                text=True,
+                timeout=3600,
+            )
+            success = proc.returncode == 0
+            results[name] = {
+                "success": success,
+                "returncode": proc.returncode,
+                "stdout_tail": proc.stdout[-2000:] if proc.stdout else "",
+                "stderr_tail": proc.stderr[-1000:] if proc.stderr else "",
+            }
+            print(f"[pipeline] {name} finished "
+                  f"(returncode={proc.returncode})")
+            if not success:
+                results["stopped_at"] = name
+                results["error"] = f"{name} failed"
+                return results
+        except subprocess.TimeoutExpired:
+            results[name] = {"success": False, "error": "timeout"}
+            results["stopped_at"] = name
+            return results
+        except Exception as exc:
+            results[name] = {"success": False, "error": str(exc)}
+            results["stopped_at"] = name
+            return results
+
+    load_artifacts()
+    results["artifacts_reloaded"] = True
+    results["status"] = "pipeline complete"
+    return results
+
+
+@router.get("/admin/status")
+def pipeline_status() -> dict:
+    """
+    Check which artifacts are currently loaded.
+    No secret required — read only.
+    """
+    return {
+        "result_model":  _result_model  is not None,
+        "home_goals":    _home_goals    is not None,
+        "away_goals":    _away_goals    is not None,
+        "home_corners":  _home_corners  is not None,
+        "away_corners":  _away_corners  is not None,
+        "le_league":     _le_league     is not None,
+        "le_season":     _le_season     is not None,
+        "features_df":   _features_df   is not None,
+        "features_rows": len(_features_df) if _features_df is not None else 0,
+        "ready": all([
+            _result_model is not None,
+            _home_goals   is not None,
+            _away_goals   is not None,
+            _home_corners is not None,
+            _away_corners is not None,
+        ]),
     }
