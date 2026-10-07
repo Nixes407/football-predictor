@@ -435,3 +435,213 @@ def train_result_model(
         "n_test": int(len(X_test)),
     }
     return results
+
+
+def train_count_model(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    target_col: str,
+    model_name: str,
+    model_dir: str = "models",
+) -> dict:
+    """
+    Train a Poisson regression model for a single
+    count target (goals or corners).
+
+    target_col is one of:
+        "target_home_goals"
+        "target_away_goals"
+        "target_home_corners"
+        "target_away_corners"
+
+    model_name is the filename stem e.g. "home_goals_v1"
+    Saved to {model_dir}/{model_name}.joblib
+    """
+    print(f"[trainer] Target: {target_col}")
+
+    def _extract_count_xy(
+        df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        if df is None or len(df) == 0:
+            return (
+                pd.DataFrame(columns=FEATURE_COLS),
+                pd.Series(dtype=float),
+            )
+        missing = [c for c in FEATURE_COLS if c not in df.columns]
+        if missing:
+            print(f"[trainer] WARNING: missing feature cols: {missing}")
+        usable = [c for c in FEATURE_COLS if c in df.columns]
+        if target_col not in df.columns:
+            print(f"[trainer] WARNING: target '{target_col}' not found")
+            return df[usable].copy(), pd.Series(dtype=float)
+        y_raw = pd.to_numeric(df[target_col], errors="coerce")
+        mask = y_raw.notna()
+        dropped = int((~mask).sum())
+        if dropped:
+            print(f"[trainer] Dropped {dropped} null rows in {target_col}")
+        return df.loc[mask, usable].copy(), y_raw[mask].astype(float)
+
+    def _poisson_deviance(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+    ) -> float:
+        y_pred = np.clip(y_pred, 0.01, None)
+        y_true = np.asarray(y_true, dtype=float)
+        dev = 2.0 * np.mean(
+            y_pred - y_true - y_true * np.log(y_pred / (y_true + 1e-8))
+        )
+        return float(dev)
+
+    def _evaluate_count(
+        pipeline: Pipeline,
+        X: pd.DataFrame,
+        y: pd.Series,
+        split_name: str,
+    ) -> dict:
+        if len(X) == 0:
+            print(f"[trainer] {split_name}: no rows to evaluate")
+            return {}
+        y_pred = pipeline.predict(X)
+        y_arr = np.asarray(y, dtype=float)
+        mae = float(mean_absolute_error(y_arr, y_pred))
+        rmse = float(np.sqrt(mean_squared_error(y_arr, y_pred)))
+        dev = _poisson_deviance(y_arr, y_pred)
+        print(f"[trainer] --- {split_name} ({len(X)} rows) ---")
+        print(f"[trainer]   MAE            : {mae:.4f}")
+        print(f"[trainer]   RMSE           : {rmse:.4f}")
+        print(f"[trainer]   Poisson dev    : {dev:.4f}")
+        return {
+            "rows": len(X),
+            "mae": mae,
+            "rmse": rmse,
+            "poisson_deviance": dev,
+        }
+
+    # --- Extract splits ---
+    X_train, y_train = _extract_count_xy(train_df)
+    X_val,   y_val   = _extract_count_xy(val_df)
+    X_test,  y_test  = _extract_count_xy(test_df)
+    print(
+        f"[trainer] Sizes -> train={len(X_train)} "
+        f"val={len(X_val)} test={len(X_test)}"
+    )
+
+    if len(X_train) == 0:
+        print("[trainer] ERROR: no training rows, aborting")
+        return {}
+
+    # --- Fit on train ---
+    print("[trainer] Fitting on TRAIN...")
+    pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler",  StandardScaler()),
+        ("model",   PoissonRegressor(alpha=1.0, max_iter=300)),
+    ])
+    pipeline.fit(X_train, y_train)
+
+    # --- Validate ---
+    print("[trainer] Evaluating on VALIDATION...")
+    val_metrics = _evaluate_count(pipeline, X_val, y_val, "VALIDATION")
+
+    # --- Refit on train + val ---
+    print("[trainer] Refitting on TRAIN + VALIDATION...")
+    X_tv = pd.concat([X_train, X_val], axis=0)
+    y_tv = pd.concat([y_train, y_val], axis=0)
+    final_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler",  StandardScaler()),
+        ("model",   PoissonRegressor(alpha=1.0, max_iter=300)),
+    ])
+    final_pipeline.fit(X_tv, y_tv)
+
+    # --- Test (once, locked) ---
+    print("[trainer] Evaluating ONCE on TEST...")
+    test_metrics = _evaluate_count(
+        final_pipeline, X_test, y_test, "TEST")
+
+    # --- Save ---
+    model_path = Path(model_dir) / f"{model_name}.joblib"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(final_pipeline, model_path)
+    print(f"[trainer] Saved -> {model_path}")
+
+    return {
+        **test_metrics,
+        "val_mae": val_metrics.get("mae"),
+        "val_rmse": val_metrics.get("rmse"),
+        "val_poisson_deviance": val_metrics.get("poisson_deviance"),
+        "model_path": str(model_path),
+        "target": target_col,
+    }
+
+
+def train_all_models(
+    features_path: str = "data/processed/features.csv",
+    model_dir: str = "models",
+) -> dict:
+    """
+    Full training pipeline. Trains all models in order:
+      1. 1X2 result classifier
+      2. Home goals Poisson
+      3. Away goals Poisson
+      4. Home corners Poisson
+      5. Away corners Poisson
+
+    Returns a summary dict of all model results.
+    Validation controls all choices.
+    Test is evaluated exactly once per model.
+    """
+    print("=" * 60)
+    print("FOOTBALL PREDICTOR — MODEL TRAINING")
+    print("=" * 60)
+
+    Path(model_dir).mkdir(parents=True, exist_ok=True)
+
+    df = load_features(features_path)
+    if df.empty:
+        print("[trainer] ERROR: no features. Run builder.py first.")
+        return {}
+
+    missing = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing:
+        print(f"[trainer] ERROR: missing feature columns: {missing}")
+        return {}
+
+    train_df, val_df, test_df = chronological_split(df)
+
+    results = {}
+
+    print("\n--- 1X2 RESULT MODEL ---")
+    results["result"] = train_result_model(
+        train_df, val_df, test_df, model_dir)
+
+    count_targets = [
+        ("target_home_goals",   "home_goals_v1"),
+        ("target_away_goals",   "away_goals_v1"),
+        ("target_home_corners", "home_corners_v1"),
+        ("target_away_corners", "away_corners_v1"),
+    ]
+    for target_col, model_name in count_targets:
+        print(f"\n--- {model_name.upper()} ---")
+        results[model_name] = train_count_model(
+            train_df, val_df, test_df,
+            target_col, model_name, model_dir,
+        )
+
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETE — SUMMARY")
+    print("=" * 60)
+    for name, metrics in results.items():
+        if not metrics:
+            continue
+        print(f"\n{name}:")
+        for k, v in metrics.items():
+            if k != "model_path":
+                print(f"  {k}: {v}")
+
+    return results
+
+
+if __name__ == "__main__":
+    train_all_models()
