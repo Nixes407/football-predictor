@@ -41,6 +41,11 @@ async def lifespan(app: FastAPI):
     print(f"  CORS allowed origins    : {', '.join(ALLOWED_ORIGINS)}")
     print("  Docs available at       : /docs")
     print("=" * 60)
+
+    from database import init_db
+
+    init_db()
+
     yield
     print("Football Predictor API is shutting down...")
 
