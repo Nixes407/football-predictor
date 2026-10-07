@@ -239,6 +239,11 @@ def _build_feature_vector(
             vector[col] = float(league_encoded)
         elif col == "season_encoded":
             vector[col] = float(season_encoded)
+        elif col == "elo_difference":
+            vector[col] = (
+                home_feats.get("home_elo", 0.0)
+                - away_feats.get("away_elo", 0.0)
+            )
         elif col in home_feats:
             vector[col] = home_feats[col]
         elif col in away_feats:
