@@ -9,8 +9,11 @@ from __future__ import annotations
 import os
 import sys
 
+import joblib
 import numpy as np
 import pandas as pd
+from pathlib import Path
+from sklearn.preprocessing import LabelEncoder
 from sqlalchemy import text
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -213,3 +216,231 @@ def compute_elo_features(
         "away_elo":       away_elo,
         "elo_difference": home_elo - away_elo,
     }
+
+
+def build_features(
+    df: pd.DataFrame,
+    elo_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Build one feature row per match in df.
+
+    df     = full matches DataFrame (all columns from DB).
+    elo_df = full elo_ratings DataFrame (optional).
+
+    STRICT RULE: all rolling windows and h2h lookups
+    use only matches with date strictly less than the
+    current row date. No data leakage of any kind.
+    """
+    if elo_df is None:
+        elo_df = pd.DataFrame()
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # Drop rows with no date or no result — cannot be trained on
+    df = df.dropna(subset=["date", "result"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    rows = []
+    total = len(df)
+
+    for i, row in df.iterrows():
+        if i % 500 == 0:
+            print(f"[builder] Processing row {i}/{total}...")
+
+        date      = row["date"]
+        home_team = row["home_team"]
+        away_team = row["away_team"]
+
+        hf5  = compute_team_rolling_form(
+            df, home_team, date, window=5,  venue="all")
+        hf10 = compute_team_rolling_form(
+            df, home_team, date, window=10, venue="all")
+        hh5  = compute_team_rolling_form(
+            df, home_team, date, window=5,  venue="home")
+        af5  = compute_team_rolling_form(
+            df, away_team, date, window=5,  venue="all")
+        af10 = compute_team_rolling_form(
+            df, away_team, date, window=10, venue="all")
+        aa5  = compute_team_rolling_form(
+            df, away_team, date, window=5,  venue="away")
+        h2h  = compute_h2h(df, home_team, away_team, date)
+        elo  = compute_elo_features(
+            elo_df, home_team, away_team, date)
+
+        feat = {
+            # Home form 5
+            "home_form_wins_5":      hf5["wins"],
+            "home_form_draws_5":     hf5["draws"],
+            "home_form_losses_5":    hf5["losses"],
+            "home_form_points_5":    hf5["points"],
+            "home_form_gf_5":        hf5["gf"],
+            "home_form_ga_5":        hf5["ga"],
+            "home_form_gd_5":        hf5["gd"],
+            "home_form_shots_5":     hf5["shots"],
+            "home_form_shots_ot_5":  hf5["shots_ot"],
+            "home_form_corners_5":   hf5["corners"],
+
+            # Home form 10
+            "home_form_wins_10":     hf10["wins"],
+            "home_form_draws_10":    hf10["draws"],
+            "home_form_losses_10":   hf10["losses"],
+            "home_form_points_10":   hf10["points"],
+            "home_form_gf_10":       hf10["gf"],
+            "home_form_ga_10":       hf10["ga"],
+            "home_form_gd_10":       hf10["gd"],
+
+            # Home at home 5
+            "home_home_wins_5":      hh5["wins"],
+            "home_home_draws_5":     hh5["draws"],
+            "home_home_losses_5":    hh5["losses"],
+            "home_home_points_5":    hh5["points"],
+            "home_home_gf_5":        hh5["gf"],
+            "home_home_ga_5":        hh5["ga"],
+            "home_home_gd_5":        hh5["gd"],
+            "home_home_shots_5":     hh5["shots"],
+            "home_home_corners_5":   hh5["corners"],
+
+            # Away form 5
+            "away_form_wins_5":      af5["wins"],
+            "away_form_draws_5":     af5["draws"],
+            "away_form_losses_5":    af5["losses"],
+            "away_form_points_5":    af5["points"],
+            "away_form_gf_5":        af5["gf"],
+            "away_form_ga_5":        af5["ga"],
+            "away_form_gd_5":        af5["gd"],
+            "away_form_shots_5":     af5["shots"],
+            "away_form_shots_ot_5":  af5["shots_ot"],
+            "away_form_corners_5":   af5["corners"],
+
+            # Away form 10
+            "away_form_wins_10":     af10["wins"],
+            "away_form_draws_10":    af10["draws"],
+            "away_form_losses_10":   af10["losses"],
+            "away_form_points_10":   af10["points"],
+            "away_form_gf_10":       af10["gf"],
+            "away_form_ga_10":       af10["ga"],
+            "away_form_gd_10":       af10["gd"],
+
+            # Away at away 5
+            "away_away_wins_5":      aa5["wins"],
+            "away_away_draws_5":     aa5["draws"],
+            "away_away_losses_5":    aa5["losses"],
+            "away_away_points_5":    aa5["points"],
+            "away_away_gf_5":        aa5["gf"],
+            "away_away_ga_5":        aa5["ga"],
+            "away_away_gd_5":        aa5["gd"],
+            "away_away_shots_5":     aa5["shots"],
+            "away_away_corners_5":   aa5["corners"],
+
+            # Elo
+            "home_elo":              elo["home_elo"],
+            "away_elo":              elo["away_elo"],
+            "elo_difference":        elo["elo_difference"],
+
+            # H2H
+            "h2h_home_wins_5":       h2h["home_wins"],
+            "h2h_draws_5":           h2h["draws"],
+            "h2h_away_wins_5":       h2h["away_wins"],
+            "h2h_home_gf_5":         h2h["home_gf"],
+            "h2h_away_gf_5":         h2h["away_gf"],
+
+            # Targets (never filled with 0)
+            "target_result":         row.get("result"),
+            "target_home_goals":     row.get("home_goals"),
+            "target_away_goals":     row.get("away_goals"),
+            "target_home_corners":   row.get("home_corners"),
+            "target_away_corners":   row.get("away_corners"),
+
+            # Meta (kept for chronological splitting later)
+            "date":      date,
+            "league":    row.get("league"),
+            "season":    row.get("season"),
+            "home_team": home_team,
+            "away_team": away_team,
+        }
+
+        rows.append(feat)
+
+    out = pd.DataFrame(rows)
+
+    # Fill NaN only in feature columns — never in targets or meta
+    feature_cols = [
+        c for c in out.columns
+        if c.startswith(("home_form_", "away_form_",
+                         "home_home_", "away_away_",
+                         "elo_", "h2h_",
+                         "home_elo", "away_elo"))
+    ]
+    out[feature_cols] = out[feature_cols].fillna(0)
+
+    print(
+        f"[builder] Built {len(out)} feature rows, "
+        f"{len(feature_cols)} feature columns"
+    )
+    return out
+
+
+def build_and_save_features(
+    output_path: str = "data/processed/features.csv",
+) -> pd.DataFrame:
+    """
+    Full pipeline: load from DB -> build features ->
+    encode league/season -> save CSV and encoders.
+
+    Run this once after data collection completes.
+    Encoders are saved so prediction time reuses the
+    exact same integer mappings.
+    """
+    matches_df = load_matches_from_db()
+    elo_df     = load_elo_from_db()
+
+    if matches_df.empty:
+        print(
+            "[builder] ERROR: no match data found. "
+            "Run collector.py first."
+        )
+        return pd.DataFrame()
+
+    features_df = build_features(matches_df, elo_df)
+
+    if features_df.empty:
+        print("[builder] ERROR: feature build produced no rows.")
+        return pd.DataFrame()
+
+    # Encode league and season with consistent integer mapping
+    le_league = LabelEncoder()
+    le_season = LabelEncoder()
+    features_df["league_encoded"] = le_league.fit_transform(
+        features_df["league"].astype(str)
+    )
+    features_df["season_encoded"] = le_season.fit_transform(
+        features_df["season"].astype(str)
+    )
+
+    # Save encoders for reuse at prediction time
+    enc_dir = Path(__file__).resolve().parent.parent / "data"
+    enc_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(le_league, enc_dir / "league_encoder.joblib")
+    joblib.dump(le_season, enc_dir / "season_encoder.joblib")
+    print(f"[builder] Encoders saved to {enc_dir}")
+
+    # Save features CSV
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    features_df.to_csv(out_path, index=False)
+
+    date_min = features_df["date"].min()
+    date_max = features_df["date"].max()
+    print(
+        f"[builder] Saved {len(features_df)} rows x "
+        f"{len(features_df.columns)} cols -> {out_path}"
+    )
+    print(f"[builder] Date range: {date_min} -> {date_max}")
+
+    return features_df
+
+
+if __name__ == "__main__":
+    build_and_save_features()
