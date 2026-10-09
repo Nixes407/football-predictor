@@ -11,6 +11,7 @@ Run from backend/ directory:
 
 from __future__ import annotations
 
+import os
 import warnings
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from sklearn.metrics import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from supabase import create_client
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
@@ -576,6 +578,58 @@ def train_count_model(
     }
 
 
+def upload_models_to_supabase(model_dir: str = "models") -> None:
+    """
+    Push the five saved .joblib artifacts to the "models"
+    bucket in Supabase Storage, overwriting existing copies.
+
+    Credentials are read from the SUPABASE_URL and SUPABASE_KEY
+    environment variables. This step is best-effort: a missing
+    credential or a failed upload prints a message and returns,
+    it never interrupts a training run.
+    """
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+
+    if not url or not key:
+        print(
+            "[trainer] WARNING: SUPABASE_URL and/or SUPABASE_KEY is not set, "
+            "skipping upload to Supabase"
+        )
+        return
+
+    model_files = [
+        "result_model_v1.joblib",
+        "home_goals_v1.joblib",
+        "away_goals_v1.joblib",
+        "home_corners_v1.joblib",
+        "away_corners_v1.joblib",
+    ]
+
+    try:
+        client = create_client(url, key)
+    except Exception as exc:
+        print(f"[trainer] WARNING: Supabase client creation failed: {exc}")
+        return
+
+    for file_name in model_files:
+        try:
+            model_path = Path(model_dir) / file_name
+            data = model_path.read_bytes()
+            client.storage.from_("models").upload(
+                path=file_name,
+                file=data,
+                file_options={
+                    "content-type": "application/octet-stream",
+                    "x-upsert": "true",
+                },
+            )
+            print(f"[trainer] Uploaded to Supabase -> models/{file_name}")
+        except Exception as exc:
+            print(f"[trainer] WARNING: upload failed for {file_name}: {exc}")
+            continue
+
+
 def train_all_models(
     features_path: str = "data/processed/features.csv",
     model_dir: str = "models",
@@ -639,6 +693,8 @@ def train_all_models(
         for k, v in metrics.items():
             if k != "model_path":
                 print(f"  {k}: {v}")
+
+    upload_models_to_supabase(model_dir)
 
     return results
 
