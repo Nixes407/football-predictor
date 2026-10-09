@@ -41,6 +41,7 @@ _features_df   = None
 _pipeline_running = False
 _pipeline_status  = "idle"
 _pipeline_log     = []
+_pipeline_error = ""
 
 FEATURE_COLS = [
     # Home form 5
@@ -441,7 +442,7 @@ def run_pipeline(secret: str = "") -> dict:
         }
 
     def _run():
-        global _pipeline_running, _pipeline_status, _pipeline_log
+        global _pipeline_running, _pipeline_status, _pipeline_log, _pipeline_error
         _pipeline_running = True
         _pipeline_log = []
         backend_dir = str(BACKEND_DIR)
@@ -468,10 +469,16 @@ def run_pipeline(secret: str = "") -> dict:
                     _pipeline_log.append(f"{name} completed OK")
                     print(f"[pipeline] {name} done (rc=0)")
                 else:
+                    global _pipeline_error
+                    _pipeline_error = (
+                        proc.stderr[-2000:] if proc.stderr
+                        else proc.stdout[-2000:] if proc.stdout
+                        else "no output captured"
+                    )
                     _pipeline_log.append(
                         f"{name} FAILED rc={proc.returncode}")
                     print(f"[pipeline] {name} FAILED")
-                    print(proc.stderr[-500:] if proc.stderr else "")
+                    print(_pipeline_error)
                     _pipeline_status = f"failed_{name}"
                     _pipeline_running = False
                     return
@@ -511,6 +518,7 @@ def pipeline_status() -> dict:
         "pipeline_running": _pipeline_running,
         "pipeline_status":  _pipeline_status,
         "pipeline_log":     _pipeline_log[-10:],
+        "pipeline_error":   _pipeline_error,
         "result_model":  _result_model  is not None,
         "home_goals":    _home_goals    is not None,
         "away_goals":    _away_goals    is not None,
