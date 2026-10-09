@@ -10,3 +10,4 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 requests
+supabase>=2.0,<3.0

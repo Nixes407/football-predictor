@@ -12,6 +12,7 @@ pipeline has been run.
 
 from __future__ import annotations
 
+import os
 import warnings
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from scipy.stats import poisson
+from supabase import create_client
 import subprocess
 import sys
 import threading
@@ -89,6 +91,55 @@ FEATURE_COLS = [
 ]
 
 
+def download_models_from_supabase() -> bool:
+    """
+    Pull the five model .joblib files from the "models" bucket
+    in Supabase Storage into BACKEND_DIR / "models".
+
+    Credentials come from SUPABASE_URL and SUPABASE_KEY. Returns
+    True only when every file downloaded and wrote successfully —
+    anything else returns False so the caller can fall back to
+    building the models locally. Never raises.
+    """
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+
+    if not url or not key:
+        print("[predict] WARNING: SUPABASE_URL and/or SUPABASE_KEY is not set "
+              "— skipping Supabase model download")
+        return False
+
+    try:
+        client = create_client(url, key)
+    except Exception as exc:
+        print(f"[predict] WARNING: could not create Supabase client: {exc}")
+        return False
+
+    model_files = [
+        "result_model_v1.joblib",
+        "home_goals_v1.joblib",
+        "away_goals_v1.joblib",
+        "home_corners_v1.joblib",
+        "away_corners_v1.joblib",
+    ]
+
+    models_dir = BACKEND_DIR / "models"
+
+    for file_name in model_files:
+        try:
+            data = client.storage.from_("models").download(file_name)
+            models_dir.mkdir(parents=True, exist_ok=True)
+            (models_dir / file_name).write_bytes(data)
+            print(f"[predict] Downloaded from Supabase -> models/{file_name}")
+        except Exception as exc:
+            print(f"[predict] WARNING: could not download "
+                  f"{file_name}: {exc}")
+            return False
+
+    print("Models downloaded from Supabase Storage")
+    return True
+
+
 def load_artifacts() -> None:
     """
     Load all model .joblib files and the features CSV
@@ -141,12 +192,22 @@ def load_artifacts() -> None:
 
 def auto_start_fast_pipeline() -> None:
     """
-    Called at startup. If models are not loaded,
+    Called at startup. Checks Supabase Storage first: a complete
+    set of models there is downloaded and loaded locally, and the
+    pipeline is skipped. Otherwise, if models are not loaded,
     automatically starts builder + trainer in a
     background thread. Collector is skipped because
     data is already in the database.
     """
     global _pipeline_running, _pipeline_status, _pipeline_log
+
+    if download_models_from_supabase():
+        load_artifacts()
+        _pipeline_status = "complete"
+        _pipeline_running = False
+        print("[pipeline] Models loaded from Supabase Storage "
+              "— skipping pipeline")
+        return
 
     if all([
         _result_model  is not None,
