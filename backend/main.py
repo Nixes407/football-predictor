@@ -76,8 +76,10 @@ async def lifespan(app: FastAPI):
     print("=" * 60)
 
     from database import init_db
+    from routers.predict import auto_start_fast_pipeline
 
     init_db()
+    auto_start_fast_pipeline()
 
     yield
     print("Football Predictor API is shutting down...")
