@@ -509,6 +509,98 @@ def run_pipeline(secret: str = "") -> dict:
     }
 
 
+@router.post("/admin/run-pipeline-fast")
+def run_pipeline_fast(secret: str = "") -> dict:
+    """
+    Run only builder and trainer — skips collector.
+    Use this when data is already in the database
+    and you just need to regenerate the model files.
+    Takes ~30-40 minutes instead of 2+ hours.
+    """
+    import os
+    global _pipeline_running, _pipeline_status, _pipeline_log
+
+    expected = os.getenv("PIPELINE_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or missing secret key."
+        )
+
+    if _pipeline_running:
+        return {
+            "status": "already_running",
+            "message": "Pipeline is already running. "
+                       "Check /predict/admin/status for progress."
+        }
+
+    def _run():
+        global _pipeline_running, _pipeline_status, _pipeline_log
+        _pipeline_running = True
+        _pipeline_log = []
+        backend_dir = str(BACKEND_DIR)
+
+        steps = [
+            ("builder", ["python", "features/builder.py"]),
+            ("trainer", ["python", "models/trainer.py"]),
+        ]
+
+        for name, cmd in steps:
+            _pipeline_status = f"running_{name}"
+            _pipeline_log.append(f"Starting {name}...")
+            print(f"[pipeline] Starting {name}...")
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=backend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=7200,
+                )
+                if proc.returncode == 0:
+                    _pipeline_log.append(f"{name} completed OK")
+                    print(f"[pipeline] {name} done (rc=0)")
+                else:
+                    global _pipeline_error
+                    _pipeline_error = (
+                        proc.stderr[-2000:] if proc.stderr
+                        else proc.stdout[-2000:] if proc.stdout
+                        else "no output captured"
+                    )
+                    _pipeline_log.append(
+                        f"{name} FAILED rc={proc.returncode}")
+                    print(f"[pipeline] {name} FAILED")
+                    print(_pipeline_error)
+                    _pipeline_status = f"failed_{name}"
+                    _pipeline_running = False
+                    return
+            except subprocess.TimeoutExpired:
+                _pipeline_log.append(f"{name} timed out")
+                _pipeline_status = f"timeout_{name}"
+                _pipeline_running = False
+                return
+            except Exception as exc:
+                _pipeline_log.append(f"{name} error: {exc}")
+                _pipeline_status = f"error_{name}"
+                _pipeline_running = False
+                return
+
+        load_artifacts()
+        _pipeline_status = "complete"
+        _pipeline_log.append("Fast pipeline complete. Artifacts loaded.")
+        print("[pipeline] Builder + trainer done. Artifacts reloaded.")
+        _pipeline_running = False
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    return {
+        "status": "started",
+        "message": "Fast pipeline started (builder + trainer only). "
+                   "Poll /predict/admin/status to monitor progress."
+    }
+
+
 @router.get("/admin/status")
 def pipeline_status() -> dict:
     """
