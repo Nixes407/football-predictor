@@ -598,12 +598,28 @@ def upload_models_to_supabase(model_dir: str = "models") -> None:
         )
         return
 
+    # backend/ root — one level above this models/ package.
+    BACKEND_DIR = Path(__file__).resolve().parent.parent
+
+    # (local path, path inside the "models" bucket)
     model_files = [
-        "result_model_v1.joblib",
-        "home_goals_v1.joblib",
-        "away_goals_v1.joblib",
-        "home_corners_v1.joblib",
-        "away_corners_v1.joblib",
+        (Path(model_dir) / "result_model_v1.joblib", "result_model_v1.joblib"),
+        (Path(model_dir) / "home_goals_v1.joblib", "home_goals_v1.joblib"),
+        (Path(model_dir) / "away_goals_v1.joblib", "away_goals_v1.joblib"),
+        (Path(model_dir) / "home_corners_v1.joblib", "home_corners_v1.joblib"),
+        (Path(model_dir) / "away_corners_v1.joblib", "away_corners_v1.joblib"),
+        (
+            BACKEND_DIR / "data" / "league_encoder.joblib",
+            "league_encoder.joblib",
+        ),
+        (
+            BACKEND_DIR / "data" / "season_encoder.joblib",
+            "season_encoder.joblib",
+        ),
+        (
+            BACKEND_DIR / "data" / "processed" / "features.csv",
+            "features.csv",
+        ),
     ]
 
     try:
@@ -612,9 +628,8 @@ def upload_models_to_supabase(model_dir: str = "models") -> None:
         print(f"[trainer] WARNING: Supabase client creation failed: {exc}")
         return
 
-    for file_name in model_files:
+    for model_path, file_name in model_files:
         try:
-            model_path = Path(model_dir) / file_name
             data = model_path.read_bytes()
             client.storage.from_("models").upload(
                 path=file_name,

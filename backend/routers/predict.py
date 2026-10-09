@@ -115,21 +115,49 @@ def download_models_from_supabase() -> bool:
         print(f"[predict] WARNING: could not create Supabase client: {exc}")
         return False
 
-    model_files = [
-        "result_model_v1.joblib",
-        "home_goals_v1.joblib",
-        "away_goals_v1.joblib",
-        "home_corners_v1.joblib",
-        "away_corners_v1.joblib",
-    ]
-
     models_dir = BACKEND_DIR / "models"
 
-    for file_name in model_files:
+    # (path inside the "models" bucket, where to save it locally)
+    model_files = [
+        (
+            "result_model_v1.joblib",
+            models_dir / "result_model_v1.joblib",
+        ),
+        (
+            "home_goals_v1.joblib",
+            models_dir / "home_goals_v1.joblib",
+        ),
+        (
+            "away_goals_v1.joblib",
+            models_dir / "away_goals_v1.joblib",
+        ),
+        (
+            "home_corners_v1.joblib",
+            models_dir / "home_corners_v1.joblib",
+        ),
+        (
+            "away_corners_v1.joblib",
+            models_dir / "away_corners_v1.joblib",
+        ),
+        (
+            "league_encoder.joblib",
+            BACKEND_DIR / "data" / "league_encoder.joblib",
+        ),
+        (
+            "season_encoder.joblib",
+            BACKEND_DIR / "data" / "season_encoder.joblib",
+        ),
+        (
+            "features.csv",
+            BACKEND_DIR / "data" / "processed" / "features.csv",
+        ),
+    ]
+
+    for file_name, save_path in model_files:
         try:
             data = client.storage.from_("models").download(file_name)
-            models_dir.mkdir(parents=True, exist_ok=True)
-            (models_dir / file_name).write_bytes(data)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_bytes(data)
             print(f"[predict] Downloaded from Supabase -> models/{file_name}")
         except Exception as exc:
             print(f"[predict] WARNING: could not download "
