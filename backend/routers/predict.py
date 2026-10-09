@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from scipy.stats import poisson
 import subprocess
 import sys
+import threading
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -36,6 +37,10 @@ _away_corners  = None
 _le_league     = None
 _le_season     = None
 _features_df   = None
+
+_pipeline_running = False
+_pipeline_status  = "idle"
+_pipeline_log     = []
 
 FEATURE_COLS = [
     # Home form 5
@@ -414,14 +419,12 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
 @router.post("/admin/run-pipeline")
 def run_pipeline(secret: str = "") -> dict:
     """
-    Trigger the full data pipeline remotely.
-    Runs collector -> builder -> trainer in sequence.
-    Protected by a secret key set in environment.
-
-    Call with:
-    POST /predict/admin/run-pipeline?secret=YOUR_SECRET
+    Trigger the full data pipeline in a background
+    thread so the HTTP request returns immediately.
+    Monitor progress via GET /predict/admin/status
     """
     import os
+    global _pipeline_running, _pipeline_status, _pipeline_log
 
     expected = os.getenv("PIPELINE_SECRET", "")
     if not expected or secret != expected:
@@ -430,59 +433,84 @@ def run_pipeline(secret: str = "") -> dict:
             detail="Invalid or missing secret key."
         )
 
-    backend_dir = str(BACKEND_DIR)
-    steps = [
-        ("collector", ["python", "data/collector.py"]),
-        ("builder",   ["python", "features/builder.py"]),
-        ("trainer",   ["python", "models/trainer.py"]),
-    ]
+    if _pipeline_running:
+        return {
+            "status": "already_running",
+            "message": "Pipeline is already running. "
+                       "Check /predict/admin/status for progress."
+        }
 
-    results = {}
-    for name, cmd in steps:
-        print(f"[pipeline] Starting {name}...")
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=backend_dir,
-                capture_output=True,
-                text=True,
-                timeout=3600,
-            )
-            success = proc.returncode == 0
-            results[name] = {
-                "success": success,
-                "returncode": proc.returncode,
-                "stdout_tail": proc.stdout[-2000:] if proc.stdout else "",
-                "stderr_tail": proc.stderr[-1000:] if proc.stderr else "",
-            }
-            print(f"[pipeline] {name} finished "
-                  f"(returncode={proc.returncode})")
-            if not success:
-                results["stopped_at"] = name
-                results["error"] = f"{name} failed"
-                return results
-        except subprocess.TimeoutExpired:
-            results[name] = {"success": False, "error": "timeout"}
-            results["stopped_at"] = name
-            return results
-        except Exception as exc:
-            results[name] = {"success": False, "error": str(exc)}
-            results["stopped_at"] = name
-            return results
+    def _run():
+        global _pipeline_running, _pipeline_status, _pipeline_log
+        _pipeline_running = True
+        _pipeline_log = []
+        backend_dir = str(BACKEND_DIR)
 
-    load_artifacts()
-    results["artifacts_reloaded"] = True
-    results["status"] = "pipeline complete"
-    return results
+        steps = [
+            ("collector", ["python", "data/collector.py"]),
+            ("builder",   ["python", "features/builder.py"]),
+            ("trainer",   ["python", "models/trainer.py"]),
+        ]
+
+        for name, cmd in steps:
+            _pipeline_status = f"running_{name}"
+            _pipeline_log.append(f"Starting {name}...")
+            print(f"[pipeline] Starting {name}...")
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=backend_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=7200,
+                )
+                if proc.returncode == 0:
+                    _pipeline_log.append(f"{name} completed OK")
+                    print(f"[pipeline] {name} done (rc=0)")
+                else:
+                    _pipeline_log.append(
+                        f"{name} FAILED rc={proc.returncode}")
+                    print(f"[pipeline] {name} FAILED")
+                    print(proc.stderr[-500:] if proc.stderr else "")
+                    _pipeline_status = f"failed_{name}"
+                    _pipeline_running = False
+                    return
+            except subprocess.TimeoutExpired:
+                _pipeline_log.append(f"{name} timed out")
+                _pipeline_status = f"timeout_{name}"
+                _pipeline_running = False
+                return
+            except Exception as exc:
+                _pipeline_log.append(f"{name} error: {exc}")
+                _pipeline_status = f"error_{name}"
+                _pipeline_running = False
+                return
+
+        load_artifacts()
+        _pipeline_status = "complete"
+        _pipeline_log.append("Pipeline complete. Artifacts loaded.")
+        print("[pipeline] All steps done. Artifacts reloaded.")
+        _pipeline_running = False
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+
+    return {
+        "status": "started",
+        "message": "Pipeline started in background. "
+                   "Poll /predict/admin/status to monitor progress."
+    }
 
 
 @router.get("/admin/status")
 def pipeline_status() -> dict:
     """
-    Check which artifacts are currently loaded.
-    No secret required — read only.
+    Check pipeline progress and loaded artifacts.
     """
     return {
+        "pipeline_running": _pipeline_running,
+        "pipeline_status":  _pipeline_status,
+        "pipeline_log":     _pipeline_log[-10:],
         "result_model":  _result_model  is not None,
         "home_goals":    _home_goals    is not None,
         "away_goals":    _away_goals    is not None,
