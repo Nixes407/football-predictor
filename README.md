@@ -30,8 +30,10 @@ football-predictor/
 ├── frontend/
 │   ├── pages/
 │   │   ├── _app.js          # loads global (Tailwind) CSS
-│   │   └── index.js         # placeholder landing page
+│   │   └── index.js         # landing page, calls the API
 │   ├── components/          # (empty — React components go here)
+│   ├── lib/
+│   │   └── apiBase.js       # NEXT_PUBLIC_API_URL -> absolute API URLs
 │   ├── styles/
 │   │   └── globals.css      # Tailwind entry point
 │   ├── package.json
@@ -52,6 +54,9 @@ football-predictor/
 │   ├── requirements.txt
 │   └── .env.example
 │
+├── docs/
+│   └── deploy.md            # Vercel + Render setup, env vars, CORS
+├── vercel.json
 ├── .gitignore
 └── README.md
 ```
@@ -121,22 +126,38 @@ npm run start     # serve the production build
 
 `backend/.env` (created from `backend/.env.example`, never committed):
 
-| Variable      | Description                                 | Example                                                          |
-| ------------- | ------------------------------------------- | ---------------------------------------------------------------- |
-| `DATABASE_URL`| PostgreSQL connection string                | `postgresql://user:password@localhost:5432/football_predictor`    |
+| Variable               | Description                                             | Example                                                    |
+| ---------------------- | ------------------------------------------------------- | ---------------------------------------------------------- |
+| `DATABASE_URL`         | PostgreSQL connection string                             | `postgresql://user:password@localhost:5432/football_predictor` |
+| `ALLOWED_ORIGINS`      | Comma-separated CORS allowlist of frontend origins       | `http://localhost:3000,https://your-frontend.vercel.app`   |
+| `FRONTEND_URL`         | Single-origin shortcut, merged into `ALLOWED_ORIGINS`    | `https://your-frontend.vercel.app`                          |
+| `ALLOWED_ORIGIN_REGEX` | Optional regex for unenumerable origins (Vercel previews)| `https://.*\.vercel\.app`                                   |
+| `PIPELINE_SECRET`      | Secret for `POST /predict/admin/run-pipeline`            | (generate with `secrets.token_urlsafe(32)`)                 |
 
-The API also reads an optional `ALLOWED_ORIGINS` (comma-separated) to control
-CORS; it defaults to `http://localhost:3000`.
+`frontend/.env.local` (created from `frontend/.env.local.example`; see
+`frontend/.env.example` for the deployed value):
+
+| Variable              | Description                            | Example                                          |
+| --------------------- | -------------------------------------- | ------------------------------------------------ |
+| `NEXT_PUBLIC_API_URL` | Backend origin, no trailing slash      | `http://localhost:8000`                           |
+
+The browser calls the backend **directly**, so `NEXT_PUBLIC_API_URL` on the
+frontend and the matching origin in the backend's `ALLOWED_ORIGINS` are both
+required. Details in [`docs/deploy.md`](docs/deploy.md).
 
 ---
 
 ## Deploying
 
 - **Frontend → Vercel.** Import the repository and set the project's **Root
-  Directory** to `frontend`. Vercel auto-detects Next.js.
-- **Backend.** FastAPI runs as a long-lived ASGI server, so host it on a service
-  such as Render, Railway or Fly.io, then point the frontend at its URL via an
-  environment variable.
+  Directory** to `frontend`. Vercel auto-detects Next.js, and `vercel.json`
+  holds nothing but `{ "version": 2 }`. Set `NEXT_PUBLIC_API_URL` to the
+  deployed backend origin.
+- **Backend → Render / Railway / Fly.** FastAPI runs as a long-lived ASGI
+  server. Set `DATABASE_URL` plus `ALLOWED_ORIGINS` containing the Vercel
+  origin, since requests are now cross-origin.
+- **No proxy layer.** `vercel.json` no longer rewrites `/api/*`; see
+  [`docs/deploy.md`](docs/deploy.md) for the full setup and troubleshooting.
 
 ---
 

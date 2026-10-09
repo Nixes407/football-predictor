@@ -22,15 +22,43 @@ from routers.predict import router as predict_router
 # Load variables from backend/.env (see .env.example) into the environment.
 load_dotenv()
 
-# Comma-separated list of browser origins allowed to call this API. The Next.js
-# dev server runs on port 3000 by default.
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv(
+def _allowed_origins() -> list[str]:
+    """
+    Build the CORS allowlist from the environment.
+
+    Two variables are honoured, so either can be used on its own:
+
+    ``ALLOWED_ORIGINS``  comma-separated list of browser origins. Defaults to
+                         the local Next.js dev server.
+    ``FRONTEND_URL``     single-origin shortcut (kept for the existing
+                         deployment docs). Empty entries are dropped, so an
+                         unset value can no longer put ``""`` in the list.
+
+    Trailing slashes are stripped — browsers never send one in ``Origin``, so
+    ``https://app.vercel.app/`` would otherwise never match. Order is
+    preserved and duplicates removed.
+    """
+    configured = os.getenv(
         "ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
-    ).split(",")
-    if origin.strip()
-]
+    )
+    candidates = [*configured.split(","), os.getenv("FRONTEND_URL", "")]
+    origins = [
+        origin.strip().rstrip("/") for origin in candidates if origin.strip()
+    ]
+    return list(dict.fromkeys(origins))
+
+
+ALLOWED_ORIGINS = _allowed_origins()
+
+# Optional regex for hosts that cannot be enumerated, e.g. Vercel preview
+# deployments:  ALLOWED_ORIGIN_REGEX=https://.*\.vercel\.app
+# Unset by default so the allowlist stays explicit.
+ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", "").strip() or None
+
+# CORS forbids credentialed requests from a wildcard origin, so a "*" entry
+# downgrades the API to anonymous CORS instead of silently rejecting the
+# browser's preflight.
+ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
 
 
 @asynccontextmanager
@@ -40,6 +68,10 @@ async def lifespan(app: FastAPI):
     print("Football Predictor API is starting up...")
     print(f"  Environment file loaded : {os.getenv('DATABASE_URL') is not None}")
     print(f"  CORS allowed origins    : {', '.join(ALLOWED_ORIGINS)}")
+    if ALLOWED_ORIGIN_REGEX:
+        print(f"  CORS origin regex       : {ALLOWED_ORIGIN_REGEX}")
+    if not ALLOW_CREDENTIALS:
+        print("  CORS credentials        : disabled (wildcard origin)")
     print("  Docs available at       : /docs")
     print("=" * 60)
 
@@ -58,16 +90,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        os.getenv("FRONTEND_URL", ""),
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+_cors_kwargs = {
+    "allow_origins": ALLOWED_ORIGINS,
+    "allow_credentials": ALLOW_CREDENTIALS,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+if ALLOWED_ORIGIN_REGEX:
+    _cors_kwargs["allow_origin_regex"] = ALLOWED_ORIGIN_REGEX
+
+app.add_middleware(CORSMiddleware, **_cors_kwargs)
 
 
 @app.get("/")

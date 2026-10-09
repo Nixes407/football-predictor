@@ -1,10 +1,9 @@
 import { useEffect, useState } from 'react';
 import Head from 'next/head';
 
+import { apiUrl } from '../lib/apiBase';
 import PredictionResult from '../components/PredictionResult';
 import TeamSelector from '../components/TeamSelector';
-
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export default function Home() {
   const [leagues, setLeagues] = useState([]);
@@ -23,7 +22,7 @@ export default function Home() {
 
     async function fetchLeagues() {
       try {
-        const res = await fetch(`${API}/predict/leagues`);
+        const res = await fetch(apiUrl('/predict/leagues'));
         const data = await res.json();
         if (!cancelled) setLeagues(data.leagues || []);
       } catch (err) {
@@ -52,7 +51,7 @@ export default function Home() {
 
     try {
       const res = await fetch(
-        `${API}/predict/teams?league=${encodeURIComponent(league)}`
+        apiUrl(`/predict/teams?league=${encodeURIComponent(league)}`)
       );
       const data = await res.json();
       setTeams(data.teams || []);
@@ -72,7 +71,7 @@ export default function Home() {
     setError(null);
 
     try {
-      const res = await fetch(`${API}/predict/match`, {
+      const res = await fetch(apiUrl('/predict/match'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
