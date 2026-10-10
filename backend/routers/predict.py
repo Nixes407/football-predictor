@@ -324,8 +324,9 @@ def auto_start_fast_pipeline() -> None:
         backend_dir = str(BACKEND_DIR)
 
         steps = [
-            ("builder", ["python", "features/builder.py"]),
-            ("trainer", ["python", "models/trainer.py"]),
+            ("fbref_collector", ["python", "data/fbref_collector.py"]),
+            ("builder",         ["python", "features/builder.py"]),
+            ("trainer",         ["python", "models/trainer.py"]),
         ]
 
         for name, cmd in steps:
@@ -731,9 +732,10 @@ def run_pipeline(secret: str = "") -> dict:
         backend_dir = str(BACKEND_DIR)
 
         steps = [
-            ("collector", ["python", "data/collector.py"]),
-            ("builder",   ["python", "features/builder.py"]),
-            ("trainer",   ["python", "models/trainer.py"]),
+            ("collector",       ["python", "data/collector.py"]),
+            ("fbref_collector", ["python", "data/fbref_collector.py"]),
+            ("builder",         ["python", "features/builder.py"]),
+            ("trainer",         ["python", "models/trainer.py"]),
         ]
 
         for name, cmd in steps:
@@ -824,8 +826,9 @@ def run_pipeline_fast(secret: str = "") -> dict:
         backend_dir = str(BACKEND_DIR)
 
         steps = [
-            ("builder", ["python", "features/builder.py"]),
-            ("trainer", ["python", "models/trainer.py"]),
+            ("fbref_collector", ["python", "data/fbref_collector.py"]),
+            ("builder",         ["python", "features/builder.py"]),
+            ("trainer",         ["python", "models/trainer.py"]),
         ]
 
         for name, cmd in steps:
