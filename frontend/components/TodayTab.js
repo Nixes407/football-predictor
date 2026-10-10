@@ -32,6 +32,82 @@ function formatKickoff(kickoffTime) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function addToAcca(match, market, probability, league) {
+  try {
+    const existing = JSON.parse(
+      localStorage.getItem('accumulator') || '[]'
+    );
+    const newSel = {
+      match:       `${match.home_team} vs ${match.away_team}`,
+      market,
+      probability: parseFloat((probability * 100).toFixed(1)),
+      league:      league || match.league || null,
+      addedAt:     new Date().toISOString(),
+    };
+    localStorage.setItem(
+      'accumulator',
+      JSON.stringify([...existing, newSel])
+    );
+    window.dispatchEvent(new Event('storage'));
+    return true;
+  } catch { return false; }
+}
+
+function AccaButtons({ match, prediction }) {
+  const [toast, setToast] = useState('');
+
+  function handleAdd(market, prob) {
+    const ok = addToAcca(match, market, prob, match.league);
+    if (ok) {
+      setToast(`✅ ${market} added!`);
+      setTimeout(() => setToast(''), 2000);
+    }
+  }
+
+  const buttons = [
+    {
+      label: `H ${(prediction.result?.home_win * 100).toFixed(1)}%`,
+      market: 'Home Win',
+      prob:   prediction.result?.home_win,
+    },
+    {
+      label: `D ${(prediction.result?.draw * 100).toFixed(1)}%`,
+      market: 'Draw',
+      prob:   prediction.result?.draw,
+    },
+    {
+      label: `A ${(prediction.result?.away_win * 100).toFixed(1)}%`,
+      market: 'Away Win',
+      prob:   prediction.result?.away_win,
+    },
+  ];
+
+  return (
+    <div className="mt-3">
+      {toast && (
+        <p className="text-xs text-green-400 text-center mb-2">
+          {toast}
+        </p>
+      )}
+      <div className="flex gap-2">
+        {buttons.map(({ label, market, prob }) => (
+          <button
+            key={market}
+            onClick={() => handleAdd(market, prob)}
+            className="flex-1 py-1.5 rounded-lg text-xs
+              font-medium bg-gray-800 hover:bg-blue-900
+              text-gray-300 hover:text-white
+              border border-white/10 hover:border-blue-500/50
+              transition-all"
+          >
+            + {label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function StatusBadge({ status }) {
   if (status === 'in_play') {
     return (
@@ -86,6 +162,10 @@ function PredictionPanel({ fixture }) {
   const awayGoals = fixture.pred_away_goals ?? 0;
   const homeCorners = fixture.pred_home_corners ?? 0;
   const awayCorners = fixture.pred_away_corners ?? 0;
+
+  const prediction = {
+    result: { home_win: homeWin, draw, away_win: awayWin },
+  };
 
   const maxProb = Math.max(homeWin, draw, awayWin);
   const totalGoals = homeGoals + awayGoals;
@@ -165,6 +245,10 @@ function PredictionPanel({ fixture }) {
           })}
         </div>
       </div>
+
+      {prediction && (
+        <AccaButtons match={fixture} prediction={prediction} />
+      )}
 
       {/* ── Section 2: Goals & Corners ── */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
