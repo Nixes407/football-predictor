@@ -2,14 +2,165 @@
 @tailwind components;
 @tailwind utilities;
 
-html,
-body {
-  padding: 0;
-  margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
-    'Helvetica Neue', Arial, sans-serif;
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+
+:root {
+  --navy:        #0a0f1e;
+  --navy-light:  #111827;
+  --navy-card:   #0d1526;
+  --blue:        #00d4ff;
+  --blue-dim:    #0ea5e9;
+  --green:       #00ff88;
+  --green-dim:   #10b981;
+  --purple:      #a855f7;
+  --gold:        #f59e0b;
+  --red:         #ef4444;
+  --text:        #e2e8f0;
+  --text-muted:  #94a3b8;
+  --border:      rgba(0, 212, 255, 0.15);
+  --glass:       rgba(13, 21, 38, 0.8);
+  --glow-blue:   0 0 20px rgba(0, 212, 255, 0.3);
+  --glow-green:  0 0 20px rgba(0, 255, 136, 0.3);
 }
 
 * {
   box-sizing: border-box;
+  margin: 0;
+  padding: 0;
 }
+
+html, body {
+  background-color: var(--navy);
+  color: var(--text);
+  font-family: 'Space Grotesk', sans-serif;
+  min-height: 100vh;
+  scroll-behavior: smooth;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--navy); }
+::-webkit-scrollbar-thumb { 
+  background: var(--blue); 
+  border-radius: 3px; 
+}
+
+/* Glass card */
+.glass {
+  background: var(--glass);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+}
+
+/* Glow effects */
+.glow-blue { box-shadow: var(--glow-blue); }
+.glow-green { box-shadow: var(--glow-green); }
+
+/* Gradient text */
+.gradient-text {
+  background: linear-gradient(135deg, var(--blue), var(--green));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Animated gradient border */
+.gradient-border {
+  position: relative;
+  border-radius: 16px;
+}
+.gradient-border::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 16px;
+  padding: 1px;
+  background: linear-gradient(135deg, var(--blue), var(--green), var(--purple));
+  -webkit-mask: 
+    linear-gradient(#fff 0 0) content-box, 
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* Probability bars */
+.prob-bar {
+  height: 6px;
+  border-radius: 3px;
+  transition: width 0.8s ease;
+}
+
+/* Pulse animation */
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+.pulse-glow { animation: pulse-glow 2s ease-in-out infinite; }
+
+/* Floating animation */
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-6px); }
+}
+.float { animation: float 3s ease-in-out infinite; }
+
+/* Tab active indicator */
+.tab-active {
+  background: linear-gradient(135deg, 
+    rgba(0,212,255,0.15), 
+    rgba(0,255,136,0.1));
+  border-bottom: 2px solid var(--blue);
+}
+
+/* Confidence badges */
+.badge-high   { 
+  background: rgba(0,255,136,0.15); 
+  color: var(--green); 
+  border: 1px solid rgba(0,255,136,0.3);
+}
+.badge-medium { 
+  background: rgba(245,158,11,0.15); 
+  color: var(--gold); 
+  border: 1px solid rgba(245,158,11,0.3);
+}
+.badge-low    { 
+  background: rgba(148,163,184,0.1); 
+  color: var(--text-muted); 
+  border: 1px solid rgba(148,163,184,0.2);
+}
+
+/* Neon button */
+.btn-neon {
+  background: linear-gradient(135deg, var(--blue), var(--blue-dim));
+  color: var(--navy);
+  font-weight: 700;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.btn-neon:hover {
+  box-shadow: var(--glow-blue);
+  transform: translateY(-1px);
+}
+.btn-neon:active { transform: translateY(0); }
+
+/* Grid background pattern */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0; left: 0;
+  width: 100%; height: 100%;
+  background-image: 
+    linear-gradient(rgba(0,212,255,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,212,255,0.03) 1px, transparent 1px);
+  background-size: 50px 50px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Ensure content sits above grid */
+#__next { position: relative; z-index: 1; }
