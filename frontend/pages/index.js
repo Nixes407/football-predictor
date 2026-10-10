@@ -5,12 +5,15 @@ import Head from 'next/head';
 import TodayTab from '../components/TodayTab';
 import CustomTab from '../components/CustomTab';
 import AboutTab from '../components/AboutTab';
+import HistoryTab from '../components/HistoryTab';
+import StatsTab from '../components/StatsTab';
 
 const TABS = [
   { id: 0, label: '📅 Today' },
   { id: 1, label: '🔮 Custom' },
   { id: 2, label: '📋 History' },
-  { id: 3, label: '⚙️ About' },
+  { id: 3, label: '📊 Stats' },
+  { id: 4, label: '⚙️ About' },
 ];
 
 export default function Home() {
@@ -101,27 +104,9 @@ export default function Home() {
             >
               {activeTab === 0 && <TodayTab />}
               {activeTab === 1 && <CustomTab />}
-              {activeTab === 2 && (
-                <div className="flex justify-center py-12">
-                  <div className="glass px-10 py-12 text-center max-w-md">
-                    <div className="text-6xl mb-4">📋</div>
-                    <h2 className="text-2xl font-bold gradient-text mb-3">
-                      Match History
-                    </h2>
-                    <p
-                      className="mb-6"
-                      style={{ color: 'var(--text-muted)' }}
-                    >
-                      Coming soon — finished match results and prediction
-                      accuracy tracking will appear here.
-                    </p>
-                    <span className="badge-medium inline-block px-4 py-1.5 rounded-full text-sm font-semibold">
-                      🔜 Phase 8.3
-                    </span>
-                  </div>
-                </div>
-              )}
-              {activeTab === 3 && <AboutTab />}
+              {activeTab === 2 && <HistoryTab />}
+              {activeTab === 3 && <StatsTab />}
+              {activeTab === 4 && <AboutTab />}
             </motion.div>
           </AnimatePresence>
         </main>
