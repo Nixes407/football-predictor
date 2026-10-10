@@ -7,13 +7,15 @@ import CustomTab from '../components/CustomTab';
 import AboutTab from '../components/AboutTab';
 import HistoryTab from '../components/HistoryTab';
 import StatsTab from '../components/StatsTab';
+import AccumulatorTab from '../components/AccumulatorTab';
 
 const TABS = [
   { id: 0, label: '📅 Today' },
   { id: 1, label: '🔮 Custom' },
   { id: 2, label: '📋 History' },
   { id: 3, label: '📊 Stats' },
-  { id: 4, label: '⚙️ About' },
+  { id: 4, label: '🎯 Acca' },
+  { id: 5, label: 'ℹ️ About' },
 ];
 
 export default function Home() {
@@ -106,7 +108,8 @@ export default function Home() {
               {activeTab === 1 && <CustomTab />}
               {activeTab === 2 && <HistoryTab />}
               {activeTab === 3 && <StatsTab />}
-              {activeTab === 4 && <AboutTab />}
+              {activeTab === 4 && <AccumulatorTab />}
+              {activeTab === 5 && <AboutTab />}
             </motion.div>
           </AnimatePresence>
         </main>
