@@ -27,6 +27,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     Integer,
+    String,
     Text,
     UniqueConstraint,
     create_engine,
@@ -180,6 +181,30 @@ class EloRating(Base):
         return f"<EloRating {self.team} {self.date} {self.elo}>"
 
 
+class DailyMatch(Base):
+    """A daily fixture and its pre-match predictions."""
+
+    __tablename__ = "daily_matches"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)  # SERIAL
+    external_id = Column(String, unique=True, nullable=False)
+    match_date = Column(String)  # YYYY-MM-DD
+    kickoff_time = Column(String)  # ISO UTC datetime
+    home_team = Column(String)
+    away_team = Column(String)
+    league = Column(String)
+    season = Column(String)
+    status = Column(String)  # scheduled, in_play or finished
+    pred_home_win = Column(Float, nullable=True)
+    pred_draw = Column(Float, nullable=True)
+    pred_away_win = Column(Float, nullable=True)
+    pred_home_goals = Column(Float, nullable=True)
+    pred_away_goals = Column(Float, nullable=True)
+    pred_home_corners = Column(Float, nullable=True)
+    pred_away_corners = Column(Float, nullable=True)
+    prediction_computed_at = Column(String, nullable=True)
+
+
 # --------------------------------------------------------------------------- #
 # Schema management
 # --------------------------------------------------------------------------- #
@@ -212,6 +237,7 @@ def init_db(bind=None) -> bool:
 
 __all__ = [
     "Base",
+    "DailyMatch",
     "EloRating",
     "Match",
     "SessionLocal",

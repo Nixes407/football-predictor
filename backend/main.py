@@ -13,10 +13,13 @@ import os
 from contextlib import asynccontextmanager
 
 import uvicorn
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+import routers.fixtures as fixtures_router_module
 from routers.predict import router as predict_router
 
 # Load variables from backend/.env (see .env.example) into the environment.
@@ -112,6 +115,37 @@ def read_root() -> dict:
 
 # Prediction endpoints live in routers/predict.py and are mounted under /predict.
 app.include_router(predict_router)
+app.include_router(
+    fixtures_router_module.router,
+    prefix="/fixtures",
+    tags=["fixtures"],
+)
+
+
+def scheduled_daily_fetch():
+    from data.fixtures import fetch_fixtures
+    from routers.fixtures import compute_and_store_predictions
+    from database import SessionLocal
+
+    try:
+        print("[scheduler] Running daily fixture fetch...")
+        fixtures = fetch_fixtures()
+        db = SessionLocal()
+        compute_and_store_predictions(fixtures, db)
+        db.close()
+        print(f"[scheduler] Done. {len(fixtures)} fixtures processed.")
+    except Exception as e:
+        print(f"[scheduler] ERROR: {e}")
+
+
+scheduler = BackgroundScheduler(timezone="UTC")
+scheduler.add_job(
+    scheduled_daily_fetch,
+    CronTrigger(hour=0, minute=0),
+    id="daily_fixture_fetch",
+    replace_existing=True,
+)
+scheduler.start()
 
 
 if __name__ == "__main__":
