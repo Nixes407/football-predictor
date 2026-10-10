@@ -126,6 +126,7 @@ def scheduled_daily_fetch():
     from data.fixtures import fetch_fixtures
     from routers.fixtures import compute_and_store_predictions
     from database import SessionLocal
+    from datetime import datetime, timezone
 
     try:
         print("[scheduler] Running daily fixture fetch...")
@@ -135,7 +136,17 @@ def scheduled_daily_fetch():
         db.close()
         print(f"[scheduler] Done. {len(fixtures)} fixtures processed.")
     except Exception as e:
-        print(f"[scheduler] ERROR: {e}")
+        print(f"[scheduler] ERROR in fixture fetch: {e}")
+
+    try:
+        today = datetime.now(timezone.utc).weekday()
+        if today == 0:
+            print("[scheduler] Monday — running weekly FBref scrape...")
+            from data.fbref_collector import scrape_fbref_stats
+            scrape_fbref_stats()
+            print("[scheduler] FBref scrape done.")
+    except Exception as e:
+        print(f"[scheduler] ERROR in FBref scrape: {e}")
 
 
 scheduler = BackgroundScheduler(timezone="UTC")
