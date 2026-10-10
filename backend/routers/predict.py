@@ -915,3 +915,69 @@ def pipeline_status() -> dict:
             _away_corners is not None,
         ]),
     }
+
+
+@router.get("/admin/fbref-check")
+def fbref_check() -> dict:
+    """
+    Query fbref_team_stats directly to see what
+    data was actually stored by the FBref collector.
+    No secret required.
+    """
+    try:
+        import sys
+        import os
+        sys.path.insert(0, str(BACKEND_DIR))
+        from sqlalchemy import text as sql_text
+        from database import session_scope
+
+        with session_scope() as session:
+            total = session.execute(
+                sql_text("SELECT COUNT(*) FROM fbref_team_stats")
+            ).scalar()
+
+            sample = session.execute(
+                sql_text(
+                    "SELECT team, league, season "
+                    "FROM fbref_team_stats "
+                    "LIMIT 10"
+                )
+            ).fetchall()
+
+            leagues = session.execute(
+                sql_text(
+                    "SELECT DISTINCT league "
+                    "FROM fbref_team_stats"
+                )
+            ).fetchall()
+
+            seasons = session.execute(
+                sql_text(
+                    "SELECT DISTINCT season "
+                    "FROM fbref_team_stats"
+                )
+            ).fetchall()
+
+            matches_sample = session.execute(
+                sql_text(
+                    "SELECT DISTINCT home_team, league, season "
+                    "FROM matches "
+                    "LIMIT 5"
+                )
+            ).fetchall()
+
+        return {
+            "fbref_total_rows": total,
+            "fbref_sample": [
+                {"team": r[0], "league": r[1], "season": r[2]}
+                for r in sample
+            ],
+            "fbref_distinct_leagues": [r[0] for r in leagues],
+            "fbref_distinct_seasons": [r[0] for r in seasons],
+            "matches_sample": [
+                {"home_team": r[0], "league": r[1], "season": r[2]}
+                for r in matches_sample
+            ],
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
