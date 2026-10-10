@@ -18,6 +18,25 @@ from sqlalchemy import text
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from database import session_scope
+from database import SessionLocal, FBrefTeamStats
+
+
+# Key columns that identify one team's season in fbref_team_stats.
+FBREF_KEY_COLUMNS = ["team", "league", "season"]
+
+# Stat columns read from fbref_team_stats (keys excluded).
+FBREF_STAT_COLUMNS = [
+    "games",
+    "shots", "shots_on_target", "shot_accuracy",
+    "goals_per_shot", "goals_per_sot",
+    "yellow_cards", "red_cards", "fouls_committed", "fouls_drawn",
+    "offsides", "crosses", "interceptions", "tackles_won",
+    "pens_won", "pens_conceded",
+    "sota", "goals_against", "saves", "save_pct",
+    "clean_sheets", "pk_faced", "pk_saved",
+]
+
+FBREF_COLUMNS = FBREF_KEY_COLUMNS + FBREF_STAT_COLUMNS
 
 
 def load_matches_from_db() -> pd.DataFrame:
@@ -54,6 +73,39 @@ def load_elo_from_db() -> pd.DataFrame:
     except Exception as exc:
         print(f"[builder] WARNING: could not load elo ratings: {exc}")
         return pd.DataFrame()
+
+
+def load_fbref_stats() -> pd.DataFrame:
+    """
+    Load all rows from the fbref_team_stats table.
+
+    Returns a DataFrame with the columns in FBREF_COLUMNS. If the table is
+    empty or cannot be read, a warning is printed and an empty DataFrame with
+    those columns is returned.
+    """
+    empty = pd.DataFrame(columns=FBREF_COLUMNS)
+    db = None
+    try:
+        db = SessionLocal()
+        rows = db.query(FBrefTeamStats).all()
+        records = [
+            {col: getattr(row, col) for col in FBREF_COLUMNS}
+            for row in rows
+        ]
+    except Exception as exc:
+        print(f"[builder] WARNING: could not load fbref stats: {exc}")
+        return empty
+    finally:
+        if db is not None:
+            db.close()
+
+    if not records:
+        print("[builder] WARNING: fbref_team_stats table is empty")
+        return empty
+
+    df = pd.DataFrame(records, columns=FBREF_COLUMNS)
+    print(f"[builder] Loaded {len(df)} FBref team-season rows from DB")
+    return df
 
 
 def get_pre_match_elo(
@@ -425,6 +477,56 @@ def build_and_save_features(
     joblib.dump(le_league, enc_dir / "league_encoder.joblib")
     joblib.dump(le_season, enc_dir / "season_encoder.joblib")
     print(f"[builder] Encoders saved to {enc_dir}")
+
+    # Join FBref team season stats onto the feature matrix, once for the home
+    # team and once for the away team. Any failure keeps the existing features.
+    fbref_df = load_fbref_stats()
+    if not fbref_df.empty:
+        try:
+            base_rows = len(features_df)
+            stat_cols = [c for c in FBREF_COLUMNS if c not in FBREF_KEY_COLUMNS]
+
+            fbref_df = fbref_df.drop_duplicates(subset=FBREF_KEY_COLUMNS, keep="last")
+            fbref_df[stat_cols] = fbref_df[stat_cols].apply(
+                pd.to_numeric, errors="coerce"
+            )
+
+            # Renaming the team key to home_team / away_team and prefixing the
+            # stats means each merge uses shared key names, so the merge brings
+            # in no duplicate team/league/season columns.
+            home_stats = fbref_df.rename(
+                columns={"team": "home_team",
+                         **{c: f"home_fbref_{c}" for c in stat_cols}}
+            )
+            away_stats = fbref_df.rename(
+                columns={"team": "away_team",
+                         **{c: f"away_fbref_{c}" for c in stat_cols}}
+            )
+
+            merged = features_df.merge(
+                home_stats, on=["home_team", "league", "season"], how="left"
+            )
+            merged = merged.merge(
+                away_stats, on=["away_team", "league", "season"], how="left"
+            )
+
+            if len(merged) != base_rows:
+                raise ValueError(
+                    f"join changed row count {base_rows} -> {len(merged)}"
+                )
+
+            new_cols = [c for c in merged.columns if c not in features_df.columns]
+            merged[new_cols] = merged[new_cols].fillna(0.0)
+
+            features_df = merged
+            print(f"[builder] Added {len(new_cols)} FBref features (home + away)")
+        except Exception as exc:
+            print(
+                "[builder] WARNING: FBref join failed, continuing without "
+                f"FBref features: {exc}"
+            )
+    else:
+        print("[builder] No FBref stats found — skipping FBref feature join")
 
     # Save features CSV
     out_path = Path(output_path)
