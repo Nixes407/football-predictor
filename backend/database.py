@@ -22,6 +22,7 @@ from typing import Iterator
 
 from dotenv import load_dotenv
 from sqlalchemy import (
+    Boolean,
     Column,
     Date,
     DateTime,
@@ -253,6 +254,39 @@ class FBrefTeamStats(Base):
         return f"<FBrefTeamStats {self.team} {self.league} {self.season}>"
 
 
+class MatchResult(Base):
+    """A match result with scorers, cards and the prediction graded against it."""
+
+    __tablename__ = "match_results"
+    __table_args__ = (
+        UniqueConstraint("external_id", name="uq_match_results_external_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)  # SERIAL
+    external_id = Column(String, nullable=False)
+    match_date = Column(String)  # YYYY-MM-DD
+    kickoff_time = Column(String)  # ISO UTC datetime
+    home_team = Column(String)
+    away_team = Column(String)
+    league = Column(String)
+    season = Column(String)
+    status = Column(String)
+    home_score = Column(Integer, nullable=True)
+    away_score = Column(Integer, nullable=True)
+    result = Column(String, nullable=True)  # "H", "D" or "A"
+    home_scorers = Column(String, nullable=True)
+    away_scorers = Column(String, nullable=True)
+    home_yellows = Column(Integer, nullable=True)
+    away_yellows = Column(Integer, nullable=True)
+    home_reds = Column(Integer, nullable=True)
+    away_reds = Column(Integer, nullable=True)
+    pred_home_win = Column(Float, nullable=True)
+    pred_draw = Column(Float, nullable=True)
+    pred_away_win = Column(Float, nullable=True)
+    pred_correct = Column(Boolean, nullable=True)
+    fetched_at = Column(String, nullable=True)
+
+
 # --------------------------------------------------------------------------- #
 # Schema management
 # --------------------------------------------------------------------------- #
@@ -289,6 +323,7 @@ __all__ = [
     "EloRating",
     "FBrefTeamStats",
     "Match",
+    "MatchResult",
     "SessionLocal",
     "engine",
     "get_database_url",

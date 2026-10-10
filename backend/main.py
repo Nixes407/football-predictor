@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import routers.fixtures as fixtures_router_module
+import routers.results as results_router_module
 from routers.predict import router as predict_router
 
 # Load variables from backend/.env (see .env.example) into the environment.
@@ -119,6 +120,11 @@ app.include_router(
     fixtures_router_module.router,
     prefix="/fixtures",
     tags=["fixtures"],
+)
+app.include_router(
+    results_router_module.router,
+    prefix="/results",
+    tags=["results"],
 )
 
 
