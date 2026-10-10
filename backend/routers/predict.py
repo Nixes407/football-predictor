@@ -341,6 +341,10 @@ def auto_start_fast_pipeline() -> None:
                     text=True,
                     timeout=7200,
                 )
+                if proc.stdout:
+                    print(proc.stdout[-3000:])
+                if proc.stderr:
+                    print(proc.stderr[-1000:])
                 if proc.returncode == 0:
                     _pipeline_log.append(f"[AUTO] {name} completed OK")
                     print(f"[pipeline][AUTO] {name} done (rc=0)")
@@ -751,6 +755,10 @@ def run_pipeline(secret: str = "") -> dict:
                     text=True,
                     timeout=7200,
                 )
+                if proc.stdout:
+                    print(proc.stdout[-3000:])
+                if proc.stderr:
+                    print(proc.stderr[-1000:])
                 if proc.returncode == 0:
                     _pipeline_log.append(f"{name} completed OK")
                     print(f"[pipeline] {name} done (rc=0)")
@@ -844,6 +852,10 @@ def run_pipeline_fast(secret: str = "") -> dict:
                     text=True,
                     timeout=7200,
                 )
+                if proc.stdout:
+                    print(proc.stdout[-3000:])
+                if proc.stderr:
+                    print(proc.stderr[-1000:])
                 if proc.returncode == 0:
                     _pipeline_log.append(f"{name} completed OK")
                     print(f"[pipeline] {name} done (rc=0)")

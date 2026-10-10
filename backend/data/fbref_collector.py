@@ -170,6 +170,8 @@ def scrape_fbref_stats() -> None:
 
             # Step 3 - process and store.
             db = SessionLocal()
+            before = db.query(FBrefTeamStats).count()
+            print(f"[fbref] rows in DB before run: {before}")
             try:
                 for league in LEAGUES:
                     for season in SEASONS:
@@ -217,7 +219,13 @@ def scrape_fbref_stats() -> None:
                                     row.updated_at = datetime.now(timezone.utc).isoformat()
 
                                     db.add(row)
-                                    db.commit()
+                                    try:
+                                        db.commit()
+                                        print("[fbref] db.commit() successful")
+                                    except Exception as exc:
+                                        print(f"[fbref] ERROR: db.commit() failed: {exc}")
+                                        db.rollback()
+                                        raise
                                     print(f"[fbref] Stored: {team} {league} {season}")
                                 except Exception as exc:  # noqa: BLE001 - keep going
                                     db.rollback()
