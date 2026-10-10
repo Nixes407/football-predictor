@@ -205,6 +205,54 @@ class DailyMatch(Base):
     prediction_computed_at = Column(String, nullable=True)
 
 
+class FBrefTeamStats(Base):
+    """Season-level team stats (shooting, discipline, goalkeeping) from FBref."""
+
+    __tablename__ = "fbref_team_stats"
+    __table_args__ = (
+        UniqueConstraint("team", "league", "season", name="uq_fbref_team_stats_team_league_season"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)  # SERIAL
+    team = Column(String, nullable=False)
+    league = Column(String, nullable=False)
+    season = Column(String, nullable=False)
+    games = Column(Integer, nullable=True)
+
+    # Shooting
+    shots = Column(Float, nullable=True)
+    shots_on_target = Column(Float, nullable=True)
+    shot_accuracy = Column(Float, nullable=True)
+    goals_per_shot = Column(Float, nullable=True)
+    goals_per_sot = Column(Float, nullable=True)
+
+    # Discipline
+    yellow_cards = Column(Float, nullable=True)
+    red_cards = Column(Float, nullable=True)
+    fouls_committed = Column(Float, nullable=True)
+    fouls_drawn = Column(Float, nullable=True)
+    offsides = Column(Float, nullable=True)
+    crosses = Column(Float, nullable=True)
+    interceptions = Column(Float, nullable=True)
+    tackles_won = Column(Float, nullable=True)
+    pens_won = Column(Float, nullable=True)
+    pens_conceded = Column(Float, nullable=True)
+
+    # Goalkeeping
+    sota = Column(Float, nullable=True)
+    goals_against = Column(Float, nullable=True)
+    saves = Column(Float, nullable=True)
+    save_pct = Column(Float, nullable=True)
+    clean_sheets = Column(Float, nullable=True)
+    pk_faced = Column(Float, nullable=True)
+    pk_saved = Column(Float, nullable=True)
+
+    updated_at = Column(String, nullable=True)  # ISO UTC datetime
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<FBrefTeamStats {self.team} {self.league} {self.season}>"
+
+
 # --------------------------------------------------------------------------- #
 # Schema management
 # --------------------------------------------------------------------------- #
@@ -239,6 +287,7 @@ __all__ = [
     "Base",
     "DailyMatch",
     "EloRating",
+    "FBrefTeamStats",
     "Match",
     "SessionLocal",
     "engine",
