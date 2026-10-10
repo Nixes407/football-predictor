@@ -20,6 +20,16 @@ from datetime import datetime, timezone
 
 import pandas as pd
 import soccerdata as sd
+
+import sys
+from pathlib import Path as _Path
+
+# Make database.py importable when this script
+# is run as a subprocess from any working directory
+_BACKEND_DIR = _Path(__file__).resolve().parent.parent
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
 from database import SessionLocal, FBrefTeamStats
 from sqlalchemy import and_
 
