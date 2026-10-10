@@ -153,8 +153,20 @@ def scrape_fbref_stats() -> None:
 
             # Step 2 - read the three stat tables.
             shooting_df = _read_stat_type(fbref, "shooting")
-            misc_df = _read_stat_type(fbref, "misc")
-            keeper_df = _read_stat_type(fbref, "keeper")
+            misc_df     = _read_stat_type(fbref, "misc")
+            keeper_df   = _read_stat_type(fbref, "keeper")
+
+            print(f"[fbref] shooting_df: "
+                  f"{'None' if shooting_df is None else shooting_df.shape}")
+            print(f"[fbref] misc_df:     "
+                  f"{'None' if misc_df is None else misc_df.shape}")
+            print(f"[fbref] keeper_df:   "
+                  f"{'None' if keeper_df is None else keeper_df.shape}")
+
+            if shooting_df is None or shooting_df.empty:
+                print("[fbref] ERROR: shooting table is empty "
+                      "— cannot continue")
+                sys.exit(1)
 
             # Step 3 - process and store.
             db = SessionLocal()
@@ -162,10 +174,15 @@ def scrape_fbref_stats() -> None:
                 for league in LEAGUES:
                     for season in SEASONS:
                         try:
-                            teams = _teams_for(shooting_df, league, season)
+                            teams = _teams_for(
+                                shooting_df, league, season)
                             if not teams:
-                                print(f"[fbref] WARNING: no teams found for {league} {season}, skipping.")
+                                print(f"[fbref] WARNING: no teams "
+                                      f"found for {league} {season}"
+                                      f", skipping.")
                                 continue
+                            print(f"[fbref] {league} {season}: "
+                                  f"found {len(teams)} teams")
 
                             for team in teams:
                                 try:
@@ -208,6 +225,9 @@ def scrape_fbref_stats() -> None:
                         except Exception as exc:  # noqa: BLE001 - keep going
                             db.rollback()
                             print(f"[fbref] WARNING: skipping {league} {season}: {exc}")
+
+                total = db.query(FBrefTeamStats).count()
+                print(f"[fbref] Total rows in DB after run: {total}")
             finally:
                 db.close()
 
