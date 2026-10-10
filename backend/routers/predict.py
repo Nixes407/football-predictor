@@ -471,6 +471,7 @@ def _build_feature_vector(
     league_encoded: int,
     season_encoded: int,
     df: pd.DataFrame,
+    feature_cols: list[str] | None = None,
 ) -> dict[str, float]:
     """
     Build the full 62-feature vector for a prediction request.
@@ -483,7 +484,7 @@ def _build_feature_vector(
     home_feats = _get_team_features(home_team, "home", df)
     away_feats = _get_team_features(away_team, "away", df)
 
-    cols_to_use = feature_cols if feature_cols else FEATURE_COLS
+    cols_to_use = feature_cols if feature_cols is not None else FEATURE_COLS
     vector: dict[str, float] = {}
     for col in cols_to_use:
         if col == "league_encoded":
