@@ -31,7 +31,7 @@ LEAGUES = [
     "FRA-Ligue 1",
 ]
 
-SEASONS = ["2020-2021", "2021-2022", "2022-2023", "2023-2024"]
+SEASONS = ["2021-2022", "2022-2023", "2023-2024", "2024-2025"]
 
 # Model attribute -> FBref column name, per source table.
 SHOOTING_FIELDS = {
