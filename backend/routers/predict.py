@@ -246,6 +246,41 @@ def load_artifacts() -> None:
               f"features.csv: {exc}")
 
 
+def _get_runtime_feature_cols() -> list[str]:
+    """
+    Return the feature list from the loaded model.
+    Falls back to the hardcoded FEATURE_COLS if
+    the model is not loaded or has no feature info.
+    This guarantees predict.py always uses exactly
+    the features the model was trained on.
+    """
+    global _result_model
+
+    if _result_model is None:
+        return FEATURE_COLS
+
+    try:
+        # Pipeline: get the final estimator step
+        if hasattr(_result_model, 'steps'):
+            final_step = _result_model.steps[-1][1]
+        else:
+            final_step = _result_model
+
+        if hasattr(final_step, 'feature_names_in_'):
+            return list(final_step.feature_names_in_)
+
+        # Try the imputer step which sees raw features
+        if hasattr(_result_model, 'steps'):
+            imputer = _result_model.steps[0][1]
+            if hasattr(imputer, 'feature_names_in_'):
+                return list(imputer.feature_names_in_)
+    except Exception as exc:
+        print(f"[predict] WARNING: could not read feature "
+              f"names from model: {exc}")
+
+    return FEATURE_COLS
+
+
 def auto_start_fast_pipeline() -> None:
     """
     Called at startup. Checks Supabase Storage first: a complete
@@ -447,8 +482,9 @@ def _build_feature_vector(
     home_feats = _get_team_features(home_team, "home", df)
     away_feats = _get_team_features(away_team, "away", df)
 
+    cols_to_use = feature_cols if feature_cols else FEATURE_COLS
     vector: dict[str, float] = {}
-    for col in FEATURE_COLS:
+    for col in cols_to_use:
         if col == "league_encoded":
             vector[col] = float(league_encoded)
         elif col == "season_encoded":
@@ -551,16 +587,23 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
     season_enc = _encode_label(_le_season, req.season)
 
     # Build feature vector
+    runtime_cols = _get_runtime_feature_cols()
     vector = _build_feature_vector(
         req.home_team,
         req.away_team,
         league_enc,
         season_enc,
         _features_df,
+        runtime_cols,
     )
 
+    # Fill any missing columns with 0
+    for col in runtime_cols:
+        if col not in vector:
+            vector[col] = 0.0
+
     # Convert to DataFrame with correct column order
-    X = pd.DataFrame([vector])[FEATURE_COLS]
+    X = pd.DataFrame([vector])[runtime_cols]
 
     # 1X2 result probabilities
     result_proba = _result_model.predict_proba(X)[0]
@@ -620,6 +663,40 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         "feature_vector_used": {
             k: round(v, 4) for k, v in vector.items()
         },
+    }
+
+
+@router.get("/admin/diagnostics")
+def diagnostics() -> dict:
+    """
+    Report what is actually loaded in memory.
+    Shows model feature counts, features.csv columns,
+    and whether they match.
+    No secret required — read only.
+    """
+    runtime_cols = _get_runtime_feature_cols()
+
+    features_df_cols = []
+    fbref_in_csv = []
+    if _features_df is not None:
+        features_df_cols = list(_features_df.columns)
+        fbref_in_csv = [c for c in features_df_cols
+                        if 'fbref' in c]
+
+    fbref_in_model = [c for c in runtime_cols
+                      if 'fbref' in c]
+
+    return {
+        "hardcoded_feature_cols": len(FEATURE_COLS),
+        "model_feature_cols":     len(runtime_cols),
+        "features_csv_cols":      len(features_df_cols),
+        "fbref_cols_in_model":    len(fbref_in_model),
+        "fbref_cols_in_csv":      len(fbref_in_csv),
+        "model_fbref_sample":     fbref_in_model[:5],
+        "csv_fbref_sample":       fbref_in_csv[:5],
+        "cols_match":             (
+            set(runtime_cols) == set(FEATURE_COLS)
+        ),
     }
 
 
