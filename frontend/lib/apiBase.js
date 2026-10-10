@@ -34,6 +34,16 @@ function normalizeBaseUrl(raw) {
 export const API_BASE = normalizeBaseUrl(process.env.NEXT_PUBLIC_API_URL);
 
 /**
+ * Return the backend API origin (no trailing slash), e.g. for building
+ * request URLs like `${getApiBase()}/fixtures/today`.
+ *
+ * @returns {string} the backend origin
+ */
+export function getApiBase() {
+  return API_BASE;
+}
+
+/**
  * Build an absolute API URL. A leading slash on `path` is optional, and a
  * query string may be included.
  *

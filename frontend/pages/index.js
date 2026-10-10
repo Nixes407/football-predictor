@@ -1,189 +1,131 @@
-import { useEffect, useState } from 'react';
+import { useState, useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { getApiBase } from '../lib/apiBase';
 import Head from 'next/head';
+import TodayTab from '../components/TodayTab';
+import CustomTab from '../components/CustomTab';
+import AboutTab from '../components/AboutTab';
 
-import { apiUrl } from '../lib/apiBase';
-import PredictionResult from '../components/PredictionResult';
-import TeamSelector from '../components/TeamSelector';
+const TABS = [
+  { id: 0, label: '📅 Today' },
+  { id: 1, label: '🔮 Custom' },
+  { id: 2, label: '📋 History' },
+  { id: 3, label: '⚙️ About' },
+];
 
 export default function Home() {
-  const [leagues, setLeagues] = useState([]);
-  const [selectedLeague, setSelectedLeague] = useState('');
-  const [teams, setTeams] = useState([]);
-  const [homeTeam, setHomeTeam] = useState('');
-  const [awayTeam, setAwayTeam] = useState('');
-  const [season, setSeason] = useState('2024-2025');
-  const [prediction, setPrediction] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const [activeTab, setActiveTab] = useState(0);
 
-  // Load the leagues once on mount.
+  // Warm up the backend as soon as the page loads (free-tier servers sleep).
   useEffect(() => {
-    let cancelled = false;
-
-    async function fetchLeagues() {
-      try {
-        const res = await fetch(apiUrl('/predict/leagues'));
-        const data = await res.json();
-        if (!cancelled) setLeagues(data.leagues || []);
-      } catch (err) {
-        if (!cancelled) setError('Could not reach the API — is it running?');
-      }
-    }
-
-    fetchLeagues();
-    return () => {
-      cancelled = true;
-    };
+    fetch(`${getApiBase()}/`).catch(() => {});
   }, []);
 
-  // Reload the team list whenever the league changes.
-  async function handleLeagueChange(league) {
-    setSelectedLeague(league);
-    setHomeTeam('');
-    setAwayTeam('');
-    setPrediction(null);
-    setError(null);
-
-    if (!league) {
-      setTeams([]);
-      return;
-    }
-
-    try {
-      const res = await fetch(
-        apiUrl(`/predict/teams?league=${encodeURIComponent(league)}`)
-      );
-      const data = await res.json();
-      setTeams(data.teams || []);
-    } catch (err) {
-      setTeams([]);
-      setError('Could not load teams — is the API running?');
-    }
-  }
-
-  async function handlePredict() {
-    if (homeTeam === awayTeam) {
-      setError('Home and away teams must be different');
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      const res = await fetch(apiUrl('/predict/match'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          home_team: homeTeam,
-          away_team: awayTeam,
-          league: selectedLeague,
-          season,
-        }),
-      });
-
-      if (res.status === 503) {
-        setError('Models not loaded yet — run the data pipeline first');
-        setPrediction(null);
-      } else if (!res.ok) {
-        setError('Prediction failed — is the API running?');
-        setPrediction(null);
-      } else {
-        const data = await res.json();
-        setPrediction(data);
-      }
-    } catch (err) {
-      setError('Prediction failed — is the API running?');
-      setPrediction(null);
-    }
-
-    setLoading(false);
-  }
-
-  const canPredict =
-    Boolean(selectedLeague) && Boolean(homeTeam) && Boolean(awayTeam);
-
   return (
-    <>
+    <div className="min-h-screen" style={{ background: 'var(--navy)' }}>
       <Head>
-        <title>Football Match Predictor</title>
+        <title>Football Predictor — ML Match Predictions</title>
         <meta
           name="description"
-          content="Predict the outcome of football matches."
+          content="Machine-learning football predictions for the top 5 European leagues"
         />
       </Head>
 
-      <div className="min-h-screen bg-gray-100">
-        <main className="mx-auto max-w-2xl p-6">
-          <h1 className="mb-6 text-center text-3xl font-bold text-gray-900">
-            ⚽ Football Match Predictor
-          </h1>
-
-          <div className="rounded-xl bg-white p-6 shadow-md">
-            <label className="mb-1 block text-sm font-medium text-gray-700">
-              League
-            </label>
-            <select
-              className="mb-4 w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-gray-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-              value={selectedLeague}
-              onChange={(event) => handleLeagueChange(event.target.value)}
+      <div className="max-w-6xl mx-auto px-4">
+        {/* ── Header ───────────────────────────────────────────── */}
+        <header className="pt-8 pb-4">
+          <div className="flex items-end justify-between flex-wrap gap-2">
+            <h1 className="text-3xl md:text-4xl font-bold flex items-center gap-3">
+              <span className="float inline-block">⚽</span>
+              <span className="gradient-text tracking-wide">
+                FOOTBALL PREDICTOR
+              </span>
+            </h1>
+            <span
+              className="text-sm pb-1"
+              style={{ color: 'var(--text-muted)' }}
             >
-              <option value="">Select league...</option>
-              {leagues.map((league) => (
-                <option key={league} value={league}>
-                  {league}
-                </option>
-              ))}
-            </select>
-
-            <div className="mb-4">
-              <label className="mb-1 block text-sm font-medium text-gray-700">
-                Season
-              </label>
-              <input
-                type="text"
-                className="w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-gray-900 shadow-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                value={season}
-                onChange={(event) => setSeason(event.target.value)}
-                placeholder="2024-2025"
-              />
-            </div>
-
-            <TeamSelector
-              label="Home Team"
-              teams={teams}
-              value={homeTeam}
-              onChange={setHomeTeam}
-              exclude={awayTeam}
-            />
-
-            <TeamSelector
-              label="Away Team"
-              teams={teams}
-              value={awayTeam}
-              onChange={setAwayTeam}
-              exclude={homeTeam}
-            />
-
-            <button
-              type="button"
-              onClick={handlePredict}
-              disabled={loading || !canPredict}
-              className="mt-2 w-full rounded-md bg-blue-600 px-4 py-2 font-semibold text-white shadow-sm transition-colors hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:cursor-not-allowed disabled:bg-gray-300 disabled:text-gray-500"
-            >
-              {loading ? 'Predicting...' : 'Get Prediction'}
-            </button>
-
-            {error && (
-              <p className="mt-4 rounded-md bg-red-50 p-3 text-center text-sm text-red-600">
-                {error}
-              </p>
-            )}
-
-            {prediction && <PredictionResult data={prediction} />}
+              Powered by ML
+            </span>
           </div>
+          <div
+            className="mt-4 h-px w-full"
+            style={{
+              background:
+                'linear-gradient(90deg, var(--blue), var(--green), transparent)',
+            }}
+          />
+        </header>
+
+        {/* ── Tab bar ──────────────────────────────────────────── */}
+        <nav className="flex gap-1 mt-2 overflow-x-auto">
+          {TABS.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              className={`relative px-5 py-3 text-sm md:text-base font-semibold rounded-t-lg transition-colors whitespace-nowrap ${
+                activeTab === tab.id
+                  ? 'tab-active'
+                  : 'hover:bg-white/5'
+              }`}
+              style={{
+                color:
+                  activeTab === tab.id ? 'var(--blue)' : 'var(--text-muted)',
+              }}
+            >
+              {tab.label}
+              {activeTab === tab.id && (
+                <motion.div
+                  layoutId="tab-underline"
+                  className="absolute bottom-0 left-0 right-0 h-0.5"
+                  style={{
+                    background:
+                      'linear-gradient(90deg, var(--blue), var(--green))',
+                  }}
+                  transition={{ type: 'spring', stiffness: 400, damping: 35 }}
+                />
+              )}
+            </button>
+          ))}
+        </nav>
+
+        {/* ── Tab content ──────────────────────────────────────── */}
+        <main className="py-8">
+          <AnimatePresence mode="wait">
+            <motion.div
+              key={activeTab}
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              {activeTab === 0 && <TodayTab />}
+              {activeTab === 1 && <CustomTab />}
+              {activeTab === 2 && (
+                <div className="flex justify-center py-12">
+                  <div className="glass px-10 py-12 text-center max-w-md">
+                    <div className="text-6xl mb-4">📋</div>
+                    <h2 className="text-2xl font-bold gradient-text mb-3">
+                      Match History
+                    </h2>
+                    <p
+                      className="mb-6"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      Coming soon — finished match results and prediction
+                      accuracy tracking will appear here.
+                    </p>
+                    <span className="badge-medium inline-block px-4 py-1.5 rounded-full text-sm font-semibold">
+                      🔜 Phase 8.3
+                    </span>
+                  </div>
+                </div>
+              )}
+              {activeTab === 3 && <AboutTab />}
+            </motion.div>
+          </AnimatePresence>
         </main>
       </div>
-    </>
+    </div>
   );
 }
