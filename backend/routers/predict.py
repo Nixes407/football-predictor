@@ -88,6 +88,34 @@ FEATURE_COLS = [
     "h2h_away_gf_5",
     # League and season
     "league_encoded", "season_encoded",
+    # FBref home team stats
+    "home_fbref_games",
+    "home_fbref_shots", "home_fbref_shots_on_target",
+    "home_fbref_shot_accuracy",
+    "home_fbref_goals_per_shot", "home_fbref_goals_per_sot",
+    "home_fbref_yellow_cards", "home_fbref_red_cards",
+    "home_fbref_fouls_committed", "home_fbref_fouls_drawn",
+    "home_fbref_offsides", "home_fbref_crosses",
+    "home_fbref_interceptions", "home_fbref_tackles_won",
+    "home_fbref_pens_won", "home_fbref_pens_conceded",
+    "home_fbref_sota", "home_fbref_goals_against",
+    "home_fbref_saves", "home_fbref_save_pct",
+    "home_fbref_clean_sheets",
+    "home_fbref_pk_faced", "home_fbref_pk_saved",
+    # FBref away team stats
+    "away_fbref_games",
+    "away_fbref_shots", "away_fbref_shots_on_target",
+    "away_fbref_shot_accuracy",
+    "away_fbref_goals_per_shot", "away_fbref_goals_per_sot",
+    "away_fbref_yellow_cards", "away_fbref_red_cards",
+    "away_fbref_fouls_committed", "away_fbref_fouls_drawn",
+    "away_fbref_offsides", "away_fbref_crosses",
+    "away_fbref_interceptions", "away_fbref_tackles_won",
+    "away_fbref_pens_won", "away_fbref_pens_conceded",
+    "away_fbref_sota", "away_fbref_goals_against",
+    "away_fbref_saves", "away_fbref_save_pct",
+    "away_fbref_clean_sheets",
+    "away_fbref_pk_faced", "away_fbref_pk_saved",
 ]
 
 
@@ -384,11 +412,13 @@ def _get_team_features(
         prefixes = (
             "home_form_", "home_home_",
             "home_elo", "h2h_",
+            "home_fbref_",
         )
     else:
         prefixes = (
             "away_form_", "away_away_",
             "away_elo",
+            "away_fbref_",
         )
 
     result = {}
