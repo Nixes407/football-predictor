@@ -1,4 +1,4 @@
-name: Daily FBref Stats Update
+name: Daily Data Collection + Model Retrain
 
 on:
   schedule:
@@ -6,36 +6,21 @@ on:
   workflow_dispatch:         # manual trigger
 
 jobs:
-  fbref-update:
+  collect-and-retrain:
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
     env:
-      DATABASE_URL:    ${{ secrets.DATABASE_URL }}
-      SUPABASE_URL:    ${{ secrets.SUPABASE_URL }}
-      SUPABASE_KEY:    ${{ secrets.SUPABASE_KEY }}
-      PIPELINE_SECRET: ${{ secrets.PIPELINE_SECRET }}
-      RENDER_BACKEND:  ${{ secrets.RENDER_BACKEND }}
+      DATABASE_URL:      ${{ secrets.DATABASE_URL }}
+      SUPABASE_URL:      ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY:      ${{ secrets.SUPABASE_KEY }}
+      PIPELINE_SECRET:   ${{ secrets.PIPELINE_SECRET }}
+      RENDER_BACKEND:    ${{ secrets.RENDER_BACKEND }}
+      API_FOOTBALL_KEY:  ${{ secrets.API_FOOTBALL_KEY }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Install Chrome
-        run: |
-          wget -q -O - \
-            https://dl-ssl.google.com/linux/linux_signing_key.pub \
-            | gpg --dearmor \
-            | sudo tee \
-              /etc/apt/trusted.gpg.d/google-chrome.gpg \
-              > /dev/null
-          echo \
-            "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
-            | sudo tee \
-              /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -qq
-          sudo apt-get install -y google-chrome-stable
-          echo "Chrome version: $(google-chrome --version)"
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -50,62 +35,93 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run team stats collector
+      - name: Run StatsBomb collector
         working-directory: backend
         run: |
-          echo "==> Scraping FBref team stats..."
-          python data/fbref_team_collector.py
-          echo "==> Team stats complete"
+          echo "==> [1/3] Downloading StatsBomb open data..."
+          python data/statsbomb_collector.py
+          if [ $? -ne 0 ]; then
+            echo "FATAL: StatsBomb collector failed."
+            echo "Pipeline will NOT be triggered."
+            echo "No data has been updated."
+            exit 1
+          fi
+          echo "==> StatsBomb collection complete"
 
-      - name: Run player stats collector
+      - name: Run Understat xG collector
         working-directory: backend
         run: |
-          echo "==> Scraping FBref player stats..."
-          python data/fbref_player_collector.py
-          echo "==> Player stats complete"
+          echo "==> [2/3] Collecting Understat xG data..."
+          python data/understat_collector.py
+          if [ $? -ne 0 ]; then
+            echo "FATAL: Understat collector failed."
+            echo "Pipeline will NOT be triggered."
+            echo "No data has been updated."
+            exit 1
+          fi
+          echo "==> Understat collection complete"
 
-      - name: Trigger fast pipeline on Render
+      - name: Run API-Football collector
+        working-directory: backend
         run: |
-          echo "==> Triggering Render pipeline..."
+          echo "==> [3/3] Collecting API-Football data..."
+          python data/api_football_collector.py
+          if [ $? -ne 0 ]; then
+            echo "FATAL: API-Football collector failed."
+            echo "Pipeline will NOT be triggered."
+            echo "No data has been updated."
+            exit 1
+          fi
+          echo "==> API-Football collection complete"
+
+      - name: All collectors succeeded — trigger pipeline
+        run: |
+          echo "==> All 3 collectors completed successfully."
+          echo "==> Triggering Render fast pipeline..."
           HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
             -X POST \
             "${RENDER_BACKEND}/predict/admin/run-pipeline-fast?secret=${PIPELINE_SECRET}")
-          echo "HTTP: $HTTP"
+          echo "HTTP status: $HTTP"
           cat /tmp/resp.json
           if [ "$HTTP" != "200" ]; then
-            echo "ERROR: pipeline trigger failed"
+            echo "FATAL: pipeline trigger failed with HTTP $HTTP"
             exit 1
           fi
+          echo "==> Pipeline triggered successfully"
 
       - name: Wait for pipeline completion
         run: |
+          echo "==> Waiting for pipeline to complete..."
           MAX=5400
           INTERVAL=60
           ELAPSED=0
           while [ $ELAPSED -lt $MAX ]; do
-            STATUS=$(curl -s \
-              "${RENDER_BACKEND}/predict/admin/status" \
-              | python3 -c "
+            RESPONSE=$(curl -s \
+              "${RENDER_BACKEND}/predict/admin/status")
+            STATUS=$(echo "$RESPONSE" | python3 -c "
           import sys,json
-
           d=json.load(sys.stdin)
-
           print(d.get('pipeline_status','unknown'))
           ")
-            echo "[${ELAPSED}s] status: $STATUS"
+            RUNNING=$(echo "$RESPONSE" | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          print(d.get('pipeline_running',False))
+          ")
+            echo "[${ELAPSED}s] status=${STATUS} running=${RUNNING}"
             if [ "$STATUS" = "complete" ]; then
               echo "==> Pipeline complete!"
               break
             fi
-            if echo "$STATUS" | grep -qE "failed|timeout|error"; then
-              echo "ERROR: pipeline failed: $STATUS"
+            if echo "$STATUS" | grep -qE "^failed|^timeout|^error"; then
+              echo "FATAL: pipeline failed with status: $STATUS"
               exit 1
             fi
             sleep $INTERVAL
             ELAPSED=$((ELAPSED+INTERVAL))
           done
           if [ $ELAPSED -ge $MAX ]; then
-            echo "WARNING: timed out after 90 minutes"
+            echo "FATAL: pipeline did not complete within 90 minutes"
             exit 1
           fi
 
@@ -115,25 +131,31 @@ jobs:
             "${RENDER_BACKEND}/predict/admin/status" \
             | python3 -c "
           import sys,json
-
           d=json.load(sys.stdin)
-
           print(d.get('ready',False))
           ")
-          echo "Ready: $READY"
+          echo "Models ready: $READY"
           if [ "$READY" != "True" ]; then
-            echo "ERROR: models not ready"
+            echo "FATAL: models not ready after pipeline"
             exit 1
           fi
-          echo "==> All models loaded!"
+          echo "==> All models loaded and ready!"
 
-      - name: Print diagnostics
+      - name: Print final diagnostics
         run: |
-          echo "==> Diagnostics:"
-          curl -s \
-            "${RENDER_BACKEND}/predict/admin/diagnostics" \
+          echo "==> Final diagnostics:"
+          curl -s "${RENDER_BACKEND}/predict/admin/diagnostics" \
             | python3 -c "
           import sys,json
-
           print(json.dumps(json.load(sys.stdin),indent=2))
           "
+
+      - name: Success summary
+        run: |
+          echo "================================"
+          echo "Daily update SUCCESSFUL"
+          echo "Date: $(date -u)"
+          echo "All collectors: PASSED"
+          echo "Pipeline: COMPLETE"
+          echo "Models: READY"
+          echo "================================"
