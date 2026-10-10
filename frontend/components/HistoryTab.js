@@ -39,8 +39,8 @@ function ResultBadge({ correct }) {
 }
 
 function MatchCard({ match }) {
-  const homeGoals = match.home_goals ?? '?';
-  const awayGoals = match.away_goals ?? '?';
+  const homeGoals = match.home_score ?? match.home_goals ?? '?';
+  const awayGoals = match.away_score ?? match.away_goals ?? '?';
   const actual    = match.result;
 
   const probs = {
