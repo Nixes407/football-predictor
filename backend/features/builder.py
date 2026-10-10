@@ -38,6 +38,77 @@ FBREF_STAT_COLUMNS = [
 
 FBREF_COLUMNS = FBREF_KEY_COLUMNS + FBREF_STAT_COLUMNS
 
+# Canonical team names keyed by known variants. Team names in the matches
+# table (Football-Data.co.uk) differ from those in fbref_team_stats (FBref),
+# so both sides are mapped to this canonical form before joining.
+TEAM_NAME_MAP: dict[str, str] = {
+    # English
+    "Man United":          "Manchester Utd",
+    "Manchester United":   "Manchester Utd",
+    "Man Utd":             "Manchester Utd",
+    "Man City":            "Manchester City",
+    "Wolves":              "Wolverhampton Wanderers",
+    "Spurs":               "Tottenham Hotspur",
+    "Tottenham":           "Tottenham Hotspur",
+    "Brighton":            "Brighton & Hove Albion",
+    "Newcastle":           "Newcastle Utd",
+    "Newcastle United":    "Newcastle Utd",
+    "West Ham":            "West Ham United",
+    "Nott'm Forest":       "Nottingham Forest",
+    "Nottm Forest":        "Nottingham Forest",
+    "Leicester":           "Leicester City",
+    "Sheffield Utd":       "Sheffield United",
+    "Leeds":               "Leeds United",
+    "Brentford":           "Brentford",
+    "Fulham":              "Fulham",
+    "Luton":               "Luton Town",
+    "Burnley":             "Burnley",
+    "Bournemouth":         "Bournemouth",
+    "Ipswich":             "Ipswich Town",
+    "Southampton":         "Southampton",
+    "Everton":             "Everton",
+    "Chelsea":             "Chelsea",
+    "Arsenal":             "Arsenal",
+    "Liverpool":           "Liverpool",
+    "Aston Villa":         "Aston Villa",
+    "Crystal Palace":      "Crystal Palace",
+    # Spanish
+    "Almeria":             "Almería",
+    "Atletico Madrid":     "Atlético Madrid",
+    "Betis":               "Real Betis",
+    "Cadiz":               "Cádiz",
+    "Espanol":             "Espanyol",
+    "Leganes":             "Leganés",
+    # German
+    "Greuther Furth":      "Greuther Fürth",
+    "Koln":                "Köln",
+    "FC Koln":             "Köln",
+    "Dusseldorf":          "Düsseldorf",
+    "Nurnberg":            "Nürnberg",
+    "Hannover":            "Hannover 96",
+    "Bochum":              "VfL Bochum",
+    "M'gladbach":          "Mönchengladbach",
+    "Mainz":               "Mainz 05",
+    # Italian
+    "Inter":               "Internazionale",
+    "Inter Milan":         "Internazionale",
+    "AC Milan":            "Milan",
+    "Hellas Verona":       "Verona",
+    # French
+    "Paris SG":            "Paris S-G",
+    "PSG":                 "Paris S-G",
+    "St Etienne":          "Saint-Étienne",
+    "Saint-Etienne":       "Saint-Étienne",
+    "Marseille":           "Marseille",
+}
+
+
+def normalise_team_name(name: str) -> str:
+    """Map known team name variants to a canonical form."""
+    if not isinstance(name, str):
+        return name
+    return TEAM_NAME_MAP.get(name, name)
+
 
 def load_matches_from_db() -> pd.DataFrame:
     """Load all rows from the matches table, sorted by date."""
@@ -487,9 +558,22 @@ def build_and_save_features(
             stat_cols = [c for c in FBREF_COLUMNS if c not in FBREF_KEY_COLUMNS]
 
             fbref_df = fbref_df.drop_duplicates(subset=FBREF_KEY_COLUMNS, keep="last")
+
+            # Normalise team names so they match the names used in the matches
+            # table
+            fbref_df["team"] = fbref_df["team"].apply(normalise_team_name)
+
             fbref_df[stat_cols] = fbref_df[stat_cols].apply(
                 pd.to_numeric, errors="coerce"
             )
+
+            # Normalise team names in the feature matrix to match the
+            # canonical form
+            features_df = features_df.copy()
+            features_df["home_team"] = features_df["home_team"].apply(
+                normalise_team_name)
+            features_df["away_team"] = features_df["away_team"].apply(
+                normalise_team_name)
 
             # Renaming the team key to home_team / away_team and prefixing the
             # stats means each merge uses shared key names, so the merge brings
