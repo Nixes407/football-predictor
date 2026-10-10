@@ -287,6 +287,302 @@ class MatchResult(Base):
     fetched_at = Column(String, nullable=True)
 
 
+class TeamSeasonStats(Base):
+    """
+    One row per team / league / season.
+    Stores all FBref advanced team statistics
+    across all stat categories.
+    Updated daily by the GitHub Actions workflow.
+    """
+
+    __tablename__ = "team_season_stats"
+    __table_args__ = (
+        UniqueConstraint(
+            "team", "league", "season",
+            name="uq_team_season_stats"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    team = Column(Text, nullable=False)
+    league = Column(Text, nullable=False)
+    season = Column(Text, nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # --- SHOOTING ---
+    sh_goals = Column(Float)  # Goals
+    sh_shots = Column(Float)  # Shots total
+    sh_sot = Column(Float)  # Shots on target
+    sh_sot_pct = Column(Float)  # Shots on target %
+    sh_sh_per90 = Column(Float)  # Shots per 90
+    sh_sot_per90 = Column(Float)  # SoT per 90
+    sh_g_per_sh = Column(Float)  # Goals per shot
+    sh_g_per_sot = Column(Float)  # Goals per SoT
+    sh_avg_dist = Column(Float)  # Avg shot distance
+    sh_xg = Column(Float)  # xG
+    sh_npxg = Column(Float)  # Non-penalty xG
+    sh_npxg_per_sh = Column(Float)  # npxG per shot
+    sh_g_minus_xg = Column(Float)  # Goals minus xG
+    sh_npg_minus_npxg = Column(Float)  # np:G minus npxG
+
+    # --- PASSING ---
+    ps_cmp = Column(Float)  # Passes completed
+    ps_att = Column(Float)  # Passes attempted
+    ps_cmp_pct = Column(Float)  # Pass completion %
+    ps_totdist = Column(Float)  # Total pass distance
+    ps_prgdist = Column(Float)  # Progressive pass distance
+    ps_cmp_short = Column(Float)  # Short passes completed
+    ps_att_short = Column(Float)  # Short passes attempted
+    ps_cmp_pct_short = Column(Float)  # Short pass completion %
+    ps_cmp_medium = Column(Float)  # Medium passes completed
+    ps_att_medium = Column(Float)  # Medium passes attempted
+    ps_cmp_pct_medium = Column(Float)  # Medium pass completion %
+    ps_cmp_long = Column(Float)  # Long passes completed
+    ps_att_long = Column(Float)  # Long passes attempted
+    ps_cmp_pct_long = Column(Float)  # Long pass completion %
+    ps_ast = Column(Float)  # Assists
+    ps_xag = Column(Float)  # xAG
+    ps_xa = Column(Float)  # xA
+    ps_kp = Column(Float)  # Key passes
+    ps_final_third = Column(Float)  # Passes into final third
+    ps_ppa = Column(Float)  # Passes into penalty area
+    ps_crspa = Column(Float)  # Crosses into penalty area
+    ps_prgp = Column(Float)  # Progressive passes
+
+    # --- GOAL & SHOT CREATION ---
+    gsc_sca = Column(Float)  # Shot-creating actions
+    gsc_sca90 = Column(Float)  # SCA per 90
+    gsc_sca_passlive = Column(Float)  # SCA from live passes
+    gsc_sca_passdead = Column(Float)  # SCA from dead passes
+    gsc_sca_to = Column(Float)  # SCA from take-ons
+    gsc_sca_sh = Column(Float)  # SCA from shots
+    gsc_sca_fld = Column(Float)  # SCA from fouls drawn
+    gsc_sca_def = Column(Float)  # SCA from defensive actions
+    gsc_gca = Column(Float)  # Goal-creating actions
+    gsc_gca90 = Column(Float)  # GCA per 90
+    gsc_gca_passlive = Column(Float)  # GCA from live passes
+    gsc_gca_passdead = Column(Float)  # GCA from dead passes
+    gsc_gca_to = Column(Float)  # GCA from take-ons
+    gsc_gca_sh = Column(Float)  # GCA from shots
+    gsc_gca_fld = Column(Float)  # GCA from fouls drawn
+    gsc_gca_def = Column(Float)  # GCA from defensive actions
+
+    # --- DEFENSIVE ACTIONS ---
+    def_tkl = Column(Float)  # Tackles
+    def_tklw = Column(Float)  # Tackles won
+    def_tkl_def3rd = Column(Float)  # Tackles def third
+    def_tkl_mid3rd = Column(Float)  # Tackles mid third
+    def_tkl_att3rd = Column(Float)  # Tackles att third
+    def_drib_tkl = Column(Float)  # Dribblers tackled
+    def_drib_att = Column(Float)  # Dribbler tackle attempts
+    def_drib_tkl_pct = Column(Float)  # Dribbler tackle %
+    def_press = Column(Float)  # Pressures
+    def_press_succ = Column(Float)  # Successful pressures
+    def_press_pct = Column(Float)  # Pressure success %
+    def_press_def3rd = Column(Float)  # Pressures def third
+    def_press_mid3rd = Column(Float)  # Pressures mid third
+    def_press_att3rd = Column(Float)  # Pressures att third
+    def_blocks = Column(Float)  # Blocks
+    def_blk_sh = Column(Float)  # Shots blocked
+    def_blk_shsv = Column(Float)  # Shots on target blocked
+    def_blk_pass = Column(Float)  # Passes blocked
+    def_int = Column(Float)  # Interceptions
+    def_tkl_int = Column(Float)  # Tackles + interceptions
+    def_clr = Column(Float)  # Clearances
+    def_err = Column(Float)  # Errors leading to shot
+
+    # --- POSSESSION ---
+    pos_poss = Column(Float)  # Possession %
+    pos_touches = Column(Float)  # Touches
+    pos_touch_defpen = Column(Float)  # Touches def pen area
+    pos_touch_def3rd = Column(Float)  # Touches def third
+    pos_touch_mid3rd = Column(Float)  # Touches mid third
+    pos_touch_att3rd = Column(Float)  # Touches att third
+    pos_touch_attpen = Column(Float)  # Touches att pen area
+    pos_to_att = Column(Float)  # Take-ons attempted
+    pos_to_succ = Column(Float)  # Take-ons successful
+    pos_to_succ_pct = Column(Float)  # Take-on success %
+    pos_to_tkld = Column(Float)  # Times tackled during take-on
+    pos_carries = Column(Float)  # Carries
+    pos_carry_totdist = Column(Float)  # Carry total distance
+    pos_carry_prgdist = Column(Float)  # Carry progressive distance
+    pos_prgc = Column(Float)  # Progressive carries
+    pos_carry_final3rd = Column(Float)  # Carries into final third
+    pos_cpa = Column(Float)  # Carries into pen area
+    pos_mis = Column(Float)  # Miscontrols
+    pos_dis = Column(Float)  # Dispossessed
+    pos_rec = Column(Float)  # Passes received
+    pos_prgr = Column(Float)  # Progressive passes received
+
+    # --- MISCELLANEOUS ---
+    misc_crdy = Column(Float)  # Yellow cards
+    misc_crdr = Column(Float)  # Red cards
+    misc_fls = Column(Float)  # Fouls committed
+    misc_fld = Column(Float)  # Fouls drawn
+    misc_off = Column(Float)  # Offsides
+    misc_crs = Column(Float)  # Crosses
+    misc_tklw = Column(Float)  # Tackles won
+    misc_pkwon = Column(Float)  # Penalties won
+    misc_pkcon = Column(Float)  # Penalties conceded
+    misc_og = Column(Float)  # Own goals
+    misc_recov = Column(Float)  # Ball recoveries
+    misc_aerial_won = Column(Float)  # Aerial duels won
+    misc_aerial_lost = Column(Float)  # Aerial duels lost
+    misc_aerial_pct = Column(Float)  # Aerial duel win %
+
+    # --- GOALKEEPING ---
+    gk_ga = Column(Float)  # Goals against
+    gk_ga90 = Column(Float)  # GA per 90
+    gk_sota = Column(Float)  # Shots on target against
+    gk_saves = Column(Float)  # Saves
+    gk_save_pct = Column(Float)  # Save %
+    gk_w = Column(Float)  # Wins
+    gk_d = Column(Float)  # Draws
+    gk_l = Column(Float)  # Losses
+    gk_cs = Column(Float)  # Clean sheets
+    gk_cs_pct = Column(Float)  # Clean sheet %
+    gk_pka = Column(Float)  # Penalties faced
+    gk_pksvd = Column(Float)  # Penalties saved
+    gk_pksv_pct = Column(Float)  # Penalty save %
+
+    # --- ADVANCED GOALKEEPING ---
+    gka_psxg = Column(Float)  # Post-shot xG
+    gka_psxg_per_sot = Column(Float)  # PSxG per SoT
+    gka_psxg_diff = Column(Float)  # PSxG+/- (GK quality)
+    gka_psxg_diff90 = Column(Float)  # PSxG+/- per 90
+    gka_launch_cmp = Column(Float)  # Launch passes completed
+    gka_launch_att = Column(Float)  # Launch passes attempted
+    gka_launch_pct = Column(Float)  # Launch pass completion %
+    gka_pass_att = Column(Float)  # Pass attempts (GK)
+    gka_pass_launch = Column(Float)  # Launch % (passes)
+    gka_pass_avglen = Column(Float)  # Avg pass length
+    gka_gkick_att = Column(Float)  # Goal kick attempts
+    gka_gkick_launch = Column(Float)  # Goal kick launch %
+    gka_gkick_avglen = Column(Float)  # Avg goal kick length
+    gka_cross_opp = Column(Float)  # Crosses faced
+    gka_cross_stp = Column(Float)  # Crosses stopped
+    gka_cross_stp_pct = Column(Float)  # Cross stop %
+    gka_opa = Column(Float)  # Sweeper actions
+    gka_opa90 = Column(Float)  # Sweeper actions per 90
+    gka_avgdist = Column(Float)  # Avg distance from goal
+
+    def __repr__(self):
+        return f"<TeamSeasonStats {self.team} {self.league} {self.season}>"
+
+
+class PlayerSeasonStats(Base):
+    """
+    One row per player / team / league / season.
+    Stores FBref advanced player statistics.
+    Updated daily by the GitHub Actions workflow.
+    """
+
+    __tablename__ = "player_season_stats"
+    __table_args__ = (
+        UniqueConstraint(
+            "player", "team", "league", "season",
+            name="uq_player_season_stats"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    player = Column(Text, nullable=False)
+    team = Column(Text, nullable=False)
+    league = Column(Text, nullable=False)
+    season = Column(Text, nullable=False)
+    position = Column(Text)
+    age = Column(Integer)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    # --- STANDARD ---
+    mp = Column(Integer)  # Matches played
+    starts = Column(Integer)  # Starts
+    minutes = Column(Float)  # Minutes played
+    minutes_per90 = Column(Float)  # 90s played
+    goals = Column(Float)  # Goals
+    assists = Column(Float)  # Assists
+    g_plus_a = Column(Float)  # Goals + assists
+    g_minus_pk = Column(Float)  # Non-penalty goals
+    pk = Column(Float)  # Penalties scored
+    pkatt = Column(Float)  # Penalties attempted
+    crdy = Column(Float)  # Yellow cards
+    crdr = Column(Float)  # Red cards
+    xg = Column(Float)  # xG
+    npxg = Column(Float)  # Non-penalty xG
+    xag = Column(Float)  # xAG
+    npxg_plus_xag = Column(Float)  # npxG + xAG
+    prgc = Column(Float)  # Progressive carries
+    prgp = Column(Float)  # Progressive passes
+    prgr = Column(Float)  # Progressive passes received
+
+    # --- PER 90 ---
+    gls_per90 = Column(Float)  # Goals per 90
+    ast_per90 = Column(Float)  # Assists per 90
+    g_plus_a_per90 = Column(Float)  # G+A per 90
+    g_minus_pk_per90 = Column(Float)  # Non-PK goals per 90
+    xg_per90 = Column(Float)  # xG per 90
+    xag_per90 = Column(Float)  # xAG per 90
+    xg_plus_xag_per90 = Column(Float)  # xG+xAG per 90
+    npxg_per90 = Column(Float)  # npxG per 90
+    npxg_plus_xag_per90 = Column(Float)  # npxG+xAG per 90
+
+    # --- SHOOTING ---
+    sh_shots = Column(Float)  # Shots
+    sh_sot = Column(Float)  # Shots on target
+    sh_sot_pct = Column(Float)  # SoT %
+    sh_sh_per90 = Column(Float)  # Shots per 90
+    sh_sot_per90 = Column(Float)  # SoT per 90
+    sh_g_per_sh = Column(Float)  # Goals per shot
+    sh_g_per_sot = Column(Float)  # Goals per SoT
+    sh_avg_dist = Column(Float)  # Avg shot distance
+    sh_xg = Column(Float)  # xG
+    sh_npxg = Column(Float)  # npxG
+    sh_g_minus_xg = Column(Float)  # Goals minus xG
+
+    # --- GOAL & SHOT CREATION ---
+    sca = Column(Float)  # Shot-creating actions
+    sca90 = Column(Float)  # SCA per 90
+    gca = Column(Float)  # Goal-creating actions
+    gca90 = Column(Float)  # GCA per 90
+
+    # --- DEFENSIVE ---
+    tkl = Column(Float)  # Tackles
+    tklw = Column(Float)  # Tackles won
+    press = Column(Float)  # Pressures
+    press_succ = Column(Float)  # Successful pressures
+    blocks = Column(Float)  # Blocks
+    int_ = Column(Float)  # Interceptions
+    tkl_plus_int = Column(Float)  # Tackles + interceptions
+    clr = Column(Float)  # Clearances
+    err = Column(Float)  # Errors
+
+    # --- POSSESSION ---
+    touches = Column(Float)  # Touches
+    touch_att3rd = Column(Float)  # Touches att third
+    touch_attpen = Column(Float)  # Touches att pen area
+    carries = Column(Float)  # Carries
+    prgc_carries = Column(Float)  # Progressive carries
+    cpa = Column(Float)  # Carries into pen area
+    rec = Column(Float)  # Passes received
+
+    # --- MISCELLANEOUS ---
+    fls = Column(Float)  # Fouls committed
+    fld = Column(Float)  # Fouls drawn
+    off = Column(Float)  # Offsides
+    crs = Column(Float)  # Crosses
+    pkwon = Column(Float)  # Penalties won
+    pkcon = Column(Float)  # Penalties conceded
+    aerial_won = Column(Float)  # Aerial duels won
+    aerial_lost = Column(Float)  # Aerial duels lost
+    aerial_pct = Column(Float)  # Aerial win %
+
+    def __repr__(self):
+        return (
+            f"<PlayerSeasonStats {self.player} "
+            f"{self.team} {self.season}>"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Schema management
 # --------------------------------------------------------------------------- #
@@ -324,7 +620,9 @@ __all__ = [
     "FBrefTeamStats",
     "Match",
     "MatchResult",
+    "PlayerSeasonStats",
     "SessionLocal",
+    "TeamSeasonStats",
     "engine",
     "get_database_url",
     "get_engine_url",
