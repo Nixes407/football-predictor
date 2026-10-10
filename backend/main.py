@@ -132,9 +132,11 @@ def scheduled_daily_fetch():
         print("[scheduler] Running daily fixture fetch...")
         fixtures = fetch_fixtures()
         db = SessionLocal()
-        compute_and_store_predictions(fixtures, db)
-        db.close()
-        print(f"[scheduler] Done. {len(fixtures)} fixtures processed.")
+        try:
+            compute_and_store_predictions(fixtures, db)
+            print(f"[scheduler] Done. {len(fixtures)} fixtures processed.")
+        finally:
+            db.close()
     except Exception as e:
         print(f"[scheduler] ERROR in fixture fetch: {e}")
 
