@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import PredictionResult from './PredictionResult';
 import { getApiBase } from '../lib/apiBase';
 
 const SEASONS = ['2024-2025', '2025-2026', '2026-2027'];
@@ -16,30 +16,6 @@ const selectStyle = {
   fontSize: '0.95rem',
 };
 
-function getConfidence(homeWin, draw, awayWin) {
-  const maxProb = Math.max(homeWin, draw, awayWin);
-  if (maxProb >= 0.65) return { label: '🔥 HIGH', className: 'badge-high' };
-  if (maxProb >= 0.5) return { label: '⚡ MEDIUM', className: 'badge-medium' };
-  return { label: '❄️ LOW', className: 'badge-low' };
-}
-
-function ProbBar({ pct, gradient, highlight }) {
-  return (
-    <div
-      className="w-full rounded-full overflow-hidden"
-      style={{ background: 'rgba(148,163,184,0.12)', height: 6 }}
-    >
-      <motion.div
-        className={`prob-bar ${highlight ? 'glow-blue' : ''}`}
-        style={{ background: gradient }}
-        initial={{ width: 0 }}
-        animate={{ width: `${pct}%` }}
-        transition={{ duration: 0.8, ease: 'easeOut' }}
-      />
-    </div>
-  );
-}
-
 export default function CustomTab() {
   const [leagues, setLeagues] = useState([]);
   const [selectedLeague, setSelectedLeague] = useState('');
@@ -48,7 +24,7 @@ export default function CustomTab() {
   const [awayTeam, setAwayTeam] = useState('');
   const [season, setSeason] = useState('2024-2025');
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null);
+  const [prediction, setPrediction] = useState(null);
   const [error, setError] = useState(null);
 
   // Load leagues on mount
@@ -67,7 +43,7 @@ export default function CustomTab() {
     }
     setHomeTeam('');
     setAwayTeam('');
-    setResult(null);
+    setPrediction(null);
     fetch(
       `${getApiBase()}/predict/teams?league=${encodeURIComponent(selectedLeague)}`
     )
@@ -84,7 +60,7 @@ export default function CustomTab() {
     if (!canSubmit) return;
     setLoading(true);
     setError(null);
-    setResult(null);
+    setPrediction(null);
     try {
       const res = await fetch(`${getApiBase()}/predict/match`, {
         method: 'POST',
@@ -101,217 +77,12 @@ export default function CustomTab() {
         throw new Error(body.detail || `Server responded with ${res.status}`);
       }
       const data = await res.json();
-      setResult(data);
+      setPrediction(data);
     } catch (err) {
       setError(err.message || 'Prediction failed');
     } finally {
       setLoading(false);
     }
-  }
-
-  // Derived values for the result panel
-  let panel = null;
-  if (result) {
-    const homeWin = result.result?.home_win ?? 0;
-    const draw = result.result?.draw ?? 0;
-    const awayWin = result.result?.away_win ?? 0;
-    const homeGoals = result.goals?.expected_home ?? 0;
-    const awayGoals = result.goals?.expected_away ?? 0;
-    const homeCorners = result.corners?.expected_home ?? 0;
-    const awayCorners = result.corners?.expected_away ?? 0;
-    const maxProb = Math.max(homeWin, draw, awayWin);
-    const totalGoals = homeGoals + awayGoals;
-    const totalCorners = homeCorners + awayCorners;
-    const btts = homeGoals >= 1.0 && awayGoals >= 1.0;
-    const conf = getConfidence(homeWin, draw, awayWin);
-
-    const outcomes = [
-      {
-        key: 'home',
-        name: result.home_team,
-        prob: homeWin,
-        gradient: 'linear-gradient(90deg, var(--blue), var(--green))',
-      },
-      {
-        key: 'draw',
-        name: 'Draw',
-        prob: draw,
-        gradient: 'linear-gradient(90deg, var(--gold), #fbbf24)',
-      },
-      {
-        key: 'away',
-        name: result.away_team,
-        prob: awayWin,
-        gradient: 'linear-gradient(90deg, var(--purple), var(--blue))',
-      },
-    ];
-
-    panel = (
-      <motion.div
-        key="result"
-        className="glass p-6 mt-6"
-        initial={{ opacity: 0, y: 16 }}
-        animate={{ opacity: 1, y: 0 }}
-        exit={{ opacity: 0, y: -16 }}
-        transition={{ duration: 0.3 }}
-      >
-        {/* Heading + confidence */}
-        <div className="flex items-start justify-between gap-3 mb-5">
-          <h3 className="text-xl md:text-2xl font-bold gradient-text">
-            {result.home_team} vs {result.away_team}
-          </h3>
-          <span
-            className={`${conf.className} text-xs font-bold px-3 py-1 rounded-full whitespace-nowrap`}
-          >
-            {conf.label}
-          </span>
-        </div>
-
-        {/* Match Result */}
-        <div className="mb-5">
-          <h4 className="text-sm font-bold mb-3">⚽ Match Result</h4>
-          <div className="grid grid-cols-3 gap-3">
-            {outcomes.map((o) => {
-              const highlight = o.prob === maxProb && maxProb > 0;
-              return (
-                <div
-                  key={o.key}
-                  className={`rounded-xl p-3 text-center ${
-                    highlight ? 'gradient-border' : ''
-                  }`}
-                  style={{
-                    background: highlight
-                      ? 'rgba(0,212,255,0.06)'
-                      : 'rgba(148,163,184,0.04)',
-                  }}
-                >
-                  <div
-                    className="text-xs mb-1 truncate"
-                    style={{ color: 'var(--text-muted)' }}
-                    title={o.name}
-                  >
-                    {o.name}
-                  </div>
-                  <div
-                    className={`text-2xl font-bold mb-2 ${
-                      highlight ? 'gradient-text' : ''
-                    }`}
-                  >
-                    {(o.prob * 100).toFixed(1)}%
-                  </div>
-                  <ProbBar
-                    pct={o.prob * 100}
-                    gradient={o.gradient}
-                    highlight={highlight}
-                  />
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {/* Goals & Corners */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-5">
-          <div
-            className="rounded-xl p-4"
-            style={{ background: 'rgba(148,163,184,0.04)' }}
-          >
-            <h4 className="text-sm font-bold mb-3">⚽ Expected Goals</h4>
-            <div className="flex items-center justify-around">
-              <div className="text-center">
-                <div
-                  className="text-3xl font-bold"
-                  style={{ color: 'var(--green)' }}
-                >
-                  {homeGoals.toFixed(2)}
-                </div>
-                <div
-                  className="text-xs mt-1"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  Home
-                </div>
-              </div>
-              <div className="text-center">
-                <div
-                  className="text-3xl font-bold"
-                  style={{ color: 'var(--blue)' }}
-                >
-                  {awayGoals.toFixed(2)}
-                </div>
-                <div
-                  className="text-xs mt-1"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  Away
-                </div>
-              </div>
-            </div>
-          </div>
-          <div
-            className="rounded-xl p-4"
-            style={{ background: 'rgba(148,163,184,0.04)' }}
-          >
-            <h4 className="text-sm font-bold mb-3">📐 Expected Corners</h4>
-            <div className="flex items-center justify-around">
-              <div className="text-center">
-                <div
-                  className="text-3xl font-bold"
-                  style={{ color: 'var(--green)' }}
-                >
-                  {homeCorners.toFixed(2)}
-                </div>
-                <div
-                  className="text-xs mt-1"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  Home
-                </div>
-              </div>
-              <div className="text-center">
-                <div
-                  className="text-3xl font-bold"
-                  style={{ color: 'var(--blue)' }}
-                >
-                  {awayCorners.toFixed(2)}
-                </div>
-                <div
-                  className="text-xs mt-1"
-                  style={{ color: 'var(--text-muted)' }}
-                >
-                  Away
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Quick Markets */}
-        <div className="flex flex-wrap gap-2">
-          <span
-            className={`px-4 py-1.5 rounded-full text-sm font-semibold ${
-              totalGoals >= 2.5 ? 'badge-high' : 'badge-low'
-            }`}
-          >
-            {totalGoals >= 2.5 ? 'Over 2.5 ✓' : 'Under 2.5'}
-          </span>
-          <span
-            className={`px-4 py-1.5 rounded-full text-sm font-semibold ${
-              btts ? 'badge-high' : 'badge-low'
-            }`}
-          >
-            {btts ? 'BTTS Yes ✓' : 'BTTS No'}
-          </span>
-          <span
-            className={`px-4 py-1.5 rounded-full text-sm font-semibold ${
-              totalCorners >= 9.5 ? 'badge-high' : 'badge-low'
-            }`}
-          >
-            {totalCorners >= 9.5 ? 'Over 9.5 Corners ✓' : 'Under 9.5 Corners'}
-          </span>
-        </div>
-      </motion.div>
-    );
   }
 
   return (
@@ -452,8 +223,7 @@ export default function CustomTab() {
         </div>
       )}
 
-      {/* Result */}
-      <AnimatePresence>{panel}</AnimatePresence>
+      <PredictionResult data={prediction} />
     </div>
   );
 }
