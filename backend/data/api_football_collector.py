@@ -438,3 +438,180 @@ def collect_team_form() -> int:
 
     print(f"[form] Done. Updated: {updated}")
     return updated
+
+
+def collect_player_stats() -> int:
+    """
+    9 API calls — one page per league.
+    Limited to 1 page to stay within budget.
+    """
+    print("[player] Collecting player statistics...")
+    total = 0
+
+    for league_name, league_id in LEAGUE_MAP.items():
+        latest   = max(SEASON_MAP[league_name])
+        season_l = SEASON_LABEL.get(
+            (league_id, latest), str(latest))
+        print(f"[player] {league_name} {latest}...")
+
+        data = _get("players", {
+            "league": league_id,
+            "season": latest,
+            "page":   1,
+        })
+        if not data:
+            continue
+
+        players = data.get("response", [])
+        if not players:
+            continue
+
+        db = SessionLocal()
+        try:
+            for entry in players:
+                p    = entry.get("player", {})
+                name = p.get("name", "Unknown")
+                age  = p.get("age")
+                pos  = p.get("position")
+
+                stats = entry.get("statistics", [])
+                if not stats:
+                    continue
+                s    = stats[0]
+                team = s.get("team", {}).get(
+                    "name", "Unknown")
+
+                games     = s.get("games", {})
+                goals_s   = s.get("goals", {})
+                shots_s   = s.get("shots", {})
+                passes_s  = s.get("passes", {})
+                tackles_s = s.get("tackles", {})
+                duels_s   = s.get("duels", {})
+                dribbles_s= s.get("dribbles", {})
+                fouls_s   = s.get("fouls", {})
+                cards_s   = s.get("cards", {})
+                penalty_s = s.get("penalty", {})
+
+                mins  = _safe(games.get("minutes")) or 0
+                per90 = (mins / 90) if mins > 0 else 1
+
+                gls = _safe(goals_s.get("total"))
+                ast = _safe(goals_s.get("assists"))
+                sh  = _safe(shots_s.get("total"))
+                sot = _safe(shots_s.get("on"))
+                dw  = _safe(duels_s.get("won"))
+                dt  = _safe(duels_s.get("total"))
+
+                attrs = {
+                    "position":       pos,
+                    "age":            age,
+                    "mp":             games.get("appearences"),
+                    "starts":         games.get("lineups"),
+                    "minutes":        _safe(games.get("minutes")),
+                    "minutes_per90":  round(per90, 2),
+                    "goals":          gls,
+                    "assists":        ast,
+                    "g_plus_a":       (gls or 0) + (ast or 0) or None,
+                    "crdy":           _safe(cards_s.get("yellow")),
+                    "crdr":           _safe(cards_s.get("red")),
+                    "sh_shots":       sh,
+                    "sh_sot":         sot,
+                    "sh_sot_pct":     round(sot / sh * 100, 1) if sh and sot else None,
+                    "sh_g_per_sh":    round(gls / sh, 3) if sh and gls else None,
+                    "sh_sh_per90":    round(sh / per90, 2) if sh else None,
+                    "sh_sot_per90":   round(sot / per90, 2) if sot else None,
+                    "ps_att":         _safe(passes_s.get("total")),
+                    "ps_kp":          _safe(passes_s.get("key")),
+                    "ps_cmp_pct":     _pct(passes_s.get("accuracy")),
+                    "tkl":            _safe(tackles_s.get("total")),
+                    "int_":           _safe(tackles_s.get("interceptions")),
+                    "tkl_plus_int":   (
+                        (_safe(tackles_s.get("total")) or 0) +
+                        (_safe(tackles_s.get("interceptions")) or 0)
+                    ) or None,
+                    "fls":            _safe(fouls_s.get("committed")),
+                    "fld":            _safe(fouls_s.get("drawn")),
+                    "pkwon":          _safe(penalty_s.get("won")),
+                    "pkcon":          _safe(penalty_s.get("commited")),
+                    "aerial_won":     dw,
+                    "aerial_lost":    ((dt or 0) - (dw or 0)) or None,
+                    "aerial_pct":     round(dw / dt * 100, 1) if dt and dw else None,
+                    "prgc_carries":   _safe(dribbles_s.get("success")),
+                    "gls_per90":      round(gls / per90, 3) if gls else None,
+                    "ast_per90":      round(ast / per90, 3) if ast else None,
+                    "g_plus_a_per90": round(
+                        ((gls or 0) + (ast or 0)) / per90, 3
+                    ) if (gls or ast) else None,
+                }
+
+                _upsert_player(
+                    db, name, team,
+                    league_name, season_l, attrs)
+                total += 1
+
+            db.commit()
+            print(f"[player] {league_name}: "
+                  f"{len(players)} players committed")
+
+        except Exception as exc:
+            db.rollback()
+            print(f"[player] ERROR {league_name}: {exc}")
+            raise
+        finally:
+            db.close()
+
+    print(f"[player] Done. Total: {total}")
+    return total
+
+
+def run_all() -> None:
+    """
+    Run all collectors in sequence.
+    Exits with code 1 on any failure.
+
+    API call budget (100/day free tier):
+      1  status check
+      2  fixtures + yesterday results
+      18 team stats (9 leagues x 2 seasons)
+      9  player stats (1 page per league)
+      9  injuries
+      9  team form
+      Total: ~48 calls — well within budget
+    """
+    print("=" * 60)
+    print("API-FOOTBALL DAILY COLLECTION")
+    print(f"Date: {date.today()}")
+    print("=" * 60)
+
+    if not API_KEY:
+        print("FATAL: API_FOOTBALL_KEY not set")
+        sys.exit(1)
+
+    print("\n--- STATUS CHECK ---")
+    if not check_status():
+        print("FATAL: API key invalid or unreachable")
+        sys.exit(1)
+
+    print("\n--- FIXTURES AND RESULTS ---")
+    collect_fixtures_and_results()
+
+    print("\n--- TEAM STATISTICS ---")
+    collect_team_stats()
+
+    print("\n--- PLAYER STATISTICS ---")
+    collect_player_stats()
+
+    print("\n--- INJURIES ---")
+    collect_injuries()
+
+    print("\n--- TEAM FORM ---")
+    collect_team_form()
+
+    print("\n" + "=" * 60)
+    print("COLLECTION COMPLETE")
+    print(f"Total API calls made: {_calls_made}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    run_all()
