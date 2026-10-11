@@ -358,6 +358,111 @@ def _close_session(db) -> None:
 # DATA LOADING
 # ═══════════════════════════════════════════
 
+# Common club suffixes and provider aliases stripped when deduplicating
+# league teams across Understat, FBref and API-Football.
+_TEAM_SUFFIXES = (
+    " & hove albion",
+    " and hove albion",
+    " hotspur",
+    " wanderers",
+    " united",
+    " utd",
+    " city",
+    " town",
+    " albion",
+    " athletic",
+    " rovers",
+    " county",
+    " fc",
+    " afc",
+    " sc",
+    " cf",
+    " fco",
+    " hsc",
+    " sco",
+    " ac",
+    " foot",
+)
+
+# Two-club city stems where stripping "city" / "united" / "fc" would
+# collapse two distinct clubs into one.
+_PROTECTED_TEAM_STEMS = frozenset({
+    "manchester",
+    "sheffield",
+    "bristol",
+    "paris",
+    "real",
+})
+
+_TEAM_ALIASES = {
+    "wolverhampton":            "wolves",
+    "wolverhampton wanderers":  "wolves",
+    "nott'm forest":            "nottingham forest",
+    "sheffield utd":            "sheffield united",
+    "afc bournemouth":          "bournemouth",
+    "west bromwich":            "west brom",
+    "deportivo alaves":         "alaves",
+    "real betis":               "betis",
+    "espanol":                  "espanyol",
+    "bayern munchen":           "bayern munich",
+    "bayer leverkusen":         "leverkusen",
+    "borussia dortmund":        "dortmund",
+    "borussia m.gladbach":      "gladbach",
+    "borussia monchengladbach": "gladbach",
+    "m'gladbach":               "gladbach",
+    "1. fsv mainz 05":          "mainz",
+    "mainz 05":                 "mainz",
+    "fc koln":                  "koln",
+    "1. fc koln":               "koln",
+    "tsg hoffenheim":           "hoffenheim",
+    "spvgg greuther furth":     "greuther furth",
+    "ac milan":                 "milan",
+    "inter milan":              "inter",
+    "internazionale":           "inter",
+    "hellas verona":            "verona",
+    "as roma":                  "roma",
+    "ss lazio":                 "lazio",
+    "ssc napoli":               "napoli",
+    "paris saint-germain":      "paris saint germain",
+    "paris sg":                 "paris saint germain",
+    "saint-etienne":            "saint etienne",
+    "olympique de marseille":   "marseille",
+    "olympique lyonnais":       "lyon",
+    "ogc nice":                 "nice",
+    "rc lens":                  "lens",
+    "stade rennais":            "rennes",
+    "stade rennais fc":         "rennes",
+    "stade brestois 29":        "brest",
+    "stade brestois":           "brest",
+    "fc nantes":                "nantes",
+    "rc strasbourg":            "strasbourg",
+    "fc metz":                  "metz",
+    "stade de reims":           "reims",
+    "fc lorient":               "lorient",
+    "girondins de bordeaux":    "bordeaux",
+    "en avant guingamp":        "guingamp",
+    "aj auxerre":               "auxerre",
+    "as monaco":                "monaco",
+    "losc lille":               "lille",
+    "lille osc":                "lille",
+}
+
+
+def _dedup_team_key(name: str) -> str:
+    """
+    Canonical team key after stripping common club suffixes and normalising
+    provider aliases (Understat vs API-Football).
+    """
+    key = (name or "").lower().strip()
+    key = _TEAM_ALIASES.get(key, key)
+    for suffix in _TEAM_SUFFIXES:
+        if key.endswith(suffix):
+            stem = key[: -len(suffix)].strip()
+            if stem and stem not in _PROTECTED_TEAM_STEMS:
+                key = stem
+                break
+    return _TEAM_ALIASES.get(key, key)
+
 
 def _row_to_dict(row) -> dict:
     """
@@ -434,6 +539,15 @@ def _row_to_dict(row) -> dict:
     }
 
 
+def _merge_stat_dicts(primary: dict, secondary: dict) -> dict:
+    """Fill missing (None) stat entries in ``primary`` from ``secondary``."""
+    merged = dict(primary)
+    for k, v in secondary.items():
+        if merged.get(k) is None and v is not None:
+            merged[k] = v
+    return merged
+
+
 def load_team_stats(
     team: str,
     league: str,
@@ -462,10 +576,36 @@ def load_team_stats(
                 TeamSeasonStats.season.desc())
 
         row = query.first()
-        if row is None:
+
+        # Also check for a duplicate row under a provider-variant name
+        # (e.g. Understat "Wolverhampton Wanderers" vs API-Football "Wolves")
+        # so neither xG nor standings columns are missed.
+        target_key = _dedup_team_key(team)
+        season_filter = season or (row.season if row is not None else None)
+        league_query = db.query(TeamSeasonStats).filter(
+            TeamSeasonStats.league == league
+        )
+        if season_filter:
+            league_query = league_query.filter(
+                TeamSeasonStats.season == season_filter
+            )
+        else:
+            league_query = league_query.order_by(
+                TeamSeasonStats.season.desc()
+            )
+        matching_rows = [
+            r for r in league_query.all()
+            if _dedup_team_key(r.team) == target_key
+        ]
+
+        if row is None and not matching_rows:
             return None
 
-        stats = _row_to_dict(row)
+        stats = _row_to_dict(row if row is not None else matching_rows[0])
+        for extra in matching_rows:
+            if row is not None and extra.id == row.id:
+                continue
+            stats = _merge_stat_dicts(stats, _row_to_dict(extra))
         stats["games"] = games_played(stats)
         return stats
 
@@ -557,6 +697,15 @@ def load_league_averages(
         if season:
             query = query.filter(TeamSeasonStats.season == season)
         rows = query.all()
+
+        seen = set()
+        unique_rows = []
+        for r in rows:
+            key = _dedup_team_key(r.team.lower().strip())
+            if key not in seen:
+                seen.add(key)
+                unique_rows.append(r)
+        rows = unique_rows
 
         if not rows:
             return dict(DEFAULT_LEAGUE_AVERAGES, teams=0, season=season)
@@ -679,15 +828,23 @@ def load_squad_players(
     if db is None:
         return []
     try:
-        query = db.query(PlayerSeasonStats).filter(
-            and_(
-                PlayerSeasonStats.team   == team,
+        query = (
+            db.query(PlayerSeasonStats)
+            .filter(
+                PlayerSeasonStats.team == team,
                 PlayerSeasonStats.league == league,
+                PlayerSeasonStats.goals.isnot(None),
             )
         )
         if season:
             query = query.filter(PlayerSeasonStats.season == season)
-        rows = query.all()
+        rows = (
+            query
+            .order_by(
+                PlayerSeasonStats.goals.desc().nulls_last()
+            )
+            .all()
+        )
         return [_player_to_dict(row) for row in rows]
     except Exception as exc:
         _warn_once(
@@ -709,12 +866,35 @@ def load_key_players(
     Load top players for a team.
     Returns top scorer and top assister.
     """
+    db = _new_session()
+    if db is None:
+        return _empty_squad_summary()
     try:
-        return _summarise_squad(load_squad_players(team, league, season))
+        query = (
+            db.query(PlayerSeasonStats)
+            .filter(
+                PlayerSeasonStats.team == team,
+                PlayerSeasonStats.league == league,
+                PlayerSeasonStats.goals.isnot(None),
+            )
+        )
+        if season:
+            query = query.filter(PlayerSeasonStats.season == season)
+        rows = (
+            query
+            .order_by(
+                PlayerSeasonStats.goals.desc().nulls_last()
+            )
+            .limit(5)
+            .all()
+        )
+        return _summarise_squad([_player_to_dict(row) for row in rows])
     except Exception as exc:
         print(f"[formula] WARNING: could not load "
               f"players for {team}: {exc}")
         return _empty_squad_summary()
+    finally:
+        _close_session(db)
 
 
 def load_league_squads(
@@ -731,14 +911,25 @@ def load_league_squads(
     if db is None:
         return {}
     try:
-        query = db.query(PlayerSeasonStats).filter(
-            PlayerSeasonStats.league == league
+        query = (
+            db.query(PlayerSeasonStats)
+            .filter(
+                PlayerSeasonStats.league == league,
+                PlayerSeasonStats.goals.isnot(None),
+            )
         )
         if season:
             query = query.filter(PlayerSeasonStats.season == season)
+        rows = (
+            query
+            .order_by(
+                PlayerSeasonStats.goals.desc().nulls_last()
+            )
+            .all()
+        )
 
         squads: dict[str, list[dict]] = {}
-        for row in query.all():
+        for row in rows:
             squads.setdefault(row.team, []).append(_player_to_dict(row))
         return squads
     except Exception as exc:
@@ -1193,9 +1384,20 @@ def compute_league_baselines(
         )
         if season:
             query = query.filter(TeamSeasonStats.season == season)
+        rows = query.all()
+
+        seen = set()
+        unique_rows = []
+        for r in rows:
+            key = _dedup_team_key(r.team.lower().strip())
+            if key not in seen:
+                seen.add(key)
+                unique_rows.append(r)
+        rows = unique_rows
+
         # Snapshot to plain dicts inside the session: the ORM instances
         # would be detached once it closes.
-        team_rows = [(_row_to_dict(row), row.team) for row in query.all()]
+        team_rows = [(_row_to_dict(row), row.team) for row in rows]
     except Exception as exc:
         print(f"[formula] ERROR loading league baselines: {exc}")
         return fallback
@@ -1987,8 +2189,8 @@ def _predict_match(
     home_squad = load_squad_players(home_team, league, season)
     away_squad = load_squad_players(away_team, league, season)
 
-    home_players = _summarise_squad(home_squad)
-    away_players = _summarise_squad(away_squad)
+    home_players = load_key_players(home_team, league, season)
+    away_players = load_key_players(away_team, league, season)
 
     # Compute ratings
     home_attack  = compute_attack_rating(
