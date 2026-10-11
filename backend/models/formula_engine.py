@@ -1348,7 +1348,10 @@ def compute_league_baselines(
 
     Runs the exact same rating formulas over every team in the league and
     reports their means, plus the league's real goals-per-game and the
-    scale factor that turns the corner formula's output into corners.
+    scale factor that turns the raw cross / attacking-third corner formula
+    into corners. ``corner_scale`` is a diagnostic only now:
+    :func:`compute_corner_markets` estimates corners directly and is not
+    rescaled by it.
 
     Returns neutral baselines (all multipliers 1.0) when the league has no
     rows, so the engine still predicts instead of failing.
@@ -2017,9 +2020,10 @@ def corner_markets_from_expected(
     """
     Build the corner markets from two expected-corner figures.
 
-    Split out from :func:`compute_corner_markets` so the calibrated
-    expectations (league-scaled, home-tilted) can reuse the same Poisson
-    code path.
+    The shared Poisson builder for the raw cross / attacking-third
+    expectation path (:func:`calibrate_corners`).
+    :func:`compute_corner_markets` no longer routes through it: that
+    estimator is calibrated in corner units and emits its own markets.
     """
     exp_home = float(np.clip(
         expected_home, MIN_EXPECTED_CORNERS, MAX_EXPECTED_CORNERS))
@@ -2046,15 +2050,92 @@ def corner_markets_from_expected(
 def compute_corner_markets(
     home_stats: dict,
     away_stats: dict,
+    league_avgs: dict | None = None,
 ) -> dict:
     """
-    Estimate expected corners from team stats.
-    Uses crosses, touches in att third, and
-    corners taken as proxy features.
+    Estimate expected corners using available
+    team stats. Primary source: shots and SoT
+    per game (corners correlate strongly with
+    attacking pressure). Secondary: goals per
+    game as proxy for attacking intent.
+
+    Empirical calibration:
+      Average PL team: ~5.3 corners/game
+      Top attacker: ~6.5 corners/game
+      Bottom attacker: ~4.0 corners/game
     """
-    exp_home_corners = _raw_corner_expectation(home_stats)
-    exp_away_corners = _raw_corner_expectation(away_stats)
-    return corner_markets_from_expected(exp_home_corners, exp_away_corners)
+    # Base corners per game — league average
+    BASE_CORNERS = 5.3
+    AWAY_PENALTY = 0.85
+
+    def _estimate_corners(stats: dict,
+                          is_home: bool) -> float:
+        shots   = _safe(stats.get("sh_per90")
+                  or stats.get("shots"), 0.0)
+        sot     = _safe(stats.get("sot_per90")
+                  or stats.get("sot"), 0.0)
+        goals   = _safe(stats.get("goals")
+                  or stats.get("sh_goals"), 0.0)
+        xg      = _safe(stats.get("xg")
+                  or stats.get("sh_xg"), 0.0)
+
+        # Normalise shots to per-game if needed
+        if shots > 20:
+            shots = shots / 38
+        if sot > 10:
+            sot = sot / 38
+        if goals > 10:
+            goals = goals / 38
+        if xg > 10:
+            xg = xg / 38
+
+        # Build attacking pressure score
+        # Each measure contributes proportionally
+        score = 0.0
+        count = 0
+
+        if shots > 0:
+            score += shots / 12.0
+            count += 1
+        if sot > 0:
+            score += sot / 4.5
+            count += 1
+        if goals > 0:
+            score += goals / 1.5
+            count += 1
+        if xg > 0:
+            score += xg / 1.4
+            count += 1
+
+        if count == 0:
+            pressure = 1.0
+        else:
+            pressure = score / count
+
+        corners = BASE_CORNERS * pressure
+        if not is_home:
+            corners *= AWAY_PENALTY
+
+        return float(np.clip(corners, 2.5, 9.0))
+
+    exp_home = _estimate_corners(home_stats, True)
+    exp_away = _estimate_corners(away_stats, False)
+    total    = exp_home + exp_away
+
+    over_8_5  = float(1 - poisson.cdf(8,  total))
+    over_9_5  = float(1 - poisson.cdf(9,  total))
+    over_10_5 = float(1 - poisson.cdf(10, total))
+    over_11_5 = float(1 - poisson.cdf(11, total))
+
+    return {
+        "expected_home":  round(exp_home, 2),
+        "expected_away":  round(exp_away, 2),
+        "expected_total": round(total,    2),
+        "over_8_5":       round(over_8_5,  4),
+        "over_9_5":       round(over_9_5,  4),
+        "over_10_5":      round(over_10_5, 4),
+        "over_11_5":      round(over_11_5, 4),
+    }
 
 
 def calibrate_corners(raw_corners: dict, baselines: dict) -> dict:
@@ -2065,6 +2146,13 @@ def calibrate_corners(raw_corners: dict, baselines: dict) -> dict:
     measured in them, so both sides are multiplied by the league scale
     factor (which makes two average teams total CORNER_LEAGUE_TOTAL) and
     tilted slightly towards the home side before the markets are recomputed.
+
+    Not used by the main prediction path any more: the output of
+    :func:`compute_corner_markets` is already in corner units and already
+    home/away split, so feeding it through here would apply the league
+    scale and the tilt a second time. Kept exported for the raw
+    ``_raw_corner_expectation`` path and for callers that rescale their own
+    expectations.
     """
     scale = _safe(baselines.get("corner_scale"), 1.0)
     if scale <= 0:
@@ -2251,8 +2339,12 @@ def _predict_match(
 
     # Markets
     markets = compute_markets(lambda_home, lambda_away)
-    corners = calibrate_corners(
-        compute_corner_markets(home_stats, away_stats), baselines)
+    # The corner estimator is already calibrated in real corner units and
+    # carries its own home/away split (AWAY_PENALTY), so the raw-formula
+    # league scale and tilt from calibrate_corners must NOT be re-applied
+    # on top of it — doing that multiplied the expectations by the league
+    # scale a second time (e.g. 14.3 -> 21.0 expected corners).
+    corners = compute_corner_markets(home_stats, away_stats, league_avgs)
 
     home_win = markets["home_win"]
     draw     = markets["draw"]
