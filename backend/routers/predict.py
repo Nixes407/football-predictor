@@ -1039,3 +1039,120 @@ def fbref_check() -> dict:
         }
     except Exception as exc:
         return {"error": str(exc)}
+
+
+@router.get("/admin/new-tables-check")
+def new_tables_check() -> dict:
+    """
+    Check new tables and show actual stored values
+    to diagnose formula engine data quality.
+    """
+    try:
+        from database import (
+            SessionLocal,
+            TeamSeasonStats,
+            PlayerSeasonStats,
+        )
+        from sqlalchemy import text as sql_text
+
+        db = SessionLocal()
+        try:
+            team_count   = db.query(TeamSeasonStats).count()
+            player_count = db.query(PlayerSeasonStats).count()
+
+            # Get Arsenal specifically to check values
+            arsenal = (
+                db.query(TeamSeasonStats)
+                .filter(
+                    TeamSeasonStats.team.ilike("%Arsenal%")
+                ).first()
+            )
+
+            chelsea = (
+                db.query(TeamSeasonStats)
+                .filter(
+                    TeamSeasonStats.team.ilike("%Chelsea%")
+                ).first()
+            )
+
+            def team_snapshot(row):
+                if row is None:
+                    return None
+                return {
+                    "team":         row.team,
+                    "league":       row.league,
+                    "season":       row.season,
+                    "sh_xg":        row.sh_xg,
+                    "sh_goals":     row.sh_goals,
+                    "sh_shots":     row.sh_shots,
+                    "sh_sot":       row.sh_sot,
+                    "sh_sh_per90":  row.sh_sh_per90,
+                    "sh_sot_per90": row.sh_sot_per90,
+                    "gk_ga":        row.gk_ga,
+                    "gk_ga90":      row.gk_ga90,
+                    "gk_cs":        row.gk_cs,
+                    "gk_w":         row.gk_w,
+                    "gk_d":         row.gk_d,
+                    "gk_l":         row.gk_l,
+                    "def_press":    row.def_press,
+                    "def_press_pct":row.def_press_pct,
+                    "pos_poss":     row.pos_poss,
+                    "pos_prgc":     row.pos_prgc,
+                }
+
+            leagues = db.query(
+                TeamSeasonStats.league
+            ).distinct().all()
+
+            seasons = db.query(
+                TeamSeasonStats.season
+            ).distinct().all()
+
+            statsbomb_count = 0
+            try:
+                result = db.execute(sql_text(
+                    "SELECT COUNT(*) FROM "
+                    "statsbomb_match_stats"
+                ))
+                statsbomb_count = result.scalar()
+            except Exception:
+                statsbomb_count = -1
+
+            top_players = (
+                db.query(PlayerSeasonStats)
+                .filter(
+                    PlayerSeasonStats.league ==
+                    "ENG-Premier League"
+                )
+                .order_by(
+                    PlayerSeasonStats.goals.desc()
+                )
+                .limit(5)
+                .all()
+            )
+
+            return {
+                "team_season_stats_rows":    team_count,
+                "player_season_stats_rows":  player_count,
+                "statsbomb_match_stats_rows":statsbomb_count,
+                "distinct_leagues": [r[0] for r in leagues],
+                "distinct_seasons": [r[0] for r in seasons],
+                "arsenal_snapshot": team_snapshot(arsenal),
+                "chelsea_snapshot": team_snapshot(chelsea),
+                "top_pl_scorers": [
+                    {
+                        "player":  p.player,
+                        "team":    p.team,
+                        "goals":   p.goals,
+                        "assists": p.assists,
+                        "xg":      p.xg,
+                        "minutes": p.minutes,
+                    }
+                    for p in top_players
+                ],
+            }
+        finally:
+            db.close()
+
+    except Exception as exc:
+        return {"error": str(exc)}
