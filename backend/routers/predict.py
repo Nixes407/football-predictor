@@ -1118,11 +1118,16 @@ def new_tables_check() -> dict:
             except Exception:
                 statsbomb_count = -1
 
-            top_players = (
+            from sqlalchemy import nulls_last
+            top_scorers = (
                 db.query(PlayerSeasonStats)
                 .filter(
                     PlayerSeasonStats.league ==
-                    "ENG-Premier League"
+                    "ENG-Premier League",
+                    PlayerSeasonStats.goals
+                    .isnot(None),
+                    PlayerSeasonStats.minutes
+                    > 0,
                 )
                 .order_by(
                     PlayerSeasonStats.goals.desc()
@@ -1148,7 +1153,7 @@ def new_tables_check() -> dict:
                         "xg":      p.xg,
                         "minutes": p.minutes,
                     }
-                    for p in top_players
+                    for p in top_scorers
                 ],
             }
         finally:
