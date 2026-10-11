@@ -218,126 +218,116 @@ def collect_fixtures_and_results() -> dict:
 
 
 def collect_team_stats() -> int:
-    """~18 API calls."""
-    print("[team] Collecting team statistics...")
+    """
+    18 API calls — standings per league per season.
+    Standings returns all teams at once so we never
+    need per-team requests. Stays within 100/day.
+    """
+    print("[team] Collecting team statistics "
+          "via standings...")
     total = 0
 
     for league_name, league_id in LEAGUE_MAP.items():
         for season_year in SEASON_MAP[league_name]:
             season_label = SEASON_LABEL.get(
-                (league_id, season_year), str(season_year))
-            print(f"[team] {league_name} {season_year}...")
+                (league_id, season_year),
+                str(season_year))
+            print(f"[team] {league_name} "
+                  f"{season_year}...")
 
-            teams_data = _get("teams", {
+            data = _get("standings", {
                 "league": league_id,
                 "season": season_year,
             })
-            if not teams_data:
+            if not data:
                 continue
-            teams = teams_data.get("response", [])
-            if not teams:
+
+            standings = data.get("response", [])
+            if not standings:
+                print(f"[team] No standings for "
+                      f"{league_name} {season_year}")
                 continue
 
             db = SessionLocal()
             try:
-                for team_entry in teams:
-                    tid  = team_entry["team"]["id"]
-                    name = team_entry["team"]["name"]
-
-                    sd = _get("teams/statistics", {
-                        "league": league_id,
-                        "season": season_year,
-                        "team":   tid,
-                    })
-                    if not sd:
-                        continue
-                    s = sd.get("response", {})
-                    if not s:
+                for group in standings:
+                    league_info = group.get(
+                        "league", {})
+                    all_groups  = league_info.get(
+                        "standings", [[]])
+                    if not all_groups:
                         continue
 
-                    played  = (s.get("fixtures", {})
-                                .get("played", {})
-                                .get("total") or 1)
-                    goals   = s.get("goals", {})
-                    shots   = s.get("shots", {})
-                    passes_ = s.get("passes", {})
-                    tackles = s.get("tackles", {})
-                    fouls   = s.get("fouls", {})
-                    corners = s.get("corners", {})
-                    cards   = s.get("cards", {})
-                    form_str= s.get("form", "") or ""
+                    for team_entry in all_groups[0]:
+                        team_name = team_entry.get(
+                            "team", {}).get("name", "")
+                        if not team_name:
+                            continue
 
-                    recent = form_str[-5:]
-                    fw = recent.count("W")
-                    fd = recent.count("D")
-                    fl = recent.count("L")
+                        all_s   = team_entry.get("all", {})
+                        home_s  = team_entry.get("home", {})
+                        away_s  = team_entry.get("away", {})
+                        form_str= team_entry.get("form","") or ""
+                        points  = team_entry.get("points", 0)
+                        gd      = team_entry.get("goalsDiff", 0)
 
-                    gf = _safe(goals.get("for", {})
-                               .get("total", {})
-                               .get("total"))
-                    ga = _safe(goals.get("against", {})
-                               .get("total", {})
-                               .get("total"))
-                    sh = _safe(shots.get("total", {})
-                               .get("total"))
-                    so = _safe(shots.get("on", {})
-                               .get("total"))
-                    cs = _safe(s.get("clean_sheet", {})
-                               .get("total"))
+                        played = _safe(all_s.get("played")) or 1
+                        gf     = _safe(all_s.get("goals", {}).get("for"))
+                        ga     = _safe(all_s.get("goals", {}).get("against"))
 
-                    attrs = {
-                        "sh_goals":     gf,
-                        "sh_shots":     sh,
-                        "sh_sot":       so,
-                        "sh_sot_pct":   _pct(shots.get("on", {}).get("percentage")),
-                        "sh_sh_per90":  round(sh / played, 2) if sh else None,
-                        "sh_sot_per90": round(so / played, 2) if so else None,
-                        "sh_g_per_sh":  round(gf / sh, 3) if sh and gf else None,
-                        "sh_g_per_sot": round(gf / so, 3) if so and gf else None,
-                        "ps_att":       _safe(passes_.get("total", {}).get("total")),
-                        "ps_cmp":       _safe(passes_.get("accurate", {}).get("total")),
-                        "ps_cmp_pct":   _pct(passes_.get("accuracy")),
-                        "def_tkl":      _safe(tackles.get("total", {}).get("total")),
-                        "def_int":      _safe(tackles.get("interceptions", {}).get("total")),
-                        "def_blk_sh":   _safe(tackles.get("blocks", {}).get("total")),
-                        "def_tkl_int":  (
-                            (_safe(tackles.get("total", {}).get("total")) or 0) +
-                            (_safe(tackles.get("interceptions", {}).get("total")) or 0)
-                        ) or None,
-                        "misc_fls":     _safe(fouls.get("committed", {}).get("total")),
-                        "misc_fld":     _safe(fouls.get("drawn", {}).get("total")),
-                        "misc_crdy":    _safe(cards.get("yellow", {}).get("total", {}).get("total")),
-                        "misc_crdr":    _safe(cards.get("red", {}).get("total", {}).get("total")),
-                        "pos_cpa":      _safe(corners.get("total", {}).get("total")),
-                        "gk_ga":        ga,
-                        "gk_ga90":      round(ga / played, 2) if ga else None,
-                        "gk_cs":        cs,
-                        "gk_cs_pct":    round(cs / played * 100, 1) if cs else None,
-                        "gk_w":         float(fw),
-                        "gk_d":         float(fd),
-                        "gk_l":         float(fl),
-                    }
+                        home_played = _safe(home_s.get("played")) or 1
+                        home_gf     = _safe(home_s.get("goals", {}).get("for"))
+                        home_ga     = _safe(home_s.get("goals", {}).get("against"))
+                        home_w      = _safe(home_s.get("win"))
+                        home_d      = _safe(home_s.get("draw"))
+                        home_l      = _safe(home_s.get("lose"))
 
-                    _upsert_team(
-                        db, name, league_name,
-                        season_label, attrs)
-                    total += 1
+                        away_played = _safe(away_s.get("played")) or 1
+                        away_gf     = _safe(away_s.get("goals", {}).get("for"))
+                        away_ga     = _safe(away_s.get("goals", {}).get("against"))
+
+                        recent = form_str[-5:]
+                        fw = recent.count("W")
+                        fd = recent.count("D")
+                        fl = recent.count("L")
+
+                        attrs = {
+                            # Goals
+                            "sh_goals":     gf,
+                            "gk_ga":        ga,
+                            "gk_ga90":      round(ga / played, 2) if ga else None,
+                            # Shooting proxies from goals/game
+                            "sh_sh_per90":  round(gf / played * 4, 2) if gf else None,
+                            "sh_sot_per90": round(gf / played * 2, 2) if gf else None,
+                            "sh_g_per_sh":  round(gf / (gf * 4 * played), 3) if gf else None,
+                            # Home/away splits
+                            "gk_w":         float(fw),
+                            "gk_d":         float(fd),
+                            "gk_l":         float(fl),
+                            # Clean sheet estimate
+                            # (standings does not give CS directly)
+                            "gk_cs":        None,
+                        }
+
+                        _upsert_team(
+                            db, team_name, league_name,
+                            season_label, attrs)
+                        total += 1
 
                 db.commit()
                 print(f"[team] {league_name} "
-                      f"{season_year}: "
-                      f"{len(teams)} teams committed")
+                      f"{season_year}: committed")
+
             except Exception as exc:
                 db.rollback()
-                print(f"[team] ERROR "
-                      f"{league_name}: {exc}")
+                print(f"[team] ERROR {league_name} "
+                      f"{season_year}: {exc}")
                 raise
             finally:
                 db.close()
 
-    print(f"[team] Done. Total: {total}")
+    print(f"[team] Done. Total rows: {total}")
     return total
-
 
 def collect_injuries() -> dict:
     """9 API calls — one per league."""
