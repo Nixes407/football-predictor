@@ -165,3 +165,276 @@ def _upsert_player(db, player, team,
         db.add(existing)
     for k, v in attrs.items():
         setattr(existing, k, v)
+
+
+def collect_fixtures_and_results() -> dict:
+    """2 API calls."""
+    print("[fixtures] Fetching fixtures and results...")
+    today     = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    output    = {"fixtures": [], "results": []}
+
+    data = _get("fixtures", {"date": today})
+    if data:
+        for f in data.get("response", []):
+            lid = f["league"]["id"]
+            ln  = next((k for k, v in LEAGUE_MAP.items()
+                        if v == lid), None)
+            if not ln:
+                continue
+            output["fixtures"].append({
+                "fixture_id": f["fixture"]["id"],
+                "league":     ln,
+                "home_team":  f["teams"]["home"]["name"],
+                "away_team":  f["teams"]["away"]["name"],
+                "kickoff":    f["fixture"]["date"],
+                "status":     f["fixture"]["status"]["short"],
+                "home_id":    f["teams"]["home"]["id"],
+                "away_id":    f["teams"]["away"]["id"],
+            })
+
+    data = _get("fixtures", {
+        "date": yesterday, "status": "FT"})
+    if data:
+        for f in data.get("response", []):
+            lid = f["league"]["id"]
+            ln  = next((k for k, v in LEAGUE_MAP.items()
+                        if v == lid), None)
+            if not ln:
+                continue
+            output["results"].append({
+                "fixture_id": f["fixture"]["id"],
+                "league":     ln,
+                "home_team":  f["teams"]["home"]["name"],
+                "away_team":  f["teams"]["away"]["name"],
+                "home_goals": f["goals"]["home"],
+                "away_goals": f["goals"]["away"],
+                "date":       f["fixture"]["date"][:10],
+            })
+
+    print(f"[fixtures] Today: {len(output['fixtures'])} | "
+          f"Yesterday: {len(output['results'])}")
+    return output
+
+
+def collect_team_stats() -> int:
+    """~18 API calls."""
+    print("[team] Collecting team statistics...")
+    total = 0
+
+    for league_name, league_id in LEAGUE_MAP.items():
+        for season_year in SEASON_MAP[league_name]:
+            season_label = SEASON_LABEL.get(
+                (league_id, season_year), str(season_year))
+            print(f"[team] {league_name} {season_year}...")
+
+            teams_data = _get("teams", {
+                "league": league_id,
+                "season": season_year,
+            })
+            if not teams_data:
+                continue
+            teams = teams_data.get("response", [])
+            if not teams:
+                continue
+
+            db = SessionLocal()
+            try:
+                for team_entry in teams:
+                    tid  = team_entry["team"]["id"]
+                    name = team_entry["team"]["name"]
+
+                    sd = _get("teams/statistics", {
+                        "league": league_id,
+                        "season": season_year,
+                        "team":   tid,
+                    })
+                    if not sd:
+                        continue
+                    s = sd.get("response", {})
+                    if not s:
+                        continue
+
+                    played  = (s.get("fixtures", {})
+                                .get("played", {})
+                                .get("total") or 1)
+                    goals   = s.get("goals", {})
+                    shots   = s.get("shots", {})
+                    passes_ = s.get("passes", {})
+                    tackles = s.get("tackles", {})
+                    fouls   = s.get("fouls", {})
+                    corners = s.get("corners", {})
+                    cards   = s.get("cards", {})
+                    form_str= s.get("form", "") or ""
+
+                    recent = form_str[-5:]
+                    fw = recent.count("W")
+                    fd = recent.count("D")
+                    fl = recent.count("L")
+
+                    gf = _safe(goals.get("for", {})
+                               .get("total", {})
+                               .get("total"))
+                    ga = _safe(goals.get("against", {})
+                               .get("total", {})
+                               .get("total"))
+                    sh = _safe(shots.get("total", {})
+                               .get("total"))
+                    so = _safe(shots.get("on", {})
+                               .get("total"))
+                    cs = _safe(s.get("clean_sheet", {})
+                               .get("total"))
+
+                    attrs = {
+                        "sh_goals":     gf,
+                        "sh_shots":     sh,
+                        "sh_sot":       so,
+                        "sh_sot_pct":   _pct(shots.get("on", {}).get("percentage")),
+                        "sh_sh_per90":  round(sh / played, 2) if sh else None,
+                        "sh_sot_per90": round(so / played, 2) if so else None,
+                        "sh_g_per_sh":  round(gf / sh, 3) if sh and gf else None,
+                        "sh_g_per_sot": round(gf / so, 3) if so and gf else None,
+                        "ps_att":       _safe(passes_.get("total", {}).get("total")),
+                        "ps_cmp":       _safe(passes_.get("accurate", {}).get("total")),
+                        "ps_cmp_pct":   _pct(passes_.get("accuracy")),
+                        "def_tkl":      _safe(tackles.get("total", {}).get("total")),
+                        "def_int":      _safe(tackles.get("interceptions", {}).get("total")),
+                        "def_blk_sh":   _safe(tackles.get("blocks", {}).get("total")),
+                        "def_tkl_int":  (
+                            (_safe(tackles.get("total", {}).get("total")) or 0) +
+                            (_safe(tackles.get("interceptions", {}).get("total")) or 0)
+                        ) or None,
+                        "misc_fls":     _safe(fouls.get("committed", {}).get("total")),
+                        "misc_fld":     _safe(fouls.get("drawn", {}).get("total")),
+                        "misc_crdy":    _safe(cards.get("yellow", {}).get("total", {}).get("total")),
+                        "misc_crdr":    _safe(cards.get("red", {}).get("total", {}).get("total")),
+                        "pos_cpa":      _safe(corners.get("total", {}).get("total")),
+                        "gk_ga":        ga,
+                        "gk_ga90":      round(ga / played, 2) if ga else None,
+                        "gk_cs":        cs,
+                        "gk_cs_pct":    round(cs / played * 100, 1) if cs else None,
+                        "gk_w":         float(fw),
+                        "gk_d":         float(fd),
+                        "gk_l":         float(fl),
+                    }
+
+                    _upsert_team(
+                        db, name, league_name,
+                        season_label, attrs)
+                    total += 1
+
+                db.commit()
+                print(f"[team] {league_name} "
+                      f"{season_year}: "
+                      f"{len(teams)} teams committed")
+            except Exception as exc:
+                db.rollback()
+                print(f"[team] ERROR "
+                      f"{league_name}: {exc}")
+                raise
+            finally:
+                db.close()
+
+    print(f"[team] Done. Total: {total}")
+    return total
+
+
+def collect_injuries() -> dict:
+    """9 API calls — one per league."""
+    print("[injuries] Collecting injuries...")
+    all_injuries = {}
+    today = date.today().isoformat()
+
+    for league_name, league_id in LEAGUE_MAP.items():
+        data = _get("injuries", {
+            "league": league_id,
+            "date":   today,
+        })
+        injuries = []
+        if data:
+            for e in data.get("response", []):
+                player = e.get("player", {})
+                team   = e.get("team", {})
+                injuries.append({
+                    "player": player.get("name"),
+                    "team":   team.get("name"),
+                    "type":   player.get("type"),
+                    "reason": player.get("reason"),
+                })
+        all_injuries[league_name] = injuries
+        print(f"[injuries] {league_name}: "
+              f"{len(injuries)} injuries")
+
+    return all_injuries
+
+
+def collect_team_form() -> int:
+    """9 API calls — one per league."""
+    print("[form] Collecting standings/form...")
+    updated = 0
+
+    for league_name, league_id in LEAGUE_MAP.items():
+        latest   = max(SEASON_MAP[league_name])
+        season_l = SEASON_LABEL.get(
+            (league_id, latest), str(latest))
+
+        data = _get("standings", {
+            "league": league_id,
+            "season": latest,
+        })
+        if not data:
+            continue
+
+        standings = data.get("response", [])
+        if not standings:
+            continue
+
+        db = SessionLocal()
+        try:
+            for group in standings:
+                league_info   = group.get("league", {})
+                all_standings = league_info.get(
+                    "standings", [[]])
+                if not all_standings:
+                    continue
+                for entry in all_standings[0]:
+                    team_name = entry.get(
+                        "team", {}).get("name", "")
+                    form_str  = entry.get("form", "") or ""
+                    recent    = form_str[-5:]
+                    fw = recent.count("W")
+                    fd = recent.count("D")
+                    fl = recent.count("L")
+
+                    existing = (
+                        db.query(TeamSeasonStats)
+                        .filter(and_(
+                            TeamSeasonStats.team   == team_name,
+                            TeamSeasonStats.league == league_name,
+                            TeamSeasonStats.season == season_l,
+                        )).first()
+                    )
+                    if existing is None:
+                        existing = TeamSeasonStats(
+                            team=team_name,
+                            league=league_name,
+                            season=season_l,
+                        )
+                        db.add(existing)
+
+                    existing.gk_w = float(fw)
+                    existing.gk_d = float(fd)
+                    existing.gk_l = float(fl)
+                    updated += 1
+
+            db.commit()
+            print(f"[form] {league_name}: updated")
+        except Exception as exc:
+            db.rollback()
+            print(f"[form] ERROR {league_name}: {exc}")
+            raise
+        finally:
+            db.close()
+
+    print(f"[form] Done. Updated: {updated}")
+    return updated
