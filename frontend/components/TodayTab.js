@@ -20,9 +20,23 @@ const LEAGUE_NAMES = {
 
 function getConfidence(homeWin, draw, awayWin) {
   const maxProb = Math.max(homeWin, draw, awayWin);
-  if (maxProb >= 0.65) return { label: '🔥 HIGH', className: 'badge-high' };
-  if (maxProb >= 0.5) return { label: '⚡ MEDIUM', className: 'badge-medium' };
+  if (maxProb > 0.65) return { label: '🔥 HIGH', className: 'badge-high' };
+  if (maxProb > 0.5) return { label: '⚡ MEDIUM', className: 'badge-medium' };
   return { label: '❄️ LOW', className: 'badge-low' };
+}
+
+function isValidProbability(value) {
+  return (
+    value !== null &&
+    value !== undefined &&
+    value !== '' &&
+    Number.isFinite(Number(value))
+  );
+}
+
+function formatProbability(value) {
+  if (!isValidProbability(value)) return '—';
+  return `${(Number(value) * 100).toFixed(1)}%`;
 }
 
 function formatKickoff(kickoffTime) {
@@ -66,17 +80,17 @@ function AccaButtons({ match, prediction }) {
 
   const buttons = [
     {
-      label: `H ${(prediction.result?.home_win * 100).toFixed(1)}%`,
+      label: `Home Win ${formatProbability(prediction.result?.home_win)}`,
       market: 'Home Win',
       prob:   prediction.result?.home_win,
     },
     {
-      label: `D ${(prediction.result?.draw * 100).toFixed(1)}%`,
+      label: `Draw ${formatProbability(prediction.result?.draw)}`,
       market: 'Draw',
       prob:   prediction.result?.draw,
     },
     {
-      label: `A ${(prediction.result?.away_win * 100).toFixed(1)}%`,
+      label: `Away Win ${formatProbability(prediction.result?.away_win)}`,
       market: 'Away Win',
       prob:   prediction.result?.away_win,
     },
@@ -137,195 +151,83 @@ function StatusBadge({ status }) {
   );
 }
 
-function ProbBar({ pct, gradient, highlight }) {
-  return (
-    <div
-      className="w-full rounded-full overflow-hidden"
-      style={{ background: 'rgba(148,163,184,0.12)', height: 6 }}
-    >
-      <motion.div
-        className={`prob-bar ${highlight ? 'glow-blue' : ''}`}
-        style={{ background: gradient }}
-        initial={{ width: 0 }}
-        animate={{ width: `${pct}%` }}
-        transition={{ duration: 0.8, ease: 'easeOut' }}
-      />
-    </div>
-  );
-}
-
 function PredictionPanel({ fixture }) {
-  const homeWin = fixture.pred_home_win ?? 0;
-  const draw = fixture.pred_draw ?? 0;
-  const awayWin = fixture.pred_away_win ?? 0;
-  const homeGoals = fixture.pred_home_goals ?? 0;
-  const awayGoals = fixture.pred_away_goals ?? 0;
-  const homeCorners = fixture.pred_home_corners ?? 0;
-  const awayCorners = fixture.pred_away_corners ?? 0;
+  const homeWin = Number(fixture.pred_home_win ?? 0);
+  const draw = Number(fixture.pred_draw ?? 0);
+  const awayWin = Number(fixture.pred_away_win ?? 0);
+  const maxProb = Math.max(homeWin, draw, awayWin);
 
   const prediction = {
     result: { home_win: homeWin, draw, away_win: awayWin },
   };
 
-  const maxProb = Math.max(homeWin, draw, awayWin);
-  const totalGoals = homeGoals + awayGoals;
-  const totalCorners = homeCorners + awayCorners;
-  const btts = homeGoals >= 1.0 && awayGoals >= 1.0;
-
   const outcomes = [
+    { key: 'home', label: 'Home Win', prob: homeWin },
+    { key: 'draw', label: 'Draw', prob: draw },
+    { key: 'away', label: 'Away Win', prob: awayWin },
+  ];
+
+  const quickMarkets = [
+    { label: 'Over 2.5', probability: fixture.pred_over_2_5 },
+    { label: 'BTTS', probability: fixture.pred_btts },
     {
-      key: 'home',
-      name: fixture.home_team,
-      sub: 'Home Win',
-      prob: homeWin,
-      gradient: 'linear-gradient(90deg, var(--blue), var(--green))',
-    },
-    {
-      key: 'draw',
-      name: 'Draw',
-      sub: 'Draw',
-      prob: draw,
-      gradient: 'linear-gradient(90deg, var(--gold), #fbbf24)',
-    },
-    {
-      key: 'away',
-      name: fixture.away_team,
-      sub: 'Away Win',
-      prob: awayWin,
-      gradient: 'linear-gradient(90deg, var(--purple), var(--blue))',
+      label: 'Corners Over 9.5',
+      probability: fixture.pred_corners_over_9_5,
     },
   ];
 
   return (
     <div
-      className="mt-4 pt-4 space-y-5"
+      className="mt-4 pt-4 space-y-4"
       style={{ borderTop: '1px solid var(--border)' }}
     >
-      {/* ── Section 1: Match Result ── */}
-      <div>
-        <h4 className="text-sm font-bold mb-3" style={{ color: 'var(--text)' }}>
-          ⚽ Match Result
+      <section className="glass-card rounded-2xl p-4 sm:p-5">
+        <h4 className="text-sm font-bold uppercase tracking-wider mb-3 text-gray-400">
+          Result Probabilities
         </h4>
-        <div className="grid grid-cols-3 gap-3">
-          {outcomes.map((o) => {
-            const highlight = o.prob === maxProb && maxProb > 0;
+        <div className="grid grid-cols-3 gap-2 sm:gap-3">
+          {outcomes.map((outcome) => {
+            const highlight = outcome.prob === maxProb;
             return (
               <div
-                key={o.key}
-                className={`rounded-xl p-3 text-center ${
-                  highlight ? 'gradient-border' : ''
+                key={outcome.key}
+                className={`min-w-0 rounded-xl border p-3 text-center transition-all ${
+                  highlight
+                    ? 'border-green-500/50 bg-green-800 text-green-300 font-bold'
+                    : 'border-white/10 bg-gray-800 text-gray-300'
                 }`}
-                style={{
-                  background: highlight
-                    ? 'rgba(0,212,255,0.06)'
-                    : 'rgba(148,163,184,0.04)',
-                }}
               >
-                <div
-                  className="text-xs mb-1 truncate"
-                  style={{ color: 'var(--text-muted)' }}
-                  title={o.name}
-                >
-                  {o.name}
+                <div className="text-xs mb-1 text-gray-400">
+                  {outcome.label}
                 </div>
-                <div
-                  className={`text-2xl font-bold mb-2 ${
-                    highlight ? 'gradient-text' : ''
-                  }`}
-                >
-                  {(o.prob * 100).toFixed(1)}%
+                <div className="text-xl font-bold">
+                  {formatProbability(outcome.prob)}
                 </div>
-                <ProbBar
-                  pct={o.prob * 100}
-                  gradient={o.gradient}
-                  highlight={highlight}
-                />
               </div>
             );
           })}
         </div>
-      </div>
-
-      {prediction && (
         <AccaButtons match={fixture} prediction={prediction} />
-      )}
+      </section>
 
-      {/* ── Section 2: Goals & Corners ── */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <div
-          className="rounded-xl p-4"
-          style={{ background: 'rgba(148,163,184,0.04)' }}
-        >
-          <h4 className="text-sm font-bold mb-3">⚽ Expected Goals</h4>
-          <div className="flex items-center justify-around">
-            <div className="text-center">
-              <div className="text-3xl font-bold" style={{ color: 'var(--green)' }}>
-                {homeGoals.toFixed(2)}
-              </div>
-              <div className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
-                Home
-              </div>
-            </div>
-            <div className="text-center">
-              <div className="text-3xl font-bold" style={{ color: 'var(--blue)' }}>
-                {awayGoals.toFixed(2)}
-              </div>
-              <div className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
-                Away
+      <section className="glass-card rounded-2xl p-4 sm:p-5">
+        <h4 className="text-sm font-bold uppercase tracking-wider mb-3 text-gray-400">
+          Quick Markets
+        </h4>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {quickMarkets.map((market) => (
+            <div
+              key={market.label}
+              className="rounded-xl border border-white/10 bg-gray-800/80 p-3"
+            >
+              <div className="text-xs text-gray-400">{market.label}</div>
+              <div className="text-lg font-bold text-white mt-1">
+                {formatProbability(market.probability)}
               </div>
             </div>
-          </div>
+          ))}
         </div>
-        <div
-          className="rounded-xl p-4"
-          style={{ background: 'rgba(148,163,184,0.04)' }}
-        >
-          <h4 className="text-sm font-bold mb-3">📐 Expected Corners</h4>
-          <div className="flex items-center justify-around">
-            <div className="text-center">
-              <div className="text-3xl font-bold" style={{ color: 'var(--green)' }}>
-                {homeCorners.toFixed(2)}
-              </div>
-              <div className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
-                Home
-              </div>
-            </div>
-            <div className="text-center">
-              <div className="text-3xl font-bold" style={{ color: 'var(--blue)' }}>
-                {awayCorners.toFixed(2)}
-              </div>
-              <div className="text-xs mt-1" style={{ color: 'var(--text-muted)' }}>
-                Away
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* ── Section 3: Quick Markets ── */}
-      <div className="flex flex-wrap gap-2">
-        <span
-          className={`px-4 py-1.5 rounded-full text-sm font-semibold ${
-            totalGoals >= 2.5 ? 'badge-high' : 'badge-low'
-          }`}
-        >
-          {totalGoals >= 2.5 ? 'Over 2.5 ✓' : 'Under 2.5'}
-        </span>
-        <span
-          className={`px-4 py-1.5 rounded-full text-sm font-semibold ${
-            btts ? 'badge-high' : 'badge-low'
-          }`}
-        >
-          {btts ? 'BTTS Yes ✓' : 'BTTS No'}
-        </span>
-        <span
-          className={`px-4 py-1.5 rounded-full text-sm font-semibold ${
-            totalCorners >= 9.5 ? 'badge-high' : 'badge-low'
-          }`}
-        >
-          {totalCorners >= 9.5 ? 'Over 9.5 Corners ✓' : 'Under 9.5 Corners'}
-        </span>
-      </div>
+      </section>
     </div>
   );
 }
@@ -461,17 +363,23 @@ export default function TodayTab() {
 
             {/* Match cards */}
             <div className="space-y-4">
-              {grouped[league].map((fx) => {
-                const hasPreds =
-                  fx.pred_home_win != null &&
-                  fx.pred_draw != null &&
-                  fx.pred_away_win != null;
+              {grouped[league].map((fx, fixtureIndex) => {
+                const fixtureKey =
+                  fx.id ??
+                  `${league}:${fx.home_team}:${fx.away_team}:${
+                    fx.kickoff ?? fx.kickoff_time ?? fixtureIndex
+                  }`;
+                const hasPreds = [
+                  fx.pred_home_win,
+                  fx.pred_draw,
+                  fx.pred_away_win,
+                ].every(isValidProbability);
                 const conf = hasPreds
                   ? getConfidence(fx.pred_home_win, fx.pred_draw, fx.pred_away_win)
                   : null;
                 return (
                   <motion.div
-                    key={fx.id}
+                    key={fixtureKey}
                     className="glass p-5"
                     whileHover={{ y: -2 }}
                   >
@@ -481,7 +389,7 @@ export default function TodayTab() {
                         className="text-sm font-semibold"
                         style={{ color: 'var(--text-muted)' }}
                       >
-                        {formatKickoff(fx.kickoff_time)}
+                        {formatKickoff(fx.kickoff ?? fx.kickoff_time)}
                       </span>
                       <StatusBadge status={fx.status} />
                       {conf ? (
@@ -542,14 +450,14 @@ export default function TodayTab() {
                     {/* Get prediction button */}
                     <button
                       className="btn-neon w-full py-2.5 text-sm"
-                      onClick={() => toggleExpanded(fx.id)}
+                      onClick={() => toggleExpanded(fixtureKey)}
                     >
-                      {expanded[fx.id] ? '🔼 Hide Prediction' : '🔮 Get Prediction'}
+                      {expanded[fixtureKey] ? '🔼 Hide Prediction' : '🔮 Get Prediction'}
                     </button>
 
                     {/* Prediction panel */}
                     <AnimatePresence initial={false}>
-                      {expanded[fx.id] && (
+                      {expanded[fixtureKey] && (
                         <motion.div
                           initial={{ height: 0, opacity: 0 }}
                           animate={{ height: 'auto', opacity: 1 }}
