@@ -48,7 +48,6 @@ UNDERSTAT_LEAGUES = [
     "GER-Bundesliga",
     "ITA-Serie A",
     "FRA-Ligue 1",
-    "NED-Eredivisie",
 ]
 
 SEASONS = ["2023-2024", "2024-2025"]
