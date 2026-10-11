@@ -2183,3 +2183,48 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print(json.dumps(prediction, indent=2))
+
+
+# ═══════════════════════════════════════════
+# STATUS
+# ═══════════════════════════════════════════
+
+
+def get_engine_status() -> dict[str, Any]:
+    """
+    Report whether the formula engine can serve predictions.
+
+    ``ready`` is True when the database engine was created and a session
+    factory exists. It is a configuration check only: no query is run, so
+    the call is cheap and never raises. A ready engine can still return
+    None for an individual fixture (unknown team, too little data, database
+    down), and the router then falls back to the ML models.
+    """
+    try:
+        from database import engine as db_engine
+    except Exception as exc:
+        return {
+            "ready": False,
+            "engine": ENGINE_NAME,
+            "reason": f"database module unavailable: {exc}",
+            "database_configured": False,
+            "cache_entries": len(_CACHE),
+        }
+
+    database_configured = db_engine is not None
+    session_factory_ok = SessionLocal is not None
+
+    if not database_configured:
+        reason = "no database engine configured (check DATABASE_URL)"
+    elif not session_factory_ok:
+        reason = "session factory unavailable"
+    else:
+        reason = "ok"
+
+    return {
+        "ready": database_configured and session_factory_ok,
+        "engine": ENGINE_NAME,
+        "reason": reason,
+        "database_configured": database_configured,
+        "cache_entries": len(_CACHE),
+    }

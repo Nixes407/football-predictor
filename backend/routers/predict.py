@@ -28,6 +28,20 @@ import subprocess
 import sys
 import threading
 
+try:
+    from models.formula_engine import (
+        predict_match as formula_predict,
+        get_engine_status,
+    )
+    _formula_engine_available = True
+    print("[predict] Formula engine loaded")
+except Exception as exc:
+    formula_predict = None
+    get_engine_status = None
+    _formula_engine_available = False
+    print(f"[predict] WARNING: formula engine "
+          f"not available: {exc}")
+
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 # Module-level artifact variables (all start as None)
@@ -565,6 +579,27 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
     Run all prediction models for a given fixture
     and return full market probabilities.
     """
+    # Try formula engine first
+    if _formula_engine_available and formula_predict:
+        try:
+            formula_result = formula_predict(
+                home_team=req.home_team,
+                away_team=req.away_team,
+                league=req.league,
+                season=req.season,
+            )
+            if formula_result is not None:
+                print(f"[predict] Formula engine: "
+                      f"{req.home_team} vs "
+                      f"{req.away_team}")
+                return formula_result
+            else:
+                print("[predict] Formula engine "
+                      "returned None — using ML")
+        except Exception as exc:
+            print(f"[predict] Formula engine "
+                  f"error: {exc} — using ML")
+
     # Check models are loaded
     models_ready = all([
         _result_model is not None,
@@ -702,6 +737,17 @@ def diagnostics() -> dict:
         "csv_fbref_sample":       fbref_in_csv[:5],
         "cols_match":             (
             set(runtime_cols) == set(FEATURE_COLS)
+        ),
+        "formula_engine": (
+            get_engine_status()
+            if _formula_engine_available and get_engine_status
+            else {"ready": False, "reason": "not loaded"}
+        ),
+        "active_engine": (
+            "formula"
+            if _formula_engine_available and get_engine_status
+            and get_engine_status().get("ready")
+            else "ml_models"
         ),
     }
 
