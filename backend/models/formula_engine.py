@@ -79,6 +79,15 @@ ATTACK_WEIGHTS = {
     "press_succ":       0.15,
 }
 
+# --- Shot quality ------------------------------------------------------ #
+
+# Typical goals per shot. FBref rows sit between ~0.05 and ~0.25, so a
+# stored value outside GOALS_PER_SHOT_RANGE is not measuring goals per shot
+# at all (the API-Football collector derives a placeholder from goals and
+# games) and the neutral value is used instead of a meaningless ratio.
+DEFAULT_G_PER_SHOT = 0.10
+GOALS_PER_SHOT_RANGE = (0.02, 0.40)
+
 # Defence weight factors
 DEFENCE_WEIGHTS = {
     "xga_per_game":     0.35,
@@ -179,7 +188,16 @@ CACHE_MAX_ENTRIES = 128
 # single game's worth of stats is already stored per game (StatsBomb
 # aggregates), not per season (FBref / Understat).
 RATE_SCALE_TOLERANCE = 1.05
-LEAGUE_SCALE_TOLERANCE = 1.30
+
+# How many games a stat row can cover: a domestic season plus a cup run.
+# An estimate above this means two columns of different scales were paired
+# up, which is not a game count.
+MAX_GAMES_ESTIMATE = 60.0
+
+# The keeper W-D-L columns hold a *last-five form window* in the
+# API-Football rows and a full-season record in the FBref / Understat rows,
+# so a total this small is not evidence of a short season.
+FORM_WINDOW = 5
 
 # Fallback league averages, all per game, used when a league has no rows.
 DEFAULT_LEAGUE_AVERAGES = {
@@ -201,6 +219,10 @@ DEFAULT_LEAGUE_AVERAGES = {
 # before they are compared with the fixed denominators in the rating
 # formulas. Everything not listed here is already a rate, a percentage or a
 # per-90 value.
+#
+# A total whose RATE_KEYS twin is stored (goals against, shots, shots on
+# target) is overwritten by that rate in :func:`to_per_game`, so the
+# division below is only the fallback for rows with no rate column.
 PER_GAME_KEYS = (
     "xg", "npxg", "shots", "sot", "goals",
     "prgp", "prgc", "passes_att", "passes_cmp", "kp", "ppa",
@@ -220,6 +242,17 @@ GAMES_RATE_PAIRS = (
     ("sca",   "sca90"),
     ("gca",   "gca90"),
 )
+
+# Totals that also have a stored per-90 column. These rate columns are the
+# values this engine trusts for a per-game figure: a collector writes them
+# from a single row (FBref's GA90 / Sh/90, the API-Football standings rate),
+# they are already per game, and unlike ``total / games_played`` they cannot
+# be corrupted by a bad games-played estimate. See :func:`to_per_game`.
+RATE_KEYS = {
+    "ga":    "ga90",
+    "shots": "sh_per90",
+    "sot":   "sot_per90",
+}
 
 # Shared cache: key -> (expires_at_monotonic, value)
 _CACHE: dict[tuple, tuple[float, Any]] = {}
@@ -735,9 +768,18 @@ def games_played(
     than season totals, which is what the StatsBomb aggregator writes.
     Detection order:
 
-      1. W + D + L from the FBref / Understat keeper columns.
-      2. total / per-90 pairs (shots, SoT, GA, SCA, GCA).
-      3. total / league-average-per-game, when league averages are known.
+      1. total / per-90 pairs (shots, SoT, GA, SCA, GCA). These columns
+         measure the row's own scale, so they win over W-D-L.
+      2. W + D + L, when the total is larger than a five-game form window.
+      3. total / league-average-per-game, which needs no rate column, used
+         before a five-game W-D-L total that may just be recent form.
+      4. W + D + L as the last resort.
+
+    The keeper W-D-L columns are *last-five form* in the API-Football rows
+    and a season record in the FBref / Understat rows, so trusting W + D + L
+    first turns a five-game form window into a "five-game season" and
+    divides every season total by five — the ``home_ga_per_game: 6.8``
+    report (34 goals against, last-five record 3W-1D-1L).
 
     An estimate below MIN_GAMES is still returned when the row is clearly
     multi-game, so the caller can reject it as insufficient data instead of
@@ -750,8 +792,15 @@ def games_played(
     draws  = _safe(stats.get("form_draws"))
     losses = _safe(stats.get("form_losses"))
     total  = wins + draws + losses
-    if total >= MIN_GAMES:
-        return float(total)
+    form_window = 0 < total <= FORM_WINDOW
+
+    # 1. Total / per-90 pairs. A ratio near 1.0 is the StatsBomb per-game
+    #    signature (both columns hold the same number), not a one-game
+    #    season, so it is remembered instead of returned.
+    plausible: list[float] = []
+    short: list[float] = []
+    ga_pair: float | None = None
+    already_per_game = False
 
     for total_key, rate_key in GAMES_RATE_PAIRS:
         season_total = _safe(stats.get(total_key))
@@ -759,13 +808,47 @@ def games_played(
         if season_total <= 0 or per_game <= 0:
             continue
         estimate = season_total / per_game
+        if estimate <= RATE_SCALE_TOLERANCE:
+            already_per_game = True
+            continue
+        if estimate > MAX_GAMES_ESTIMATE:
+            # Two columns of different scales were paired up; not a count.
+            continue
         if estimate >= MIN_GAMES:
-            return estimate
-        # A StatsBomb row stores the same number in both columns, giving
-        # exactly 1.0; anything meaningfully above 1.0 is a short season.
-        if estimate > RATE_SCALE_TOLERANCE:
-            return estimate
+            plausible.append(estimate)
+            if (total_key, rate_key) == ("ga", "ga90"):
+                ga_pair = estimate
+        else:
+            short.append(estimate)
 
+    if plausible:
+        # GA90 is written from the same row as GA by every collector, while
+        # sh_per90 can hold a proxy (the API-Football rows store a
+        # goals-per-game-derived stand-in), so the keeper pair is the most
+        # trustworthy single estimate. Otherwise the median of the pairs.
+        if ga_pair is not None:
+            estimate = ga_pair
+        else:
+            plausible.sort()
+            estimate = plausible[len(plausible) // 2]
+        return float(round(estimate))
+
+    if already_per_game:
+        return None
+
+    if short:
+        short.sort()
+        return float(round(short[len(short) // 2]))
+
+    # 2. A season record (more than a five-game form window) is exact.
+    if total >= MIN_GAMES and not form_window:
+        return float(total)
+
+    # 3. League-average-per-game: the only signal left for a season-total
+    #    row with no rate column at all. Estimates below MIN_GAMES are not
+    #    returned — a per-game row measured against a per-game average
+    #    lands there too, and treating it as "not enough games" would
+    #    reject a perfectly good row.
     if league_avgs and total < MIN_GAMES:
         for total_key, avg_key in (
             ("shots", "avg_shots"),
@@ -777,11 +860,12 @@ def games_played(
             if season_total <= 0 or average <= 0:
                 continue
             estimate = season_total / average
+            if estimate > MAX_GAMES_ESTIMATE:
+                continue
             if estimate >= MIN_GAMES:
-                return estimate
-            if estimate > LEAGUE_SCALE_TOLERANCE:
-                return estimate
+                return float(round(estimate))
 
+    # 4. Whatever W + D + L says, including the ambiguous form window.
     if total > 0:
         return float(total)
     return None
@@ -797,6 +881,14 @@ def to_per_game(
 
     Rows that already hold per-game values (StatsBomb aggregates) are
     returned unchanged, so the whole engine can compare like with like.
+
+    A total that has a stored per-90 column (goals against, shots, shots on
+    target — see ``RATE_KEYS``) is taken from that column instead of being
+    re-derived from the total, because the rate is computed by the collector
+    from the same row and is already per game. That makes the reported
+    per-game figures independent of the games-played estimate: reading
+    ``ga90`` gives Arsenal 0.76 whether the row says 38 games or holds a
+    five-game form window in W-D-L.
     """
     if not stats:
         return {}
@@ -805,16 +897,18 @@ def to_per_game(
     games = games_played(stats, league_avgs)
     normalised["games"] = games
 
-    if not games or games < MIN_GAMES:
-        # Either the row is already per game, or it covers too few games to
-        # divide meaningfully — leave the values as stored.
-        return normalised
+    if games and games >= MIN_GAMES:
+        for key in PER_GAME_KEYS:
+            value = normalised.get(key)
+            if value is None:
+                continue
+            normalised[key] = _safe(value) / games
 
-    for key in PER_GAME_KEYS:
-        value = normalised.get(key)
-        if value is None:
-            continue
-        normalised[key] = _safe(value) / games
+    # Stored rates are the authoritative per-game values.
+    for total_key, rate_key in RATE_KEYS.items():
+        rate = _safe(normalised.get(rate_key))
+        if rate > 0:
+            normalised[total_key] = rate
 
     return normalised
 
@@ -851,9 +945,16 @@ def compute_attack_rating(
     sot = _safe(stats.get("sot"), avg_sot)
     sot_rating = sot / avg_sot if avg_sot > 0 else 1.0
 
-    # Shot quality — goals per shot
-    g_per_sh = _safe(stats.get("g_per_sh"), 0.1)
-    shot_quality = g_per_sh / 0.1  # 0.1 is typical average
+    # Shot quality — goals per shot.
+    # A stored value outside the goals-per-shot range is not measuring shot
+    # quality (the API-Football rows write a placeholder derived from goals
+    # and games played), so the league-typical value is used instead of a
+    # ratio that would drag the whole attack rating down.
+    g_per_sh = _safe(stats.get("g_per_sh"), DEFAULT_G_PER_SHOT)
+    shot_min, shot_max = GOALS_PER_SHOT_RANGE
+    if not shot_min <= g_per_sh <= shot_max:
+        g_per_sh = DEFAULT_G_PER_SHOT
+    shot_quality = g_per_sh / DEFAULT_G_PER_SHOT
 
     # Progressive actions — proxy for creativity.
     # A missing column falls back to the league's own per-game average, so a
@@ -915,13 +1016,17 @@ def compute_defence_rating(
     Returns value around 1.0:
       < 1.0 = better than average defence
       > 1.0 = worse than average defence
+
+    ``stats`` is expected to be per-game normalised, so ``ga`` is goals
+    against *per game*: :func:`to_per_game` fills it from the stored GA90
+    column (0.76 for 29 conceded in 38 games), never from GA / 38 alone.
     """
     avg_xga = league_avgs.get("avg_xga", LEAGUE_AVG_XG)
 
     if avg_xga <= 0:
         avg_xga = LEAGUE_AVG_XG
 
-    # xGA — how much xG the team concedes
+    # xGA — how much the team concedes, per game
     xga = _safe(stats.get("ga"), avg_xga)
     xga_rating = xga / avg_xga  # higher = worse
 
@@ -2024,11 +2129,17 @@ def _predict_match(
             "h2h_away_modifier":     _num(h2h["away"]),
             "home_advantage":        _num(HOME_ADVANTAGE),
             "away_adjustment":       _num(AWAY_ADJUSTMENT),
-            # Per-game inputs actually used
+            # Per-game inputs actually used. ga / shots / sot come straight
+            # from the stored per-90 columns (ga90, sh_per90, sh_sot_per90);
+            # goals per game is sh_goals divided by the games estimate.
             "home_xg_per_game":      _num(home_stats.get("xg")),
             "away_xg_per_game":      _num(away_stats.get("xg")),
             "home_ga_per_game":      _num(home_stats.get("ga")),
             "away_ga_per_game":      _num(away_stats.get("ga")),
+            "home_goals_per_game":   _num(home_stats.get("goals")),
+            "away_goals_per_game":   _num(away_stats.get("goals")),
+            "home_shots_per_game":   _num(home_stats.get("shots")),
+            "away_shots_per_game":   _num(away_stats.get("shots")),
             "home_sot_per_game":     _num(home_stats.get("sot")),
             "away_sot_per_game":     _num(away_stats.get("sot")),
             "home_save_pct":         _num(home_stats.get("save_pct"), 2),

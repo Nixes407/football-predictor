@@ -84,6 +84,30 @@ def _pct(val) -> float | None:
         return None
 
 
+# API-Football reports a player's role as a full word ("Midfielder", in
+# statistics[].games.position), while player_season_stats.position holds
+# the FBref codes (GK/DF/MF/FW) that the prediction engine matches on
+# (see formula_engine._position_groups). Collected roles are normalised to
+# the FBref codes so both sources agree.
+POSITION_MAP = {
+    "goalkeeper": "GK",
+    "defender":   "DF",
+    "midfielder": "MF",
+    "attacker":   "FW",
+    "forward":    "FW",
+}
+
+
+def _norm_position(value) -> str | None:
+    """FBref-style position code for an API-Football role string."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.upper() in ("GK", "DF", "MF", "FW"):
+        return raw.upper()
+    return POSITION_MAP.get(raw.lower())
+
+
 def _get(endpoint: str, params: dict) -> dict | None:
     global _calls_made
     if not API_KEY:
@@ -130,6 +154,22 @@ def check_status() -> bool:
     return True
 
 
+def _apply_attrs(existing, attrs) -> None:
+    """
+    Write collected values onto an ORM row, skipping ``None``.
+
+    A collector that only fills part of a row (the standings feed has no
+    clean sheets, shots or cards) passes None for what it could not read.
+    Writing those would wipe a value another collector had stored — the
+    daily API-Football run was clearing the clean-sheet column that FBref
+    fills — so None means "unknown, leave what is there".
+    """
+    for k, v in attrs.items():
+        if v is None:
+            continue
+        setattr(existing, k, v)
+
+
 def _upsert_team(db, team, league, season, attrs):
     existing = (
         db.query(TeamSeasonStats)
@@ -143,8 +183,7 @@ def _upsert_team(db, team, league, season, attrs):
         existing = TeamSeasonStats(
             team=team, league=league, season=season)
         db.add(existing)
-    for k, v in attrs.items():
-        setattr(existing, k, v)
+    _apply_attrs(existing, attrs)
 
 
 def _upsert_player(db, player, team,
@@ -163,8 +202,7 @@ def _upsert_player(db, player, team,
             player=player, team=team,
             league=league, season=season)
         db.add(existing)
-    for k, v in attrs.items():
-        setattr(existing, k, v)
+    _apply_attrs(existing, attrs)
 
 
 def collect_fixtures_and_results() -> dict:
@@ -265,26 +303,11 @@ def collect_team_stats() -> int:
                             continue
 
                         all_s   = team_entry.get("all", {})
-                        home_s  = team_entry.get("home", {})
-                        away_s  = team_entry.get("away", {})
                         form_str= team_entry.get("form","") or ""
-                        points  = team_entry.get("points", 0)
-                        gd      = team_entry.get("goalsDiff", 0)
 
                         played = _safe(all_s.get("played")) or 1
                         gf     = _safe(all_s.get("goals", {}).get("for"))
                         ga     = _safe(all_s.get("goals", {}).get("against"))
-
-                        home_played = _safe(home_s.get("played")) or 1
-                        home_gf     = _safe(home_s.get("goals", {}).get("for"))
-                        home_ga     = _safe(home_s.get("goals", {}).get("against"))
-                        home_w      = _safe(home_s.get("win"))
-                        home_d      = _safe(home_s.get("draw"))
-                        home_l      = _safe(home_s.get("lose"))
-
-                        away_played = _safe(away_s.get("played")) or 1
-                        away_gf     = _safe(away_s.get("goals", {}).get("for"))
-                        away_ga     = _safe(away_s.get("goals", {}).get("against"))
 
                         recent = form_str[-5:]
                         fw = recent.count("W")
@@ -292,20 +315,22 @@ def collect_team_stats() -> int:
                         fl = recent.count("L")
 
                         attrs = {
-                            # Goals
+                            # Goals — the only real numbers the standings
+                            # feed carries. Shots / SoT are deliberately not
+                            # estimated from goals here: the old
+                            # gf / played * 4 style proxies overwrote the
+                            # real per-90 columns FBref writes.
                             "sh_goals":     gf,
                             "gk_ga":        ga,
                             "gk_ga90":      round(ga / played, 2) if ga else None,
-                            # Shooting proxies from goals/game
-                            "sh_sh_per90":  round(gf / played * 4, 2) if gf else None,
-                            "sh_sot_per90": round(gf / played * 2, 2) if gf else None,
-                            "sh_g_per_sh":  round(gf / (gf * 4 * played), 3) if gf else None,
-                            # Home/away splits
+                            # The keeper W-D-L columns are the last-five form
+                            # window in this table (see collect_team_form).
                             "gk_w":         float(fw),
                             "gk_d":         float(fd),
                             "gk_l":         float(fl),
-                            # Clean sheet estimate
-                            # (standings does not give CS directly)
+                            # The standings feed has no clean sheets; the
+                            # None is skipped by _upsert_team, so a value
+                            # FBref stored is not wiped.
                             "gk_cs":        None,
                         }
 
@@ -432,125 +457,242 @@ def collect_team_form() -> int:
 
 def collect_player_stats() -> int:
     """
-    9 API calls — one page per league.
-    Limited to 1 page to stay within budget.
+    Fetch players for each team using
+    the /players endpoint with team parameter.
+    Uses standing data to get team IDs first.
+    One call per league for standings (already
+    done in collect_team_form) then one call
+    per team for players.
+
+    The league-wide page (league + season, no team / player) comes back
+    empty on the free tier, which is why this collector used to store no
+    rows. /teams supplies the team ids per league, then page 1 of
+    /players is read for every team.
+
+    Budget: 1 /teams call per league plus ~1 /players call per team —
+    roughly 10 calls per league, ~185 for all nine. That is more than the
+    100/day free-tier quota, so the loop stops as soon as the API reports
+    the limit (a quota or plan error arrives in a 200 body) and the rows
+    collected up to that point are committed.
     """
-    print("[player] Collecting player statistics...")
+    print("[player] Collecting player stats...")
     total = 0
 
     for league_name, league_id in LEAGUE_MAP.items():
         latest   = max(SEASON_MAP[league_name])
         season_l = SEASON_LABEL.get(
             (league_id, latest), str(latest))
-        print(f"[player] {league_name} {latest}...")
+        league_total = 0
 
-        data = _get("players", {
+        # Get teams for this league
+        teams_data = _get("teams", {
             "league": league_id,
             "season": latest,
-            "page":   1,
         })
-        if not data:
+        if not teams_data:
             continue
 
-        players = data.get("response", [])
-        if not players:
+        # API-Football reports quota and plan errors in a 200 body, with an
+        # empty response — stop rather than spend the rest of the loop on
+        # calls that cannot succeed.
+        errors = teams_data.get("errors")
+        if errors:
+            print(f"[player] Stopping: {errors}")
+            print(f"[player] Total rows: {total}")
+            return total
+
+        teams = teams_data.get("response", [])
+        if not teams:
+            print(f"[player] No teams for "
+                  f"{league_name} {latest}")
             continue
 
-        db = SessionLocal()
-        try:
-            for entry in players:
-                p    = entry.get("player", {})
-                name = p.get("name", "Unknown")
-                age  = p.get("age")
-                pos  = p.get("position")
+        print(f"[player] {league_name}: "
+              f"{len(teams)} teams")
 
-                stats = entry.get("statistics", [])
-                if not stats:
-                    continue
-                s    = stats[0]
-                team = s.get("team", {}).get(
-                    "name", "Unknown")
+        for team_entry in teams:
+            team_info = team_entry.get("team", {})
+            tid   = team_info.get("id")
+            tname = team_info.get("name", "Unknown")
+            if not tid:
+                continue
 
-                games     = s.get("games", {})
-                goals_s   = s.get("goals", {})
-                shots_s   = s.get("shots", {})
-                passes_s  = s.get("passes", {})
-                tackles_s = s.get("tackles", {})
-                duels_s   = s.get("duels", {})
-                dribbles_s= s.get("dribbles", {})
-                fouls_s   = s.get("fouls", {})
-                cards_s   = s.get("cards", {})
-                penalty_s = s.get("penalty", {})
+            data = _get("players", {
+                "team":   tid,
+                "season": latest,
+                "page":   1,
+            })
+            if not data:
+                continue
 
-                mins  = _safe(games.get("minutes")) or 0
-                per90 = (mins / 90) if mins > 0 else 1
+            errors = data.get("errors")
+            if errors:
+                print(f"[player] Stopping: {errors}")
+                print(f"[player] Total rows: {total}")
+                return total
 
-                gls = _safe(goals_s.get("total"))
-                ast = _safe(goals_s.get("assists"))
-                sh  = _safe(shots_s.get("total"))
-                sot = _safe(shots_s.get("on"))
-                dw  = _safe(duels_s.get("won"))
-                dt  = _safe(duels_s.get("total"))
+            players = data.get("response", [])
+            if not players:
+                continue
 
-                attrs = {
-                    "position":       pos,
-                    "age":            age,
-                    "mp":             games.get("appearences"),
-                    "starts":         games.get("lineups"),
-                    "minutes":        _safe(games.get("minutes")),
-                    "minutes_per90":  round(per90, 2),
-                    "goals":          gls,
-                    "assists":        ast,
-                    "g_plus_a":       (gls or 0) + (ast or 0) or None,
-                    "crdy":           _safe(cards_s.get("yellow")),
-                    "crdr":           _safe(cards_s.get("red")),
-                    "sh_shots":       sh,
-                    "sh_sot":         sot,
-                    "sh_sot_pct":     round(sot / sh * 100, 1) if sh and sot else None,
-                    "sh_g_per_sh":    round(gls / sh, 3) if sh and gls else None,
-                    "sh_sh_per90":    round(sh / per90, 2) if sh else None,
-                    "sh_sot_per90":   round(sot / per90, 2) if sot else None,
-                    "ps_att":         _safe(passes_s.get("total")),
-                    "ps_kp":          _safe(passes_s.get("key")),
-                    "ps_cmp_pct":     _pct(passes_s.get("accuracy")),
-                    "tkl":            _safe(tackles_s.get("total")),
-                    "int_":           _safe(tackles_s.get("interceptions")),
-                    "tkl_plus_int":   (
-                        (_safe(tackles_s.get("total")) or 0) +
-                        (_safe(tackles_s.get("interceptions")) or 0)
-                    ) or None,
-                    "fls":            _safe(fouls_s.get("committed")),
-                    "fld":            _safe(fouls_s.get("drawn")),
-                    "pkwon":          _safe(penalty_s.get("won")),
-                    "pkcon":          _safe(penalty_s.get("commited")),
-                    "aerial_won":     dw,
-                    "aerial_lost":    ((dt or 0) - (dw or 0)) or None,
-                    "aerial_pct":     round(dw / dt * 100, 1) if dt and dw else None,
-                    "prgc_carries":   _safe(dribbles_s.get("success")),
-                    "gls_per90":      round(gls / per90, 3) if gls else None,
-                    "ast_per90":      round(ast / per90, 3) if ast else None,
-                    "g_plus_a_per90": round(
-                        ((gls or 0) + (ast or 0)) / per90, 3
-                    ) if (gls or ast) else None,
-                }
+            pages = _safe(
+                (data.get("paging") or {}).get("total"))
+            if pages and pages > 1:
+                print(f"[player] NOTE: {tname} has "
+                      f"{int(pages)} pages — only "
+                      f"page 1 collected")
 
-                _upsert_player(
-                    db, name, team,
-                    league_name, season_l, attrs)
-                total += 1
+            db = SessionLocal()
+            try:
+                for entry in players:
+                    p    = entry.get("player", {})
+                    name = p.get("name", "Unknown")
+                    age  = p.get("age")
 
-            db.commit()
+                    stats = entry.get(
+                        "statistics", [])
+                    if not stats:
+                        continue
+                    # A mid-season transfer leaves one statistics entry per
+                    # club, so prefer the one for the team just requested.
+                    s = next(
+                        (st for st in stats
+                         if (st.get("team") or {}).get("id") == tid),
+                        stats[0])
+
+                    games    = s.get("games", {})
+                    goals_s  = s.get("goals", {})
+                    shots_s  = s.get("shots", {})
+                    tackles_s= s.get("tackles", {})
+                    duels_s  = s.get("duels", {})
+                    dribbles_s=s.get("dribbles",{})
+                    fouls_s  = s.get("fouls", {})
+                    cards_s  = s.get("cards", {})
+                    penalty_s= s.get("penalty", {})
+
+                    # The role lives in the statistics block (the player
+                    # object has no position) and arrives as a full word
+                    # ("Midfielder"); it is normalised to the FBref codes
+                    # (GK/DF/MF/FW) the prediction engine matches on.
+                    pos = _norm_position(
+                        p.get("position")
+                        or games.get("position"))
+
+                    mins  = _safe(games.get("minutes")) or 0
+                    per90 = (mins/90) if mins>0 else 1
+
+                    gls = _safe(goals_s.get("total"))
+                    ast = _safe(goals_s.get("assists"))
+                    sh  = _safe(shots_s.get("total"))
+                    sot = _safe(shots_s.get("on"))
+                    dw  = _safe(duels_s.get("won"))
+                    dt  = _safe(duels_s.get("total"))
+
+                    attrs = {
+                        "position":   pos,
+                        "age":        age,
+                        # API-Football spells this field "appearences".
+                        "mp":         (
+                            games.get("appearences")
+                            or games.get("appearances")
+                        ),
+                        "starts":     games.get("lineups"),
+                        "minutes":    _safe(
+                            games.get("minutes")),
+                        "minutes_per90": round(
+                            per90, 2),
+                        "goals":      gls,
+                        "assists":    ast,
+                        "g_plus_a":   (
+                            (gls or 0)+(ast or 0)
+                        ) or None,
+                        "crdy":       _safe(
+                            cards_s.get("yellow")),
+                        "crdr":       _safe(
+                            cards_s.get("red")),
+                        "sh_shots":   sh,
+                        "sh_sot":     sot,
+                        "sh_sot_pct": round(
+                            sot/sh*100,1
+                        ) if sh and sot else None,
+                        "sh_g_per_sh":round(
+                            gls/sh,3
+                        ) if sh and gls else None,
+                        "sh_sh_per90":round(
+                            sh/per90,2
+                        ) if sh else None,
+                        "sh_sot_per90":round(
+                            sot/per90,2
+                        ) if sot else None,
+                        # NOTE: the API also returns passing numbers
+                        # (passes.total / key / accuracy), but
+                        # player_season_stats has no column for them —
+                        # ps_att / ps_kp / ps_cmp_pct belong to
+                        # TeamSeasonStats — so they are not read here.
+                        "tkl":        _safe(
+                            tackles_s.get("total")),
+                        "int_":       _safe(
+                            tackles_s.get(
+                                "interceptions")),
+                        "tkl_plus_int": (
+                            (_safe(tackles_s.get("total")) or 0) +
+                            (_safe(tackles_s.get(
+                                "interceptions")) or 0)
+                        ) or None,
+                        "fls":        _safe(
+                            fouls_s.get("committed")),
+                        "fld":        _safe(
+                            fouls_s.get("drawn")),
+                        "pkwon":      _safe(
+                            penalty_s.get("won")),
+                        "pkcon":      _safe(
+                            penalty_s.get("commited")),
+                        "aerial_won": dw,
+                        "aerial_lost":(
+                            (dt or 0)-(dw or 0)
+                        ) or None,
+                        "aerial_pct": round(
+                            dw/dt*100,1
+                        ) if dt and dw else None,
+                        "prgc_carries":_safe(
+                            dribbles_s.get("success")),
+                        "gls_per90":  round(
+                            gls/per90,3
+                        ) if gls else None,
+                        "ast_per90":  round(
+                            ast/per90,3
+                        ) if ast else None,
+                        "g_plus_a_per90": round(
+                            ((gls or 0)+(ast or 0))/per90, 3
+                        ) if (gls or ast) else None,
+                    }
+
+                    _upsert_player(
+                        db, name, tname,
+                        league_name, season_l,
+                        attrs)
+                    total += 1
+                    league_total += 1
+
+                db.commit()
+
+            except Exception as exc:
+                db.rollback()
+                print(f"[player] ERROR "
+                      f"{tname}: {exc}")
+                raise
+            finally:
+                db.close()
+
+        if league_total:
             print(f"[player] {league_name}: "
-                  f"{len(players)} players committed")
+                  f"{league_total} players")
+        else:
+            print(f"[player] WARNING: no players for "
+                  f"{league_name} — /players returned "
+                  f"nothing for every team")
 
-        except Exception as exc:
-            db.rollback()
-            print(f"[player] ERROR {league_name}: {exc}")
-            raise
-        finally:
-            db.close()
-
-    print(f"[player] Done. Total: {total}")
+    print(f"[player] Total rows: {total}")
     return total
 
 
@@ -560,13 +702,17 @@ def run_all() -> None:
     Exits with code 1 on any failure.
 
     API call budget (100/day free tier):
-      1  status check
-      2  fixtures + yesterday results
-      18 team stats (9 leagues x 2 seasons)
-      9  player stats (1 page per league)
-      9  injuries
-      9  team form
-      Total: ~48 calls — well within budget
+      1   status check
+      2   fixtures + yesterday results
+      18  team stats (9 leagues x 2 seasons)
+      9   /teams for the player collector (1 per league)
+      ~185 player stats (1 /players call per team)
+      9   injuries
+      9   team form
+      A full pass is ~230+ calls, more than the daily quota, so
+      collect_player_stats stops as soon as the API reports the limit and
+      commits the teams it did reach; raise the plan or trim LEAGUE_MAP
+      (or run that collector on its own) to cover more of the list.
     """
     print("=" * 60)
     print("API-FOOTBALL DAILY COLLECTION")
