@@ -168,3 +168,4 @@ required. Details in [`docs/deploy.md`](docs/deploy.md).
 - [ ] **Phase 3** — feature engineering
 - [ ] **Phase 4** — model training and evaluation
 - [ ] **Phase 5** — prediction endpoint wired to the UI
+- [ ] 
