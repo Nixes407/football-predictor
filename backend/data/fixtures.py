@@ -5,12 +5,17 @@ import requests
 from datetime import date, datetime, timezone
 
 
+# football-data.org competition code -> internal league name.
+# The codes are football-data.org's own (e.g. "CL" = UEFA Champions League),
+# not API-Football IDs: API-Football's ID 2 would be requested here as
+# /v4/competitions/2/matches, which does not exist.
 LEAGUE_MAP = {
     "PL": "ENG-Premier League",
     "PD": "ESP-La Liga",
     "BL1": "GER-Bundesliga",
     "SA": "ITA-Serie A",
     "FL1": "FRA-Ligue 1",
+    "CL": "UEFA-Champions League",
 }
 
 TEAM_NAME_MAP = {
