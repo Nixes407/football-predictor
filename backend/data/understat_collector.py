@@ -129,24 +129,29 @@ UNDERSTAT_LEAGUES = [
     "FRA-Ligue 1",
 ]
 
-SEASONS = ["2023-2024", "2024-2025"]
+# Understat lags roughly one season behind the live calendar, so
+# 2025-2026 is the most recent season it publishes.
+SEASONS = ["2024-2025", "2025-2026"]
 
 # Understat uses different league name format
-# Map our league names to Understat format
+# Map our league names to Understat format.
+# Reference only: soccerdata accepts our own names (the same
+# keys as UNDERSTAT_LEAGUES), so the collectors pass them through
+# unchanged. Understat has no Eredivisie data, so there is no
+# entry for it ("RFPL" is the Russian Premier League).
 UNDERSTAT_LEAGUE_MAP = {
     "ENG-Premier League": "EPL",
     "ESP-La Liga": "La_liga",
     "GER-Bundesliga": "Bundesliga",
     "ITA-Serie A": "Serie_A",
     "FRA-Ligue 1": "Ligue_1",
-    "NED-Eredivisie": "RFPL",
 }
 
 # Map Understat season format to our format
 # Understat uses the year the season starts
 UNDERSTAT_SEASON_MAP = {
-    "2023-2024": 2023,
     "2024-2025": 2024,
+    "2025-2026": 2025,
 }
 
 
