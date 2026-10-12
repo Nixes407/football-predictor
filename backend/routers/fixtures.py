@@ -57,14 +57,17 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Atletico Madrid":      "ESP-La Liga",
     "Atlético de Madrid":   "ESP-La Liga",
     "Real Betis":           "ESP-La Liga",
+    "Betis":                "ESP-La Liga",          # football-data.org normaliser
     "Villarreal":           "ESP-La Liga",
     # Germany
     "Bayern Munchen":       "GER-Bundesliga",
     "Bayern München":       "GER-Bundesliga",
     "Bayern Munich":        "GER-Bundesliga",
     "Borussia Dortmund":    "GER-Bundesliga",
+    "Dortmund":             "GER-Bundesliga",       # football-data.org normaliser
     "RB Leipzig":           "GER-Bundesliga",
     "VfB Stuttgart":        "GER-Bundesliga",
+    "Stuttgart":            "GER-Bundesliga",       # football-data.org normaliser
     # Italy
     "Internazionale":       "ITA-Serie A",
     "Inter":                "ITA-Serie A",
@@ -76,6 +79,7 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     # France
     "Paris Saint-Germain":  "FRA-Ligue 1",
     "Paris Saint Germain":  "FRA-Ligue 1",
+    "Paris SG":             "FRA-Ligue 1",          # football-data.org normaliser
     "RC Lens":              "FRA-Ligue 1",
     "Lens":                 "FRA-Ligue 1",
     "Lille":                "FRA-Ligue 1",
