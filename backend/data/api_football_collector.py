@@ -38,6 +38,7 @@ LEAGUE_MAP = {
     "POR-Primeira Liga":  94,
     "NED-Eredivisie":     88,
     "USA-MLS":            253,
+    "UEFA-Champions League": 2,
 }
 
 SEASON_MAP = {
@@ -50,6 +51,7 @@ SEASON_MAP = {
     "POR-Primeira Liga":  [2025, 2026],
     "NED-Eredivisie":     [2025, 2026],
     "USA-MLS":            [2025, 2026],
+    "UEFA-Champions League": [2025, 2026],
 }
 
 SEASON_LABEL = {
@@ -62,6 +64,7 @@ SEASON_LABEL = {
     (94,  2025): "2025-2026", (94,  2026): "2026-2027",
     (88,  2025): "2025-2026", (88,  2026): "2026-2027",
     (253, 2025): "2025",      (253, 2026): "2026",
+    (2,   2025): "2025-2026", (2,   2026): "2026-2027",
 }
 
 _calls_made = 0
@@ -266,6 +269,8 @@ def collect_team_stats() -> int:
     total = 0
 
     for league_name, league_id in LEAGUE_MAP.items():
+        if league_name == "UEFA-Champions League":
+            continue
         for season_year in SEASON_MAP[league_name]:
             season_label = SEASON_LABEL.get(
                 (league_id, season_year),
@@ -355,12 +360,14 @@ def collect_team_stats() -> int:
     return total
 
 def collect_injuries() -> dict:
-    """9 API calls — one per league."""
+    """9 API calls — one per domestic league (UCL skipped: not stored)."""
     print("[injuries] Collecting injuries...")
     all_injuries = {}
     today = date.today().isoformat()
 
     for league_name, league_id in LEAGUE_MAP.items():
+        if league_name == "UEFA-Champions League":
+            continue
         data = _get("injuries", {
             "league": league_id,
             "date":   today,
@@ -389,6 +396,8 @@ def collect_team_form() -> int:
     updated = 0
 
     for league_name, league_id in LEAGUE_MAP.items():
+        if league_name == "UEFA-Champions League":
+            continue
         latest   = max(SEASON_MAP[league_name])
         season_l = SEASON_LABEL.get(
             (league_id, latest), str(latest))
@@ -479,6 +488,8 @@ def collect_player_stats() -> int:
     total = 0
 
     for league_name, league_id in LEAGUE_MAP.items():
+        if league_name == "UEFA-Champions League":
+            continue
         latest   = max(SEASON_MAP[league_name])
         season_l = SEASON_LABEL.get(
             (league_id, latest), str(latest))

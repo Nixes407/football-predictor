@@ -1,7 +1,7 @@
 """Endpoints for daily football fixtures and their stored predictions."""
 
 import traceback
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import routers.predict as predict_module
@@ -41,6 +41,57 @@ router = APIRouter()
 # predict.MatchRequest). The formula engine resolves it to the newest season
 # the league actually has data for.
 DEFAULT_SEASON = "2024-2025"
+
+UCL_LEAGUE = "UEFA-Champions League"
+
+UCL_TEAM_DOMESTIC_LEAGUE = {
+    # England
+    "Arsenal":              "ENG-Premier League",
+    "Aston Villa":          "ENG-Premier League",
+    "Liverpool":            "ENG-Premier League",
+    "Manchester City":      "ENG-Premier League",
+    "Manchester United":    "ENG-Premier League",
+    # Spain
+    "Real Madrid":          "ESP-La Liga",
+    "Barcelona":            "ESP-La Liga",
+    "Atletico Madrid":      "ESP-La Liga",
+    "Atlético de Madrid":   "ESP-La Liga",
+    "Real Betis":           "ESP-La Liga",
+    "Villarreal":           "ESP-La Liga",
+    # Germany
+    "Bayern Munchen":       "GER-Bundesliga",
+    "Bayern München":       "GER-Bundesliga",
+    "Bayern Munich":        "GER-Bundesliga",
+    "Borussia Dortmund":    "GER-Bundesliga",
+    "RB Leipzig":           "GER-Bundesliga",
+    "VfB Stuttgart":        "GER-Bundesliga",
+    # Italy
+    "Internazionale":       "ITA-Serie A",
+    "Inter":                "ITA-Serie A",
+    "Inter Milan":          "ITA-Serie A",
+    "Napoli":               "ITA-Serie A",
+    "AS Roma":              "ITA-Serie A",
+    "Roma":                 "ITA-Serie A",
+    "Como":                 "ITA-Serie A",
+    # France
+    "Paris Saint-Germain":  "FRA-Ligue 1",
+    "Paris Saint Germain":  "FRA-Ligue 1",
+    "RC Lens":              "FRA-Ligue 1",
+    "Lens":                 "FRA-Ligue 1",
+    "Lille":                "FRA-Ligue 1",
+    "LOSC Lille":           "FRA-Ligue 1",
+    # Portugal
+    "FC Porto":             "POR-Primeira Liga",
+    "Porto":                "POR-Primeira Liga",
+    "Sporting CP":          "POR-Primeira Liga",
+    # Netherlands
+    "Feyenoord":            "NED-Eredivisie",
+    "PSV Eindhoven":        "NED-Eredivisie",
+    "PSV":                  "NED-Eredivisie",
+}
+
+# A stored prediction is refreshed at most this long after it was computed.
+FIXTURE_STALE_HOURS = 2
 
 # 1X2 probabilities: the fields that make a stored fixture "predicted".
 RESULT_PREDICTION_FIELDS = (
@@ -289,6 +340,30 @@ def _predict_with_formula(
     return _with_derived_markets(values)
 
 
+def _get_ucl_domestic_league(team: str) -> str | None:
+    """
+    Return the domestic league for a UCL team.
+
+    Returns None if the team is from a league
+    we do not cover — those fixtures are hidden.
+    """
+    return UCL_TEAM_DOMESTIC_LEAGUE.get(team)
+
+
+def _parse_utc(value) -> datetime | None:
+    """A stored ISO timestamp (or datetime) as an aware UTC datetime."""
+    if value is None or value == "":
+        return None
+    try:
+        parsed = (value if isinstance(value, datetime)
+                  else datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _predict_fixture_values(
     home_team: str,
     away_team: str,
@@ -305,6 +380,27 @@ def _predict_fixture_values(
     derived market is computed from the expected goals and corners. Every
     field is None when neither engine can predict the fixture.
     """
+    if league == UCL_LEAGUE:
+        home_dom = _get_ucl_domestic_league(home_team)
+        away_dom = _get_ucl_domestic_league(away_team)
+        if not home_dom or not away_dom:
+            print(f"[fixtures] UCL: skipping "
+                  f"{home_team} vs {away_team} "
+                  f"— domestic league not found")
+            return {}
+        if home_dom != away_dom:
+            # The formula engine rates both teams inside one league, so a
+            # pair from two leagues cannot be scored without looking up one
+            # side in the wrong league. Leave it unpredicted instead.
+            print(f"[fixtures] UCL: skipping "
+                  f"{home_team} ({home_dom}) vs {away_team} ({away_dom}) "
+                  f"— teams from different domestic leagues")
+            return {}
+        print(f"[fixtures] UCL: {home_team} "
+              f"({home_dom}) vs {away_team} "
+              f"({away_dom})")
+        league = home_dom
+
     values = _empty_prediction_values()
 
     from_formula = _predict_with_formula(home_team, away_team, league, season)
@@ -622,6 +718,11 @@ def _row_to_dict(row: DailyMatch) -> dict:
         data[name] = values.get(name)
 
     data["prediction_computed_at"] = row.prediction_computed_at
+    data["has_prediction"] = (
+        row.pred_home_win is not None and
+        row.pred_draw is not None and
+        row.pred_away_win is not None
+    )
     return data
 
 
@@ -632,6 +733,94 @@ def _load_matches(target_date: str, db: Session) -> list[DailyMatch]:
         .filter(DailyMatch.match_date == target_date)
         .all()
     )
+
+
+def _fixtures_are_stale(rows: list) -> bool:
+    """
+    Returns True if fixtures should be
+    refreshed — when the newest
+    prediction_computed_at is more than
+    FIXTURE_STALE_HOURS old or missing.
+    """
+    if not rows:
+        return False
+    # Parse before comparing: stored strings may differ in format.
+    timestamps = [
+        parsed
+        for parsed in (_parse_utc(r.prediction_computed_at) for r in rows)
+        if parsed is not None
+    ]
+    if not timestamps:
+        return True
+    newest = max(timestamps)
+    age = datetime.now(timezone.utc) - newest
+    return age > timedelta(hours=FIXTURE_STALE_HOURS)
+
+
+def _has_open_fixtures(rows: list) -> bool:
+    """True if any stored fixture has not kicked off yet."""
+    now = datetime.now(timezone.utc)
+    return any(
+        (kickoff := _parse_utc(r.kickoff_time)) is not None and kickoff > now
+        for r in rows
+    )
+
+
+def refresh_open_predictions(
+    rows: list[DailyMatch],
+    fresh_fixtures: list,
+    db: Session,
+) -> int:
+    """
+    Re-predict fixtures that have not kicked off yet, using the latest stats.
+
+    ``compute_and_store_predictions`` skips fixtures already stored, so a
+    refresh needs this separate pass. Status and kickoff come from the
+    fresh feed. A fixture that has kicked off keeps the prediction it was
+    made with. A fixture whose new prediction is unavailable keeps its old
+    one. Every open fixture is stamped as checked, so the staleness check
+    does not re-run predictions on every request. Returns how many
+    predictions were replaced.
+    """
+    fresh_by_id = {
+        str(f.get("external_id")): f for f in fresh_fixtures
+        if f.get("external_id") is not None
+    }
+    now = datetime.now(timezone.utc)
+    refreshed = 0
+
+    for row in rows:
+        try:
+            fresh = fresh_by_id.get(str(row.external_id))
+            if fresh:
+                if fresh.get("status"):
+                    row.status = fresh["status"]
+                if fresh.get("kickoff_time"):
+                    row.kickoff_time = fresh["kickoff_time"]
+
+            kickoff = _parse_utc(row.kickoff_time)
+            if kickoff is None or kickoff <= now:
+                db.commit()
+                continue
+
+            values = _predict_fixture_values(
+                home_team=row.home_team,
+                away_team=row.away_team,
+                league=row.league,
+                season=row.season,
+            )
+            if _has_result_prediction(values):
+                _apply_prediction_values(row, values)
+                refreshed += 1
+            row.prediction_computed_at = now.isoformat()
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            print(f"[fixtures] WARNING: refresh failed for "
+                  f"{row.home_team} vs {row.away_team}: {exc}")
+            traceback.print_exc()
+
+    return refreshed
 
 
 def _get_or_fetch_matches(target_date: str, db: Session) -> list[dict]:
@@ -645,6 +834,15 @@ def _get_or_fetch_matches(target_date: str, db: Session) -> list[dict]:
     if not rows:
         fixtures = fetch_fixtures(target_date)
         compute_and_store_predictions(fixtures, db)
+        rows = _load_matches(target_date, db)
+    elif _fixtures_are_stale(rows) and _has_open_fixtures(rows):
+        # Only dates with fixtures still to play are refreshed. Re-predicting
+        # a finished match would overwrite the forecast it was judged on.
+        print(f"[fixtures] Stale — refreshing "
+              f"{target_date}...")
+        new_fixtures = fetch_fixtures(target_date)
+        compute_and_store_predictions(new_fixtures, db)
+        refresh_open_predictions(rows, new_fixtures, db)
         rows = _load_matches(target_date, db)
 
     filled = fill_missing_predictions(rows, db)

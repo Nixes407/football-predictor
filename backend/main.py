@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -157,11 +158,42 @@ def scheduled_daily_fetch():
         print(f"[scheduler] ERROR in FBref scrape: {e}")
 
 
+def refresh_todays_fixtures():
+    """Refresh fixture predictions every 2 hours."""
+    from database import SessionLocal
+    from routers.fixtures import (
+        _get_or_fetch_matches,
+    )
+    from datetime import datetime, timezone
+
+    db = SessionLocal()
+    try:
+        # UTC date, matching /fixtures/today and the UTC scheduler.
+        today = datetime.now(timezone.utc).date().isoformat()
+        print(f"[scheduler] Refreshing "
+              f"fixtures for {today}...")
+        _get_or_fetch_matches(today, db)
+        print(f"[scheduler] Refresh done")
+    except Exception as exc:
+        print(f"[scheduler] ERROR: {exc}")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
     scheduled_daily_fetch,
     CronTrigger(hour=0, minute=0),
     id="daily_fixture_fetch",
+    replace_existing=True,
+)
+scheduler.add_job(
+    refresh_todays_fixtures,
+    trigger=IntervalTrigger(hours=2),
+    id="refresh_fixtures",
     replace_existing=True,
 )
 scheduler.start()
