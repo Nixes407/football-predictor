@@ -92,14 +92,20 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Lens":                 "FRA-Ligue 1",
     "Lille":                "FRA-Ligue 1",
     "LOSC Lille":           "FRA-Ligue 1",
+    "Monaco":               "FRA-Ligue 1",
+    "AS Monaco":            "FRA-Ligue 1",
     # Portugal
     "FC Porto":             "POR-Primeira Liga",
     "Porto":                "POR-Primeira Liga",
     "Sporting CP":          "POR-Primeira Liga",
+    "Benfica":              "POR-Primeira Liga",
+    "SL Benfica":           "POR-Primeira Liga",
     # Netherlands
     "Feyenoord":            "NED-Eredivisie",
     "PSV Eindhoven":        "NED-Eredivisie",
     "PSV":                  "NED-Eredivisie",
+    "Ajax":                 "NED-Eredivisie",
+    "AFC Ajax":             "NED-Eredivisie",
 }
 
 # A stored prediction is refreshed at most this long after it was computed.
