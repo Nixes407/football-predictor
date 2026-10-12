@@ -64,6 +64,28 @@ DEFAULT_GCA90 = 5.5
 # Minimum games played to use a team's stats
 MIN_GAMES = 3
 
+# Season preference order — most recent first
+SEASON_ORDER = [
+    "2026-2027", "2025-2026", "2024-2025",
+    "2023-2024", "2026", "2025", "2024", "2023",
+]
+
+# Number of games after which current season
+# gets full weight (no blending)
+FULL_WEIGHT_GAMES = 20
+
+# Games assumed for the blend weight when a row does not say how many
+# games it covers (per-game aggregates). Mid-season, so an even blend.
+DEFAULT_SEASON_GAMES = 10
+
+# Stat keys copied from the current season untouched by the season blend:
+# the keeper W-D-L columns are a record (or a five-game form window) that
+# games_played() reads, so blending them would corrupt the games estimate.
+_UNBLENDED_KEYS = (
+    "form_wins", "form_draws", "form_losses",
+    "games", "team", "league", "season",
+)
+
 # Max goals to consider in Poisson sum
 MAX_GOALS = 10
 
@@ -464,7 +486,7 @@ def _dedup_team_key(name: str) -> str:
     return _TEAM_ALIASES.get(key, key)
 
 
-def _row_to_dict(row) -> dict:
+def _row_to_stats_dict(row) -> dict:
     """
     Map one TeamSeasonStats ORM row onto the flat stat dict used by every
     rating function in this module.
@@ -546,6 +568,206 @@ def _merge_stat_dicts(primary: dict, secondary: dict) -> dict:
         if merged.get(k) is None and v is not None:
             merged[k] = v
     return merged
+
+
+def _blend_stats(
+    current: dict,
+    previous: dict | None,
+    games_current: float,
+) -> dict:
+    """
+    Blend current and previous season stats
+    using a weight based on games played.
+
+    At FULL_WEIGHT_GAMES games the current
+    season gets 100% weight. Below that
+    the previous season fills the gap.
+
+    Only numeric values are blended.
+    Non-numeric values come from current.
+    None values fall back to the other season.
+    """
+    if previous is None or games_current >= FULL_WEIGHT_GAMES:
+        return current
+
+    w_cur = max(0.0, min(games_current / FULL_WEIGHT_GAMES, 1.0))
+    w_pre = 1.0 - w_cur
+
+    blended = {}
+    all_keys = set(current) | set(previous)
+
+    for key in all_keys:
+        cur_val = current.get(key)
+        pre_val = previous.get(key)
+
+        if cur_val is None and pre_val is None:
+            blended[key] = None
+            continue
+
+        if cur_val is None:
+            blended[key] = pre_val
+            continue
+
+        if pre_val is None:
+            blended[key] = cur_val
+            continue
+
+        try:
+            blended[key] = round(
+                w_cur * float(cur_val) +
+                w_pre * float(pre_val),
+                4
+            )
+        except (TypeError, ValueError):
+            blended[key] = cur_val
+
+    return blended
+
+
+def _previous_season(season: str | None) -> str | None:
+    """
+    The season before ``season`` in SEASON_ORDER, or None.
+
+    SEASON_ORDER mixes two labelling schemes (European "2023-2024" and
+    MLS calendar "2026"). The list is not a timeline across that boundary,
+    so "2023-2024" must not be blended with "2026". Only a neighbour with
+    the same label style counts as the previous season.
+    """
+    if not season or season not in SEASON_ORDER:
+        return None
+    idx = SEASON_ORDER.index(season)
+    if idx + 1 >= len(SEASON_ORDER):
+        return None
+    previous = SEASON_ORDER[idx + 1]
+    if ("-" in season) != ("-" in previous):
+        return None
+    return previous
+
+
+def _per_game_values(stats: dict, games: float | None) -> dict:
+    """
+    Copy of ``stats`` with every season total divided by ``games``.
+
+    A row whose games are unknown (None) already holds per-game values, so
+    it is returned as a copy unchanged. Blending has to happen on per-game
+    values: a 6-game season total and a 38-game season total cannot be
+    averaged directly.
+    """
+    per_game = dict(stats)
+    if games and games > 0:
+        for key in PER_GAME_KEYS:
+            value = per_game.get(key)
+            if value is not None:
+                per_game[key] = _safe(value) / games
+    return per_game
+
+
+def _load_season_stats(
+    db,
+    team: str,
+    league: str,
+    season: str,
+) -> dict | None:
+    """
+    Stat dict for one team in one season, merged across provider-variant
+    team names the same way load_team_stats does for the current season.
+    Returns None when the team has no row in that season.
+    """
+    exact = (
+        db.query(TeamSeasonStats)
+        .filter(and_(
+            TeamSeasonStats.team   == team,
+            TeamSeasonStats.league == league,
+            TeamSeasonStats.season == season,
+        )).first()
+    )
+
+    target_key = _dedup_team_key(team)
+    variants = [
+        r for r in db.query(TeamSeasonStats).filter(and_(
+            TeamSeasonStats.league == league,
+            TeamSeasonStats.season == season,
+        )).all()
+        if _dedup_team_key(r.team) == target_key
+    ]
+
+    rows = ([exact] if exact is not None else []) + [
+        r for r in variants if exact is None or r.id != exact.id
+    ]
+    if not rows:
+        return None
+
+    stats = _row_to_stats_dict(rows[0])
+    for extra in rows[1:]:
+        stats = _merge_stat_dicts(stats, _row_to_stats_dict(extra))
+    return stats
+
+
+def _blend_with_previous_season(
+    db,
+    team: str,
+    league: str,
+    stats: dict,
+) -> dict:
+    """
+    Blend the current season's stats with the previous season's, weighted
+    by games played so far (see _blend_stats).
+
+    ``stats`` must already carry ``games`` (set by load_team_stats). The
+    result stays in the same format as the input: season totals stay totals
+    and per-game rows stay per-game, so to_per_game() downstream works
+    unchanged. The result also records ``blend_weight_current`` (the share
+    of the current season, 0-1) and ``blend_previous_season``.
+    """
+    stats["blend_weight_current"] = 1.0
+    stats["blend_previous_season"] = None
+
+    games_cur = games_played(stats)
+    # Per-game rows (StatsBomb) do not say how many games they cover.
+    weight_games = (
+        games_cur if games_cur is not None and games_cur >= 1
+        else float(DEFAULT_SEASON_GAMES)
+    )
+    if weight_games >= FULL_WEIGHT_GAMES:
+        return stats
+
+    prev_season = _previous_season(stats.get("season"))
+    if prev_season is None:
+        return stats
+
+    previous = _load_season_stats(db, team, league, prev_season)
+    if previous is None:
+        return stats
+
+    games_prev = games_played(previous)
+    blended = _blend_stats(
+        _per_game_values(stats, games_cur),
+        _per_game_values(previous, games_prev),
+        weight_games,
+    )
+
+    # Back to season totals on the current row's games, so the downstream
+    # to_per_game() divides them by the same count and gets the blend.
+    if games_cur:
+        for key in PER_GAME_KEYS:
+            if blended.get(key) is not None:
+                blended[key] = round(_safe(blended[key]) * games_cur, 4)
+
+    for key in _UNBLENDED_KEYS:
+        blended[key] = stats.get(key)
+
+    w_cur = max(0.0, min(weight_games / FULL_WEIGHT_GAMES, 1.0))
+    blended["blend_weight_current"] = round(w_cur, 4)
+    blended["blend_previous_season"] = prev_season
+
+    games_label = (
+        f"{weight_games:.0f} games" if games_cur is not None
+        else f"games unknown (assuming {weight_games:.0f})"
+    )
+    print(f"[formula] Blending {team} {games_label}: "
+          f"{w_cur:.0%} current + "
+          f"{1.0 - w_cur:.0%} previous")
+    return blended
 
 
 def load_team_stats(
@@ -640,12 +862,15 @@ def load_team_stats(
         if row is None and not matching_rows:
             return None
 
-        stats = _row_to_dict(row if row is not None else matching_rows[0])
+        stats = _row_to_stats_dict(row if row is not None else matching_rows[0])
         for extra in matching_rows:
             if row is not None and extra.id == row.id:
                 continue
-            stats = _merge_stat_dicts(stats, _row_to_dict(extra))
+            stats = _merge_stat_dicts(stats, _row_to_stats_dict(extra))
         stats["games"] = games_played(stats)
+        # Early in the season, lean on last season so one thin row does not
+        # carry the whole prediction (see _blend_with_previous_season).
+        stats = _blend_with_previous_season(db, team, league, stats)
         return stats
 
     except Exception as exc:
@@ -749,7 +974,7 @@ def load_league_averages(
         if not rows:
             return dict(DEFAULT_LEAGUE_AVERAGES, teams=0, season=season)
 
-        per_game = [to_per_game(_row_to_dict(row)) for row in rows]
+        per_game = [to_per_game(_row_to_stats_dict(row)) for row in rows]
 
         xg_vals    = [p["xg"]    for p in per_game if _safe(p.get("xg"))    > 0]
         xga_vals   = [p["ga"]    for p in per_game if _safe(p.get("ga"))    > 0]
@@ -1439,7 +1664,7 @@ def compute_league_baselines(
 
         # Snapshot to plain dicts inside the session: the ORM instances
         # would be detached once it closes.
-        team_rows = [(_row_to_dict(row), row.team) for row in rows]
+        team_rows = [(_row_to_stats_dict(row), row.team) for row in rows]
     except Exception as exc:
         print(f"[formula] ERROR loading league baselines: {exc}")
         return fallback
@@ -2439,6 +2664,13 @@ def _predict_match(
             # Games behind each row
             "home_games":            _num(home_games or 0, 1),
             "away_games":            _num(away_games or 0, 1),
+            # Season blend: how much of each row is the current season
+            "home_season_games":     _num(home_games or 0, 1),
+            "home_blend_weight":     _num(
+                home_stats.get("blend_weight_current", 1.0)),
+            "away_season_games":     _num(away_games or 0, 1),
+            "away_blend_weight":     _num(
+                away_stats.get("blend_weight_current", 1.0)),
             # Raw ratings
             "home_attack_rating":    _num(home_attack),
             "home_defence_rating":   _num(home_defence),
