@@ -555,8 +555,10 @@ def load_team_stats(
 ) -> dict | None:
     """
     Load team stats from team_season_stats.
-    If season is None, uses most recent season.
-    Returns dict of stats or None if not found.
+    If season is None, walks PREFERRED_SEASONS (newest first, European
+    labels then MLS calendar years) and uses the first that has a row,
+    falling back to the newest season present. Returns dict of stats or
+    None if not found.
     """
     db = _new_session()
     if db is None:
@@ -575,13 +577,40 @@ def load_team_stats(
             query = query.order_by(
                 TeamSeasonStats.season.desc())
 
-        row = query.first()
+        # Prefer most recent season with data
+        PREFERRED_SEASONS = [
+            "2026-2027", "2025-2026", "2024-2025",
+            "2026", "2025", "2024",
+        ]
+        row = None
+        if season:
+            row = query.filter(
+                TeamSeasonStats.season == season
+            ).first()
+        if row is None:
+            for preferred in PREFERRED_SEASONS:
+                row = (
+                    db.query(TeamSeasonStats)
+                    .filter(and_(
+                        TeamSeasonStats.team   == team,
+                        TeamSeasonStats.league == league,
+                        TeamSeasonStats.season == preferred,
+                    )).first()
+                )
+                if row is not None:
+                    break
+        if row is None:
+            row = query.first()
 
         # Also check for a duplicate row under a provider-variant name
         # (e.g. Understat "Wolverhampton Wanderers" vs API-Football "Wolves")
         # so neither xG nor standings columns are missed.
         target_key = _dedup_team_key(team)
-        season_filter = season or (row.season if row is not None else None)
+        # Variant-name rows are scoped to the season that was just
+        # resolved (or to the requested season when nothing was found).
+        season_filter = (
+            row.season if row is not None else season
+        )
         league_query = db.query(TeamSeasonStats).filter(
             TeamSeasonStats.league == league
         )
@@ -597,6 +626,16 @@ def load_team_stats(
             r for r in league_query.all()
             if _dedup_team_key(r.team) == target_key
         ]
+
+        # No exact-name row and no season to pin the variant rows to:
+        # keep only the newest season the variant name appears in, so
+        # stats from two different seasons are never merged into one
+        # (per-game) stat line.
+        if row is None and season_filter is None and matching_rows:
+            newest = max(r.season for r in matching_rows if r.season)
+            matching_rows = [
+                r for r in matching_rows if r.season == newest
+            ]
 
         if row is None and not matching_rows:
             return None
