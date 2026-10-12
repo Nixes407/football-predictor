@@ -68,6 +68,8 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "RB Leipzig":           "GER-Bundesliga",
     "VfB Stuttgart":        "GER-Bundesliga",
     "Stuttgart":            "GER-Bundesliga",       # football-data.org normaliser
+    "Leverkusen":           "GER-Bundesliga",
+    "Bayer Leverkusen":     "GER-Bundesliga",
     # Italy
     "Internazionale":       "ITA-Serie A",
     "Inter":                "ITA-Serie A",
@@ -76,6 +78,12 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "AS Roma":              "ITA-Serie A",
     "Roma":                 "ITA-Serie A",
     "Como":                 "ITA-Serie A",
+    "Juventus":             "ITA-Serie A",
+    "Milan":                "ITA-Serie A",
+    "AC Milan":             "ITA-Serie A",
+    "Atalanta":             "ITA-Serie A",
+    "Bologna":              "ITA-Serie A",
+    "Lazio":                "ITA-Serie A",
     # France
     "Paris Saint-Germain":  "FRA-Ligue 1",
     "Paris Saint Germain":  "FRA-Ligue 1",
