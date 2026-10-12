@@ -432,6 +432,7 @@ def _get_team_features(
     team: str,
     role: str,
     df: pd.DataFrame,
+    feature_cols: list[str] | None = None,
 ) -> dict[str, float]:
     """
     Extract the most recent feature row for a team.
@@ -440,6 +441,11 @@ def _get_team_features(
                      return all home_* and h2h_* columns
     role = "away" -> use rows where away_team == team,
                      return all away_* columns
+
+    ``feature_cols`` defaults to the hardcoded FEATURE_COLS. Callers that
+    know the model's own feature list (``_get_runtime_feature_cols``) pass it
+    through, so a model trained on extra columns reads those columns from the
+    features CSV instead of scoring them as 0.
 
     Returns a dict of feature_name -> value.
     Falls back to zeros with a warning if no history.
@@ -476,7 +482,7 @@ def _get_team_features(
         )
 
     result = {}
-    for col in FEATURE_COLS:
+    for col in (feature_cols if feature_cols is not None else FEATURE_COLS):
         if any(col.startswith(p) for p in prefixes):
             result[col] = float(latest.get(col, 0.0) or 0.0)
 
@@ -499,8 +505,8 @@ def _build_feature_vector(
     features CSV. Elo and H2H come from the home row
     (they are always computed from home perspective).
     """
-    home_feats = _get_team_features(home_team, "home", df)
-    away_feats = _get_team_features(away_team, "away", df)
+    home_feats = _get_team_features(home_team, "home", df, feature_cols)
+    away_feats = _get_team_features(away_team, "away", df, feature_cols)
 
     cols_to_use = feature_cols if feature_cols is not None else FEATURE_COLS
     vector: dict[str, float] = {}
