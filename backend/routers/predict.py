@@ -1167,3 +1167,52 @@ def new_tables_check() -> dict:
 
     except Exception as exc:
         return {"error": str(exc)}
+
+
+@router.delete("/admin/clear-fixtures-cache")
+def clear_fixtures_cache(
+    secret: str = "",
+    date: str = "",
+) -> dict:
+    """
+    Delete cached fixtures for a specific date
+    so they get refetched on the next call.
+    Requires the PIPELINE_SECRET.
+    """
+    import os
+    expected = os.getenv("PIPELINE_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or missing secret."
+        )
+
+    from database import SessionLocal
+    from sqlalchemy import text as sql_text
+    from datetime import date as date_cls
+
+    target = date or date_cls.today().isoformat()
+
+    db = SessionLocal()
+    try:
+        result = db.execute(
+            sql_text(
+                "DELETE FROM daily_matches "
+                "WHERE match_date = :d"
+            ),
+            {"d": target},
+        )
+        db.commit()
+        deleted = result.rowcount
+        return {
+            "deleted": deleted,
+            "date": target,
+            "message": f"Cleared {deleted} fixtures "
+                       f"for {target}. Next call to "
+                       f"/fixtures/today will refetch."
+        }
+    except Exception as exc:
+        db.rollback()
+        return {"error": str(exc)}
+    finally:
+        db.close()
