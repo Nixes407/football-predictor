@@ -58,7 +58,10 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Atlético de Madrid":   "ESP-La Liga",
     "Real Betis":           "ESP-La Liga",
     "Betis":                "ESP-La Liga",          # football-data.org normaliser
+    "Real Betis Balompié":  "ESP-La Liga",
     "Villarreal":           "ESP-La Liga",
+    "Villarreal CF":        "ESP-La Liga",
+    "Club Atletico de Madrid":  "ESP-La Liga",
     # Germany
     "Bayern Munchen":       "GER-Bundesliga",
     "Bayern München":       "GER-Bundesliga",
@@ -70,6 +73,9 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Stuttgart":            "GER-Bundesliga",       # football-data.org normaliser
     "Leverkusen":           "GER-Bundesliga",
     "Bayer Leverkusen":     "GER-Bundesliga",
+    "Bayer 04 Leverkusen":  "GER-Bundesliga",
+    "FC Bayern München":    "GER-Bundesliga",
+    "Borussia Mönchengladbach": "GER-Bundesliga",
     # Italy
     "Internazionale":       "ITA-Serie A",
     "Inter":                "ITA-Serie A",
@@ -84,6 +90,11 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Atalanta":             "ITA-Serie A",
     "Bologna":              "ITA-Serie A",
     "Lazio":                "ITA-Serie A",
+    "SS Lazio":             "ITA-Serie A",
+    "SSC Napoli":           "ITA-Serie A",
+    "Juventus FC":          "ITA-Serie A",
+    "Atalanta BC":          "ITA-Serie A",
+    "Bologna FC 1909":      "ITA-Serie A",
     # France
     "Paris Saint-Germain":  "FRA-Ligue 1",
     "Paris Saint Germain":  "FRA-Ligue 1",
@@ -94,12 +105,16 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "LOSC Lille":           "FRA-Ligue 1",
     "Monaco":               "FRA-Ligue 1",
     "AS Monaco":            "FRA-Ligue 1",
+    "Racing Club de Lens":  "FRA-Ligue 1",
+    "RC Strasbourg":        "FRA-Ligue 1",
+    "Stade Brestois 29":    "FRA-Ligue 1",
     # Portugal
     "FC Porto":             "POR-Primeira Liga",
     "Porto":                "POR-Primeira Liga",
     "Sporting CP":          "POR-Primeira Liga",
     "Benfica":              "POR-Primeira Liga",
     "SL Benfica":           "POR-Primeira Liga",
+    "Sporting Clube de Portugal": "POR-Primeira Liga",
     # Netherlands
     "Feyenoord":            "NED-Eredivisie",
     "PSV Eindhoven":        "NED-Eredivisie",
