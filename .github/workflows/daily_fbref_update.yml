@@ -35,12 +35,6 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright Chromium
-        working-directory: backend
-        run: |
-          python -m patchright install chromium
-          python -m patchright install-deps chromium
-
       - name: Run StatsBomb collector
         working-directory: backend
         run: |
@@ -54,30 +48,30 @@ jobs:
           fi
           echo "==> StatsBomb collection complete"
 
-      - name: Run Sofascore collector (primary)
-        id: sofascore
+      - name: Run FotMob collector (primary)
+        id: fotmob
         working-directory: backend
         run: |
           set +e
-          echo "==> [2/4] Collecting Sofascore stats (primary)..."
-          python data/sofascore_collector.py
+          echo "==> [2/4] Collecting FotMob stats (primary)..."
+          python data/fotmob_collector.py
           if [ $? -ne 0 ]; then
-            echo "WARNING: Sofascore collector failed."
-            echo "sofascore_failed=true" >> $GITHUB_OUTPUT
+            echo "WARNING: FotMob collector failed."
+            echo "fotmob_failed=true" >> $GITHUB_OUTPUT
           else
-            echo "==> Sofascore collection complete"
-            echo "sofascore_failed=false" >> $GITHUB_OUTPUT
+            echo "==> FotMob collection complete"
+            echo "fotmob_failed=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Run Understat collector (backup)
         working-directory: backend
-        if: steps.sofascore.outputs.sofascore_failed == 'true'
+        if: steps.fotmob.outputs.fotmob_failed == 'true'
         run: |
           set +e
-          echo "==> Sofascore failed — running Understat backup..."
+          echo "==> FotMob failed — running Understat backup..."
           python data/understat_collector.py
           if [ $? -ne 0 ]; then
-            echo "FATAL: Both Sofascore and Understat failed."
+            echo "FATAL: Both FotMob and Understat failed."
             echo "Pipeline will NOT be triggered."
             exit 1
           fi
@@ -98,7 +92,7 @@ jobs:
 
       - name: All collectors succeeded — trigger pipeline
         run: |
-          echo "==> [4/4] All 4 collectors completed successfully."
+          echo "==> [4/4] All 4 collectors completed"
           echo "==> Triggering Render fast pipeline..."
           HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
             -X POST \
