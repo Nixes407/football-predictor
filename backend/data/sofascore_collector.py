@@ -1,10 +1,9 @@
 """
 Sofascore direct API collector.
 
-Uses curl_cffi to impersonate Chrome TLS
-fingerprint when calling api.sofascore.com.
-Bypasses bot detection on cloud servers
-including GitHub Actions.
+Uses patchright to fetch api.sofascore.com through a stealth browser.
+Falls back to curl_cffi TLS impersonation, then plain requests,
+when the preferred client is not installed.
 
 Primary data source for all advanced stats.
 Run from backend/ directory:
@@ -17,6 +16,7 @@ import math
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
@@ -68,9 +68,18 @@ REQUEST_DELAY      = 2.0
 
 def _get_client():
     """
-    Create curl_cffi session impersonating Chrome.
-    Falls back to plain requests if not installed.
+    Returns a client with get(url, params)
+    that uses patchright stealth browser.
+    Falls back to curl_cffi then requests.
     """
+    try:
+        from patchright.sync_api import sync_playwright
+        print("[sofascore] Using patchright "
+              "(stealth Chrome browser)")
+        return _PatchrightClient(), "patchright"
+    except ImportError:
+        pass
+
     try:
         from curl_cffi import requests as cffi_req
         session = cffi_req.Session(
@@ -78,14 +87,111 @@ def _get_client():
         session.headers.update(HEADERS)
         print("[sofascore] Using curl_cffi "
               "(Chrome TLS impersonation)")
-        return session, True
+        return session, "curl_cffi"
     except ImportError:
-        import requests
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        print("[sofascore] WARNING: curl_cffi "
-              "not found — using plain requests")
-        return session, False
+        pass
+
+    import requests
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    print("[sofascore] WARNING: using plain "
+          "requests — likely to be blocked")
+    return session, "requests"
+
+
+class _PatchrightClient:
+    """
+    Stealth browser client using patchright.
+    Opens one browser instance reused for
+    all requests to avoid overhead.
+    """
+
+    def __init__(self):
+        from patchright.sync_api import sync_playwright
+        self._pw = sync_playwright().start()
+        try:
+            self._browser = self._pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features="
+                    "AutomationControlled",
+                ],
+            )
+            self._context = self._browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                extra_http_headers={
+                    "Referer": HEADERS["Referer"],
+                    "Accept-Language": HEADERS["Accept-Language"],
+                },
+            )
+            self._page = self._context.new_page()
+        except Exception:
+            self.close()
+            raise
+
+        # Visit homepage first to get cookies
+        try:
+            self._page.goto(
+                "https://www.sofascore.com",
+                timeout=30000,
+                wait_until="domcontentloaded",
+            )
+            time.sleep(3)
+            print("[sofascore] Browser "
+                  "initialised with cookies")
+        except Exception as exc:
+            print(f"[sofascore] WARNING: "
+                  f"homepage visit failed: {exc}")
+
+    def get(self, url: str,
+            params: dict = None,
+            timeout: int = 30,
+            **kwargs) -> "_FakeResponse":
+        """Fetch URL via stealth browser."""
+        if params:
+            qs = urlencode(params, doseq=True)
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}{qs}"
+        try:
+            resp = self._page.goto(
+                url,
+                timeout=timeout * 1000,
+                wait_until="networkidle",
+            )
+            body = self._page.inner_text("body")
+            status = resp.status if resp else 0
+            return _FakeResponse(status, body)
+        except Exception as exc:
+            print(f"[sofascore] Browser ERROR: "
+                  f"{exc}")
+            return _FakeResponse(0, "")
+
+    def close(self):
+        try:
+            if hasattr(self, "_browser"):
+                self._browser.close()
+        except Exception:
+            pass
+        finally:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+
+
+class _FakeResponse:
+    """Mimics requests.Response interface."""
+
+    def __init__(self, status_code: int,
+                 text: str):
+        self.status_code = status_code
+        self._text = text
+
+    def json(self):
+        import json
+        return json.loads(self._text)
 
 
 def _get(
@@ -104,12 +210,22 @@ def _get(
             return resp.json()
         elif resp.status_code == 429:
             print("[sofascore] Rate limited — "
-                  "waiting 30s...")
-            time.sleep(30)
+                  "waiting 60s...")
+            time.sleep(60)
+            # Retry once
+            resp = session.get(
+                url,
+                params=params or {},
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.json()
             return None
         elif resp.status_code == 403:
             print(f"[sofascore] 403 Forbidden: "
                   f"{url}")
+            print("[sofascore] Sofascore is "
+                  "blocking this request.")
             return None
         else:
             print(f"[sofascore] HTTP "
@@ -578,84 +694,96 @@ def collect_sofascore() -> dict:
     print("SOFASCORE — PRIMARY STATS COLLECTION")
     print("=" * 60)
 
-    session, using_cffi = _get_client()
-    if not using_cffi:
+    session, client_type = _get_client()
+    if client_type != "patchright":
         print("[sofascore] WARNING: install "
-              "curl_cffi for better results: "
-              "pip install curl_cffi")
+              "patchright and Chromium for better results: "
+              "pip install patchright && "
+              "python -m patchright install chromium")
 
-    team_total   = 0
-    player_total = 0
-    failed       = []
+    try:
+        team_total   = 0
+        player_total = 0
+        failed       = []
 
-    for league, config in LEAGUE_CONFIG.items():
-        tid         = config["tid"]
-        is_mls      = league == "USA-MLS"
-        target_yrs  = (MLS_TARGET_SEASONS
-                       if is_mls else TARGET_SEASONS)
+        for league, config in LEAGUE_CONFIG.items():
+            tid         = config["tid"]
+            is_mls      = league == "USA-MLS"
+            target_yrs  = (MLS_TARGET_SEASONS
+                           if is_mls else TARGET_SEASONS)
 
-        print(f"\n[sofascore] === {league} ===")
+            print(f"\n[sofascore] === {league} ===")
 
-        seasons = get_seasons(
-            session, tid, target_yrs)
-        if not seasons:
-            print(f"[sofascore] WARNING: no "
-                  f"seasons for {league}")
-            failed.append(league)
-            continue
+            seasons = get_seasons(
+                session, tid, target_yrs)
+            if not seasons:
+                print(f"[sofascore] WARNING: no "
+                      f"seasons for {league}")
+                failed.append(league)
+                continue
 
-        for si in seasons:
-            sid   = si["sid"]
-            year  = si["year"]
-            label = _season_label(
-                league, year, si["name"])
+            for si in seasons:
+                sid   = si["sid"]
+                year  = si["year"]
+                label = _season_label(
+                    league, year, si["name"])
 
-            print(f"[sofascore] {league} "
-                  f"{label} (sid={sid})...")
+                print(f"[sofascore] {league} "
+                      f"{label} (sid={sid})...")
 
-            try:
-                n = collect_team_stats(
-                    session, league,
-                    tid, sid, label)
-                team_total += n
-            except Exception as exc:
-                print(f"[sofascore] team error "
-                      f"{league} {label}: {exc}")
-                failed.append(
-                    f"{league}/{label}/team")
-
-            if year == max(target_yrs):
                 try:
-                    n = collect_player_stats(
+                    n = collect_team_stats(
                         session, league,
                         tid, sid, label)
-                    player_total += n
+                    team_total += n
                 except Exception as exc:
-                    print(
-                        f"[sofascore] player "
-                        f"error {league} "
-                        f"{label}: {exc}")
+                    print(f"[sofascore] team error "
+                          f"{league} {label}: {exc}")
                     failed.append(
-                        f"{league}/{label}/players")
+                        f"{league}/{label}/team")
 
-    print("\n" + "=" * 60)
-    print("SOFASCORE COLLECTION COMPLETE")
-    print("=" * 60)
-    print(f"Team rows   : {team_total}")
-    print(f"Player rows : {player_total}")
-    if failed:
-        print(f"Failed      : {failed}")
+                if year == max(target_yrs):
+                    try:
+                        n = collect_player_stats(
+                            session, league,
+                            tid, sid, label)
+                        player_total += n
+                    except Exception as exc:
+                        print(
+                            f"[sofascore] player "
+                            f"error {league} "
+                            f"{label}: {exc}")
+                        failed.append(
+                            f"{league}/{label}/players")
 
-    if team_total == 0 and player_total == 0:
-        print("\nERROR: Zero rows collected.")
-        print("Sofascore is blocking requests.")
-        sys.exit(1)
+        print("\n" + "=" * 60)
+        print("SOFASCORE COLLECTION COMPLETE")
+        print("=" * 60)
+        print(f"Team rows   : {team_total}")
+        print(f"Player rows : {player_total}")
+        if failed:
+            print(f"Failed      : {failed}")
 
-    return {
-        "team_total":   team_total,
-        "player_total": player_total,
-        "failed":       failed,
-    }
+        if team_total == 0 and player_total == 0:
+            print("\nERROR: Zero rows collected.")
+            print("Sofascore is blocking requests.")
+            sys.exit(1)
+
+        return {
+            "team_total":   team_total,
+            "player_total": player_total,
+            "failed":       failed,
+        }
+    finally:
+        # Close browser if patchright was used (also close fallback sessions).
+        if hasattr(session, "close"):
+            try:
+                session.close()
+                print("[sofascore] Browser closed" if client_type == "patchright"
+                      else "[sofascore] Session closed")
+            except Exception:
+                pass
+
 
 
 if __name__ == "__main__":

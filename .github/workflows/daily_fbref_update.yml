@@ -35,6 +35,12 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install Playwright Chromium
+        working-directory: backend
+        run: |
+          python -m patchright install chromium
+          python -m patchright install-deps chromium
+
       - name: Run StatsBomb collector
         working-directory: backend
         run: |
