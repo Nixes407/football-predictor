@@ -1,7 +1,11 @@
 """Endpoints for daily football fixtures and their stored predictions."""
 
+import json
+import time
 import traceback
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
 
 import pandas as pd
 import routers.predict as predict_module
@@ -10,7 +14,7 @@ from sqlalchemy import Column, Float, inspect, text
 from sqlalchemy.orm import Session
 
 from data.fixtures import fetch_fixtures
-from database import DailyMatch, SessionLocal
+from database import DailyMatch, SessionLocal, TeamSeasonStats
 from routers.predict import (
     _away_corners,
     _away_goals,
@@ -36,6 +40,10 @@ except ImportError:  # pragma: no cover - SQLAlchemy 1.4 fallback
 
 
 router = APIRouter()
+
+_FOTMOB_NAMES_FILE = (
+    Path(__file__).resolve().parent.parent / "data" / "fotmob_team_names.json"
+)
 
 # Season used when a stored fixture carries none (matches the default of
 # predict.MatchRequest). The formula engine resolves it to the newest season
@@ -422,6 +430,112 @@ def _parse_utc(value) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+@lru_cache(maxsize=2)
+def _fotmob_names_from_db(_time_bucket: int) -> dict[str, list[str]]:
+    """Use committed stats when the collector's JSON is on another host."""
+    db = SessionLocal()
+    try:
+        rows = db.query(
+            TeamSeasonStats.team, TeamSeasonStats.league,
+        ).distinct().all()
+        names: dict[str, list[str]] = {}
+        for team, league in rows:
+            if team and league:
+                league_names = names.setdefault(league, [])
+                if team not in league_names:
+                    league_names.append(team)
+        return names
+    finally:
+        db.close()
+
+
+def _load_fotmob_names() -> dict[str, list[str]]:
+    """Load FotMob names from JSON, or the DB if the JSON is not deployed."""
+    try:
+        if _FOTMOB_NAMES_FILE.exists():
+            names = json.loads(_FOTMOB_NAMES_FILE.read_text())
+            if isinstance(names, dict) and names:
+                return names
+    except (OSError, ValueError):
+        pass
+    try:
+        # The collector runs in CI; its local JSON may not reach the API host.
+        return _fotmob_names_from_db(int(time.monotonic() // 300))
+    except Exception as exc:
+        print(f"[fixtures] WARNING: could not load FotMob names: {exc}")
+        return {}
+
+
+def _find_fotmob_name(
+    name: str,
+    league: str,
+    fotmob_names: dict,
+) -> str:
+    """Resolve a fixture spelling to an unambiguous FotMob name in its league.
+
+    Try exact, case-insensitive, suffix-stripped, partial and token matches,
+    in that order. Leave unknown or ambiguous names unchanged.
+    """
+    candidates = fotmob_names.get(league, [])
+    if not isinstance(candidates, list):
+        return name
+    candidates = [c for c in candidates if isinstance(c, str) and c.strip()]
+    if name in candidates:
+        return name
+
+    name_lower = name.casefold()
+    for candidate in candidates:
+        if candidate.casefold() == name_lower:
+            return candidate
+
+    def clean(value: str) -> str:
+        value = " ".join(value.casefold().split())
+        suffixes = (
+            " fc", " afc", " cf", " sc", " city", " united", " town",
+            " rovers", " wanderers", " athletic", " albion", " hotspur",
+            " county",
+        )
+        # Only remove trailing club suffixes, not those inside a team name.
+        while any(value.endswith(suffix) for suffix in suffixes):
+            value = next(
+                value.removesuffix(suffix).strip()
+                for suffix in suffixes if value.endswith(suffix)
+            )
+        return value
+
+    name_clean = clean(name)
+    if not name_clean:
+        return name
+
+    def unique(matches: list[str]) -> str | None:
+        return matches[0] if len(matches) == 1 else None
+
+    clean_matches = [c for c in candidates if clean(c) == name_clean]
+    if clean_matches:
+        return unique(clean_matches) or name
+
+    partial_matches = [
+        c for c in candidates
+        if clean(c) and (clean(c) in name_clean or name_clean in clean(c))
+    ]
+    if partial_matches:
+        return unique(partial_matches) or name
+
+    name_tokens = set(name_clean.replace("-", " ").split())
+    if len(name_tokens) >= 2:
+        token_matches = []
+        for candidate in candidates:
+            tokens = set(clean(candidate).replace("-", " ").split())
+            overlap = name_tokens & tokens
+            if len(overlap) >= 2 and len(overlap) == min(
+                len(name_tokens), len(tokens)
+            ):
+                token_matches.append(candidate)
+        return unique(token_matches) or name
+
+    return name
+
+
 def _predict_fixture_values(
     home_team: str,
     away_team: str,
@@ -431,81 +545,61 @@ def _predict_fixture_values(
     """
     Best available prediction for one fixture.
 
-    The formula engine is asked first — the same order ``/predict/match``
-    uses — and the stored ML models are the fallback for fixtures the engine
-    cannot rate (no team stats yet, database unavailable). Fields the engine
-    did not fill are completed from the ML prediction, then any remaining
-    derived market is computed from the expected goals and corners. Every
-    field is None when neither engine can predict the fixture.
+    Resolve team names to FotMob spellings before asking the formula engine.
+    ML is only a fallback when both teams occur in the training history;
+    otherwise return no prediction rather than a default-valued forecast.
     """
+    # Dynamically resolve team names to FotMob spelling. For UCL matches,
+    # find each side's domestic league before resolving its name.
+    fotmob_names = _load_fotmob_names()
     if league == UCL_LEAGUE:
         home_dom = _get_ucl_domestic_league(home_team)
         away_dom = _get_ucl_domestic_league(away_team)
-        print(f"[fixtures] UCL lookup: "
-              f"{home_team!r} -> {home_dom!r} | "
-              f"{away_team!r} -> {away_dom!r}")
         if not home_dom or not away_dom:
-            print(f"[fixtures] UCL: skipping "
-                  f"{home_team} vs {away_team} "
-                  f"— domestic league not found")
+            print(f"[fixtures] UCL: skipping {home_team} vs {away_team} "
+                  "— domestic league not found")
             return {}
-
-        print(f"[fixtures] UCL: predicting "
-              f"{home_team} ({home_dom}) vs "
-              f"{away_team} ({away_dom})")
-
-        if home_dom != away_dom:
-            # A UCL tie is normally between two domestic leagues, and the
-            # formula engine rates both teams inside a single league: the
-            # away side has no rows under the home league, so the engine
-            # cannot rate this fixture. It is still asked — its answer is
-            # logged below — and the league-agnostic ML models are the
-            # fallback, so the tie keeps a prediction instead of none.
-            print(f"[fixtures] UCL: {home_team} ({home_dom}) and "
-                  f"{away_team} ({away_dom}) come from different "
-                  f"domestic leagues — expecting no formula result")
-
+        home_team = _find_fotmob_name(home_team, home_dom, fotmob_names)
+        away_team = _find_fotmob_name(away_team, away_dom, fotmob_names)
         league = home_dom
+    else:
+        home_team = _find_fotmob_name(home_team, league, fotmob_names)
+        away_team = _find_fotmob_name(away_team, league, fotmob_names)
 
-    values = _empty_prediction_values()
+    formula_result = _predict_with_formula(
+        home_team, away_team, league, season
+    )
+    if formula_result:
+        return formula_result
 
-    print(f"[fixtures] Calling formula for "
-          f"{home_team} vs {away_team} "
-          f"league={league}")
-    from_formula = _predict_with_formula(home_team, away_team, league, season)
-    print(f"[fixtures] Formula result: "
-          f"{bool(from_formula)}")
-    if from_formula:
-        values.update(from_formula)
+    # Use current predictor state: model artifacts may load after this module.
+    features_df = _current_predictor_value("_features_df", _features_df)
+    if (
+        _ml_models_available()
+        and features_df is not None
+        and {"home_team", "away_team"}.issubset(features_df.columns)
+    ):
+        home_known = bool((
+            (features_df["home_team"] == home_team)
+            | (features_df["away_team"] == home_team)
+        ).any())
+        away_known = bool((
+            (features_df["home_team"] == away_team)
+            | (features_df["away_team"] == away_team)
+        ).any())
+        if home_known and away_known:
+            print(f"[fixtures] ML fallback: {home_team} vs {away_team}")
+            try:
+                return _compute_prediction_values(
+                    home_team, away_team, league, season or DEFAULT_SEASON
+                )
+            except Exception as exc:
+                print(f"[fixtures] WARNING: prediction failed for "
+                      f"{home_team} vs {away_team}: {exc}")
+                traceback.print_exc()
 
-    if not _has_result_prediction(values) and _ml_models_available():
-        print(f"[fixtures] Falling back to the ML models for "
-              f"{home_team} vs {away_team} (league={league})")
-        try:
-            from_models = _compute_prediction_values(
-                home_team=home_team,
-                away_team=away_team,
-                league=league,
-                season=season or DEFAULT_SEASON,
-            )
-        except Exception as exc:
-            print(f"[fixtures] WARNING: prediction failed for "
-                  f"{home_team} vs {away_team}: {exc}")
-            traceback.print_exc()
-            from_models = None
-
-        print(f"[fixtures] ML result: {bool(from_models)}")
-
-        for name, value in (from_models or {}).items():
-            if values.get(name) is None:
-                values[name] = value
-
-    values = _with_derived_markets(values)
-    if not _has_result_prediction(values):
-        print(f"[fixtures] No prediction could be produced for "
-              f"{home_team} vs {away_team} (league={league}) — "
-              f"ML models available: {_ml_models_available()}")
-    return values
+    print(f"[fixtures] No data: {home_team} vs {away_team}")
+    return {}
 
 
 def _register_derived_columns() -> None:

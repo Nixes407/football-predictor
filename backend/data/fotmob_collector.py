@@ -68,6 +68,9 @@ from database import SessionLocal, TeamSeasonStats
 from sqlalchemy import and_
 
 
+FOTMOB_NAMES_FILE = _BACKEND / "data" / "fotmob_team_names.json"
+
+
 # FotMob tournament ids, country codes (ccode3) and season labels. Season
 # labels use FotMob's readable "YYYY/YYYY" (European) or "YYYY" (MLS) form;
 # they are converted to the database's dash format on upsert.
@@ -562,6 +565,15 @@ class _FotMobClient:
         self.session.close()
 
 
+def _store_fotmob_name(db, fotmob_name: str, league: str) -> None:
+    """The upsert already stores the API spelling in TeamSeasonStats.team.
+
+    The league/name pairs are exported from committed rows at the end of
+    collection, so there is no separate table or additional write here.
+    """
+    pass
+
+
 def collect_team_stats() -> int:
     """Collect both seasons for all leagues; return successfully committed rows."""
     print("[fotmob] Collecting team stats via the FotMob JSON API...")
@@ -608,6 +620,8 @@ def collect_team_stats() -> int:
                             attrs = _team_attrs(entry, standing)
                             if attrs:
                                 _upsert_team(db, team, league, db_season, attrs)
+                                # The exact API name is now in team_season_stats.
+                                _store_fotmob_name(db, team, league)
                                 committed += 1
                         db.commit()
                         total += committed
@@ -622,6 +636,30 @@ def collect_team_stats() -> int:
                     print(f"[fotmob] ERROR {league} {api_season}: {exc}")
     finally:
         client.close()
+
+    # Export persisted team names for fixture matching. Keep previously
+    # collected leagues when a league's API request fails this time.
+    try:
+        existing = {}
+        if FOTMOB_NAMES_FILE.exists():
+            existing = json.loads(FOTMOB_NAMES_FILE.read_text())
+        db_check = SessionLocal()
+        try:
+            rows = db_check.query(
+                TeamSeasonStats.team, TeamSeasonStats.league,
+            ).distinct().all()
+            for team, league in rows:
+                if league not in existing:
+                    existing[league] = []
+                if team not in existing[league]:
+                    existing[league].append(team)
+        finally:
+            db_check.close()
+        FOTMOB_NAMES_FILE.write_text(json.dumps(existing, indent=2))
+        print(f"[fotmob] Saved team names to {FOTMOB_NAMES_FILE.name}")
+    except Exception as exc:
+        print(f"[fotmob] WARNING: could not save team names: {exc}")
+
     print(f"[fotmob] Done. Total rows: {total}")
     return total
 
