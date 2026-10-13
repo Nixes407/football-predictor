@@ -38,7 +38,7 @@ jobs:
       - name: Run StatsBomb collector
         working-directory: backend
         run: |
-          echo "==> [1/3] Downloading StatsBomb open data..."
+          echo "==> [1/4] Downloading StatsBomb open data..."
           python data/statsbomb_collector.py
           if [ $? -ne 0 ]; then
             echo "FATAL: StatsBomb collector failed."
@@ -48,23 +48,39 @@ jobs:
           fi
           echo "==> StatsBomb collection complete"
 
-      - name: Run Understat xG collector
+      - name: Run Sofascore collector (primary)
+        id: sofascore
         working-directory: backend
         run: |
-          echo "==> [2/3] Collecting Understat xG data..."
+          set +e
+          echo "==> [2/4] Collecting Sofascore stats (primary)..."
+          python data/sofascore_collector.py
+          if [ $? -ne 0 ]; then
+            echo "WARNING: Sofascore collector failed."
+            echo "sofascore_failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "==> Sofascore collection complete"
+            echo "sofascore_failed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Understat collector (backup)
+        working-directory: backend
+        if: steps.sofascore.outputs.sofascore_failed == 'true'
+        run: |
+          set +e
+          echo "==> Sofascore failed — running Understat backup..."
           python data/understat_collector.py
           if [ $? -ne 0 ]; then
-            echo "FATAL: Understat collector failed."
+            echo "FATAL: Both Sofascore and Understat failed."
             echo "Pipeline will NOT be triggered."
-            echo "No data has been updated."
             exit 1
           fi
-          echo "==> Understat collection complete"
+          echo "==> Understat backup complete"
 
       - name: Run API-Football collector
         working-directory: backend
         run: |
-          echo "==> [3/3] Collecting API-Football data..."
+          echo "==> [3/4] Collecting API-Football data..."
           python data/api_football_collector.py
           if [ $? -ne 0 ]; then
             echo "FATAL: API-Football collector failed."
@@ -76,7 +92,7 @@ jobs:
 
       - name: All collectors succeeded — trigger pipeline
         run: |
-          echo "==> All 3 collectors completed successfully."
+          echo "==> [4/4] All 4 collectors completed successfully."
           echo "==> Triggering Render fast pipeline..."
           HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
             -X POST \
