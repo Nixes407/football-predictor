@@ -1,14 +1,48 @@
 """
 FotMob advanced stats collector.
 
-Replaces Sofascore as the primary advanced team stats source.
-The published soccerdata package (1.9.1) has no FotMob scraper or
-read_team_season_stats method for FotMob. Use its JSON HTTP API directly
-instead: no Chrome or browser automation is required on GitHub Actions.
-HTTP access is still subject to FotMob availability and access restrictions.
+Replaces Sofascore as the primary advanced team stats source. Talks to
+FotMob's public JSON API directly: no Chrome or browser automation is
+required on GitHub Actions.
 
-Collects team season stats including xG, shots, possession and more
-for all 9 leagues. Missing statistics never overwrite existing values.
+Why the previous version got 404s
+---------------------------------
+FotMob moved its JSON API: the old ``https://www.fotmob.com/api/<endpoint>``
+routes now answer 404 and the current routes live under
+``https://www.fotmob.com/api/data/<endpoint>`` (confirmed by live endpoint
+probes, 2026-09-30). This collector therefore tries the ``/api/data`` hub
+first and falls back to the legacy ``/api`` hub, so it works under either
+layout.
+
+Endpoints used
+--------------
+Team season deep stats (xG etc.):
+    GET /api/data/leagueseasondeepstats
+        id={league_id} season={season} type=teams stat={stat_name}
+
+``season`` must be FotMob's internal numeric season id (e.g. 27110), not the
+readable "2026/2027" label, so labels are resolved through the season
+directory that the same endpoint exposes. The legacy parameter style
+(``teamOrPlayer=team`` with unsuffixed stat names) is also attempted, and the
+first successful raw response per endpoint is printed so the exact JSON
+structure is visible in the GitHub Actions logs.
+
+League table / standings:
+    GET /api/data/leagues
+        id={league_id} ccode3={ccode} season={season}
+
+Data flow
+---------
+For every league in FOTMOB_LEAGUES, both seasons (current + previous) are
+collected. The deep-stats endpoint supplies the advanced metrics, the league
+table supplies matches played / wins / draws / losses / goals, and the
+combined result is upserted into team_season_stats:
+
+    expectedGoals -> sh_xg      shotsOnTarget -> sh_sot
+    possession    -> pos_poss   goals          -> sh_goals
+    saves         -> gk_saves   cleanSheets    -> gk_cs
+
+Missing statistics never overwrite existing values.
 
 Run from backend/ directory:
     python data/fotmob_collector.py
@@ -16,12 +50,12 @@ Run from backend/ directory:
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import time
 from pathlib import Path
 
-import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -34,53 +68,132 @@ from database import SessionLocal, TeamSeasonStats
 from sqlalchemy import and_
 
 
-# FotMob tournament IDs, not Sofascore tournament IDs.
-LEAGUE_IDS = {
-    "ENG-Premier League": 47,
-    "ENG-Championship": 48,
-    "ESP-La Liga": 87,
-    "GER-Bundesliga": 54,
-    "ITA-Serie A": 55,
-    "FRA-Ligue 1": 53,
-    "POR-Primeira Liga": 61,
-    "NED-Eredivisie": 57,
-    "USA-MLS": 130,
+# FotMob tournament ids, country codes (ccode3) and season labels. Season
+# labels use FotMob's readable "YYYY/YYYY" (European) or "YYYY" (MLS) form;
+# they are converted to the database's dash format on upsert.
+FOTMOB_LEAGUES = {
+    "ENG-Premier League": {
+        "id": 47,
+        "ccode": "GBR_ENG",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "ENG-Championship": {
+        "id": 48,
+        "ccode": "GBR_ENG",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "ESP-La Liga": {
+        "id": 87,
+        "ccode": "ESP",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "GER-Bundesliga": {
+        "id": 54,
+        "ccode": "DEU",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "ITA-Serie A": {
+        "id": 55,
+        "ccode": "ITA",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "FRA-Ligue 1": {
+        "id": 53,
+        "ccode": "FRA",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "POR-Primeira Liga": {
+        "id": 61,
+        "ccode": "PRT",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "NED-Eredivisie": {
+        "id": 57,
+        "ccode": "NLD",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "USA-MLS": {
+        "id": 130,
+        "ccode": "USA",
+        "season": "2026",
+        "prev_season": "2025",
+    },
 }
-LEAGUES = list(LEAGUE_IDS)
-SEASONS = ["2025-2026", "2026-2027"]
-MLS_SEASONS = ["2025", "2026"]
+LEAGUES = list(FOTMOB_LEAGUES)
+
 BASE_URL = "https://www.fotmob.com/api"
-REQUEST_DELAY = 1.0
-REQUEST_TIMEOUT = (10, 60)
 
-# Older responses supply English titles without machine-readable keys.
-_STAT_TITLES = {
-    "Ball possession": "BallPossesion",
-    "Ball possesion": "BallPossesion",
-    "Expected goals (xG)": "expected_goals",
-    "Expected goals": "expected_goals",
-    "Total shots": "total_shots",
-    "Shots on target": "ShotsOnTarget",
-    "Accurate passes": "accurate_passes",
-    "Passes": "passes",
-    "Pass success": "accurate_passes_percentage",
-    "Fouls": "fouls",
-    "Corners": "corners",
-    "Offsides": "Offsides",
-    "Tackles": "tackles",
-    "Tackles won": "tackles_succeeded",
-    "Interceptions": "interceptions",
-    "Clearances": "clearances",
-    "Blocks": "shot_blocks",
-    "Saves": "keeper_saves",
-    "Keeper saves": "keeper_saves",
-    "Yellow cards": "yellow_cards",
-    "Red cards": "red_cards",
+# FotMob moved the JSON API from /api/<endpoint> to /api/data/<endpoint>;
+# the legacy hub answers 404 (verified by live probes on 2026-09-30). Try the
+# current hub first and keep the legacy hub from the task spec as a fallback,
+# so the collector works under either layout.
+API_BASES = (f"{BASE_URL}/data", BASE_URL)
+
+REQUEST_DELAY = 2.0        # seconds between requests
+REQUEST_TIMEOUT = (10, 60)
+SAMPLE_CHARS = 4000        # raw sample response truncation for the logs
+
+# Browser-like headers for all requests.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.fotmob.com/",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.fotmob.com",
 }
 
+# One deep-stats query per logical stat. Each entry lists request variants to
+# try, most likely first:
+#   * current API style: type=teams with "<stat>_team" stat names
+#   * legacy task-spec style: teamOrPlayer=team with bare stat names
+# goals_team_match is a per-match average, so it is scaled by matches played.
+DEEP_STAT_QUERIES = {
+    "expectedGoals": [
+        {"stat": "expected_goals_team", "type": "teams"},
+        {"stat": "expected_goals", "teamOrPlayer": "team"},
+    ],
+    "shotsOnTarget": [
+        {"stat": "ontarget_scoring_att_team", "type": "teams"},
+        {"stat": "shots_on_target", "teamOrPlayer": "team"},
+    ],
+    "possession": [
+        {"stat": "possession_percentage_team", "type": "teams"},
+        {"stat": "possession_percentage", "teamOrPlayer": "team"},
+    ],
+    "goals": [
+        {"stat": "goals_team_match", "type": "teams"},
+        {"stat": "goals", "teamOrPlayer": "team"},
+    ],
+    "saves": [
+        {"stat": "saves_team", "type": "teams"},
+        {"stat": "saves", "teamOrPlayer": "team"},
+    ],
+    "cleanSheets": [
+        {"stat": "clean_sheet_team", "type": "teams"},
+        {"stat": "clean_sheets", "teamOrPlayer": "team"},
+    ],
+}
 
-def _get_seasons(league: str) -> list[str]:
-    return MLS_SEASONS if league == "USA-MLS" else SEASONS
+# Deep-stats response key -> TeamSeasonStats column (task spec mapping).
+STAT_COLUMNS = {
+    "expectedGoals": "sh_xg",
+    "shotsOnTarget": "sh_sot",
+    "possession": "pos_poss",
+    "goals": "sh_goals",
+    "saves": "gk_saves",
+    "cleanSheets": "gk_cs",
+}
 
 
 def _safe(val) -> float | None:
@@ -92,6 +205,85 @@ def _safe(val) -> float | None:
         return number if math.isfinite(number) else None
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _norm_team(name) -> str:
+    """Case-insensitive, whitespace-normalised team name for joining."""
+    return " ".join(str(name).split()).casefold()
+
+
+def _db_season(season: str) -> str:
+    """Convert FotMob season labels to the dash format used in the database."""
+    return str(season).replace("/", "-")
+
+
+def _season_aliases(value) -> set[str]:
+    """Season label spellings: 2026/2027 == 2026/27."""
+    text = str(value or "").strip().replace(" ", "")
+    aliases = {text} if text else set()
+    if "/" in text:
+        left, right = text.split("/", 1)
+        if len(left) == 4 and right.isdigit():
+            if len(right) == 2:
+                aliases.add(f"{left}/{left[:2]}{right}")
+            elif len(right) == 4:
+                aliases.add(f"{left}/{right[2:]}")
+    return aliases
+
+
+def _match_season(seasons: list, season: str):
+    """Find the internal season id for a readable label in a seasons list."""
+    wanted = _season_aliases(season)
+    for entry in seasons:
+        if not isinstance(entry, dict):
+            continue
+        for field in ("name", "id"):
+            if _season_aliases(entry.get(field)) & wanted:
+                return entry.get("id")
+    return None
+
+
+def _row_team(row: dict) -> str | None:
+    """Team name from a deep-stats row, tolerating alternative layouts."""
+    for key in ("name", "teamName", "ParticipantName"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return " ".join(value.split())
+    return None
+
+
+def _row_value(row: dict) -> float | None:
+    """Stat value from a deep-stats row: {"value": x} or a bare number."""
+    value = row.get("statValue")
+    if isinstance(value, dict):
+        for key in ("value", "StatValue"):
+            if key in value:
+                return _safe(value[key])
+        return None
+    return _safe(value)
+
+
+def _row_matches(row: dict) -> float | None:
+    """Matches played: explicit fields first, then the substat value."""
+    for key in ("matchesPlayed", "MatchesPlayed"):
+        number = _safe(row.get(key))
+        if number is not None:
+            return number
+    sub = row.get("substatValue")
+    if isinstance(sub, dict):
+        for key in ("value", "StatValue"):
+            if key in sub:
+                return _safe(sub[key])
+        return None
+    return _safe(sub)
+
+
+def _parse_scores(scores) -> tuple[float | None, float | None]:
+    """Split a standings scoresStr such as '70-24' into goals for/against."""
+    if not isinstance(scores, str) or "-" not in scores:
+        return None, None
+    scored, _, conceded = scores.partition("-")
+    return _safe(scored), _safe(conceded)
 
 
 def _upsert_team(db, team, league, season, attrs) -> None:
@@ -118,180 +310,48 @@ def _upsert_team(db, team, league, season, attrs) -> None:
             setattr(existing, key, value)
 
 
-def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """Find the first matching column, ignoring case as a fallback."""
-    for candidate in candidates:
-        if candidate in df.columns:
-            return candidate
-    lower = {col.lower(): col for col in df.columns if isinstance(col, str)}
-    for candidate in candidates:
-        if candidate.lower() in lower:
-            return lower[candidate.lower()]
-    return None
-
-
-def _col_sum(df: pd.DataFrame, candidates: list[str]) -> float | None:
-    """Sum only complete metrics; absent match stats are not zeroes."""
-    col = _find_col(df, candidates)
-    if col is None or df.empty:
-        return None
-    values = df[col].map(_safe)
-    # Do not replace complete season totals with partial coverage totals.
-    return _safe(values.sum(min_count=len(df)))
-
-
-def _col_mean(df: pd.DataFrame, candidates: list[str]) -> float | None:
-    """Average a fully covered metric, without treating missing as zero."""
-    col = _find_col(df, candidates)
-    if col is None or df.empty:
-        return None
-    values = df[col].map(_safe)
-    return _safe(values.mean()) if values.notna().all() else None
-
-
-def _extract_attrs(group: pd.DataFrame, games: int) -> dict:
-    """Aggregate one row per team per completed match to season stats."""
+def _team_attrs(entry: dict, standing: dict) -> dict:
+    """Map one team's FotMob data onto TeamSeasonStats columns."""
     attrs = {}
-    totals = {
-        "sh_xg": ["expected_goals", "xg", "team_xg", "expectedGoals"],
-        "sh_npxg": ["expected_goals_non_penalty"],
-        "sh_goals": ["goals", "score", "goals_scored"],
-        "sh_shots": ["total_shots", "shots", "shots_total", "shotsTotal"],
-        "sh_sot": ["ShotsOnTarget", "shots_on_target", "on_target", "shots_on_goal"],
-        "gk_ga": ["goals_conceded", "goals_against", "opponent_score", "goalsConceded"],
-        "gk_saves": ["keeper_saves", "saves", "goalkeeper_saves", "savedShots"],
-        "gk_sota": ["opponent_shots_on_target"],
-        "gk_cs": ["clean_sheets", "cleanSheets", "clean_sheet"],
-        "def_tkl": ["tackles", "total_tackles"],
-        "def_tklw": ["tackles_succeeded", "tackles_won", "tacklesWon"],
-        "def_int": ["interceptions"],
-        "def_clr": ["clearances"],
-        "def_blk_sh": ["shot_blocks", "blocked_shots"],
-        "misc_crdy": ["yellow_cards", "yellowCards"],
-        "misc_crdr": ["red_cards", "redCards"],
-        "misc_fls": ["fouls", "fouls_committed", "foulsCommitted"],
-        "misc_off": ["Offsides", "offsides"],
-        "ps_cmp": ["accurate_passes", "accuratePasses"],
-        "ps_att": ["passes", "total_passes"],
-    }
-    # Corners have no corresponding TeamSeasonStats column. In particular,
-    # pos_cpa means carries into the penalty area, NOT corners.
-    for field, candidates in totals.items():
-        value = _col_sum(group, candidates)
+    for logical, column in STAT_COLUMNS.items():
+        value = _safe(entry.get(logical))
         if value is not None:
-            attrs[field] = round(value, 3)
-
-    possession = _col_mean(group, [
-        "BallPossesion", "BallPossession", "Ball possession", "Ball possesion",
-        "possession", "ball_possession", "possessionPercent",
-    ])
-    if possession is not None:
-        attrs["pos_poss"] = round(possession, 1)
-
-    minutes = _col_sum(group, ["minutes"])
-    nineties = minutes / 90 if minutes is not None else games
-    for total, rate in (("sh_shots", "sh_sh_per90"),
-                        ("sh_sot", "sh_sot_per90"), ("gk_ga", "gk_ga90")):
-        if total in attrs and nineties > 0:
-            attrs[rate] = round(attrs[total] / nineties, 2)
-
-    for numerator, denominator, field, scale in (
-        ("sh_goals", "sh_shots", "sh_g_per_sh", 1),
-        ("sh_goals", "sh_sot", "sh_g_per_sot", 1),
-        ("sh_sot", "sh_shots", "sh_sot_pct", 100),
-        ("sh_npxg", "sh_shots", "sh_npxg_per_sh", 1),
-        ("ps_cmp", "ps_att", "ps_cmp_pct", 100),
-    ):
-        if numerator in attrs and attrs.get(denominator, 0) > 0:
-            attrs[field] = round(attrs[numerator] / attrs[denominator] * scale, 3)
-
-    if "ps_cmp_pct" not in attrs:
-        accuracy = _col_mean(group, [
-            "accurate_passes_percentage", "pass_accuracy", "passAccuracy", "Pass success",
-        ])
-        if accuracy is not None:
-            attrs["ps_cmp_pct"] = round(accuracy, 1)
+            attrs[column] = round(value, 1 if column == "pos_poss" else 3)
+    # Standings supply exact season totals and results where columns exist.
+    for column in ("gk_ga", "gk_w", "gk_d", "gk_l"):
+        value = _safe(standing.get(column))
+        if value is not None:
+            attrs[column] = value
+    goals_for = _safe(standing.get("goalsFor"))
+    if goals_for is not None:
+        # The exact table total beats the per-match estimate.
+        attrs["sh_goals"] = goals_for
+    matches = _safe(entry.get("matchesPlayed"))
+    if matches is None:
+        matches = _safe(standing.get("matchesPlayed"))
     if "sh_goals" in attrs and "sh_xg" in attrs:
         attrs["sh_g_minus_xg"] = round(attrs["sh_goals"] - attrs["sh_xg"], 3)
-    if "def_tkl" in attrs and "def_int" in attrs:
-        attrs["def_tkl_int"] = attrs["def_tkl"] + attrs["def_int"]
-    if "gk_saves" in attrs and attrs.get("gk_sota", 0) > 0:
-        attrs["gk_save_pct"] = round(attrs["gk_saves"] / attrs["gk_sota"] * 100, 1)
-    if "gk_cs" in attrs and games > 0:
-        attrs["gk_cs_pct"] = round(attrs["gk_cs"] / games * 100, 1)
+    if "gk_cs" in attrs and matches:
+        attrs["gk_cs_pct"] = round(attrs["gk_cs"] / matches * 100, 1)
     return attrs
 
 
-def _is_finished(status: dict) -> bool:
-    """Exclude scheduled, live, cancelled, postponed and abandoned games."""
-    reason = status.get("reason") or {}
-    text = " ".join(str(value).lower() for value in reason.values())
-    return bool(status.get("finished")) and not (
-        status.get("cancelled") or status.get("awarded")
-        or any(word in text for word in ("abandon", "abort", "cancel", "postpon", "award"))
-    )
-
-
-def _match_rows(payload: dict) -> list[dict]:
-    """Flatten content.stats.Periods.All only, never add half-time twice."""
-    header = payload.get("header") or {}
-    status = header.get("status") or {}
-    if not _is_finished(status):
-        return []
-    teams = header.get("teams") or []
-    if len(teams) != 2:
-        raise ValueError("FotMob match response has no home/away teams")
-    scores = [_safe(team.get("score")) for team in teams]
-    if any(score is None for score in scores):
-        raise ValueError("Completed FotMob match has no numeric score")
-    reason = status.get("reason") or {}
-    extra_time = bool((payload.get("general") or {}).get("hasExtraTime")) or (
-        reason.get("short") in {"AET", "AP", "Pen"}
-    )
-    rows = []
-    for side, team in enumerate(teams):
-        name = team.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("FotMob match response has no team name")
-        conceded = scores[1 - side]
-        rows.append({
-            "team": name.strip(), "goals": scores[side],
-            "goals_conceded": conceded, "clean_sheets": int(conceded == 0),
-            "minutes": 120 if extra_time else 90,
-        })
-
-    stats = (payload.get("content") or {}).get("stats") or {}
-    if "Periods" in stats:
-        stats = (stats.get("Periods") or {}).get("All") or {}
-    categories = stats.get("stats", []) if isinstance(stats, dict) else stats
-    if not isinstance(categories, list):
-        raise ValueError("Unexpected FotMob match statistics format")
-    for category in categories:
-        for stat in category.get("stats", []):
-            values = stat.get("stats")
-            if not isinstance(values, list) or len(values) != 2:
-                continue
-            title = stat.get("title")
-            key = stat.get("key") or _STAT_TITLES.get(title, title)
-            if not isinstance(key, str):
-                continue
-            for side, value in enumerate(values):
-                rows[side][key] = _safe(value)
-                if key.lower() in {"shotsontarget", "shots_on_target"}:
-                    rows[1 - side]["opponent_shots_on_target"] = _safe(value)
-    return rows
+def _merge_teams(stats: dict, table: dict) -> dict:
+    """Deep-stats entries keyed by team, with standings-only teams appended."""
+    teams = dict(stats)
+    known = {_norm_team(name) for name in teams}
+    for name in table:
+        if _norm_team(name) not in known:
+            teams[name] = {}
+    return teams
 
 
 class _FotMobClient:
-    """Bounded, rate-limited HTTP requests with retries; no browser required."""
+    """Rate-limited HTTP client for FotMob's JSON API with hub fallback."""
 
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; FootballPredictor/1.0)",
-            "Accept": "application/json",
-            "Referer": "https://www.fotmob.com/",
-        })
+        self.session.headers.update(HEADERS)
         retry = Retry(
             total=3, backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
@@ -299,95 +359,267 @@ class _FotMobClient:
         )
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
         self._last_request = 0.0
+        self._base = None            # API hub that answered last
+        self._samples = set()        # endpoints whose response was sampled
+        self._seasons = {}           # (league_id, season label) -> season param
+        self._deep_style = None      # team-param style that worked
 
-    def _get(self, endpoint: str, **params) -> dict:
-        time.sleep(max(0, REQUEST_DELAY - (time.monotonic() - self._last_request)))
-        try:
-            response = self.session.get(
-                f"{BASE_URL}/{endpoint}", params=params, timeout=REQUEST_TIMEOUT,
-            )
+    # -- HTTP ----------------------------------------------------------
+
+    def _get(self, endpoint: str, params: dict) -> dict:
+        """GET {hub}/{endpoint}, preferring the hub that answered last.
+
+        404/405/410 means the route does not exist on that hub, so the other
+        known hub is tried before giving up.
+        """
+        candidates = [self._base] if self._base else []
+        candidates += [base for base in API_BASES if base not in candidates]
+        last_error = None
+        for base in candidates:
+            time.sleep(max(0.0, REQUEST_DELAY - (time.monotonic() - self._last_request)))
+            try:
+                response = self.session.get(
+                    f"{base}/{endpoint}", params=params, timeout=REQUEST_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                continue
+            finally:
+                self._last_request = time.monotonic()
+            if response.status_code in (404, 405, 410):
+                last_error = RuntimeError(
+                    f"HTTP {response.status_code}: {base}/{endpoint}"
+                )
+                continue
             response.raise_for_status()
-            payload = response.json()
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise ValueError(f"Non-JSON reply from {base}/{endpoint}") from exc
             if not isinstance(payload, dict):
                 raise ValueError(f"Unexpected FotMob {endpoint} response")
+            if self._base != base:
+                print(f"[fotmob] Using API hub: {base}")
+                self._base = base
+            self._print_sample(response, payload, endpoint)
             return payload
-        finally:
-            self._last_request = time.monotonic()
+        if last_error is None:
+            last_error = RuntimeError(f"FotMob {endpoint} request failed")
+        raise last_error
 
-    def read_team_match_stats(self, league: str, season: str) -> pd.DataFrame:
-        """Get the requested season's schedule, then completed match details."""
-        api_season = season.replace("-", "/")
-        payload = self._get("leagues", id=LEAGUE_IDS[league], season=api_season)
-        available = payload.get("allAvailableSeasons")
-        if available is not None and api_season not in available:
-            raise ValueError(f"FotMob does not publish season {api_season}")
-        selected = (payload.get("overview") or {}).get("selectedSeason")
-        if selected is not None and selected != api_season:
-            raise ValueError(f"FotMob returned season {selected}, expected {api_season}")
-        matches = (payload.get("matches") or {}).get("allMatches")
-        if not isinstance(matches, list):
-            raise ValueError("FotMob league response has no full season match list")
-        rows = []
-        seen = set()
-        for match in matches:
-            if not _is_finished(match.get("status") or {}):
+    def _print_sample(self, response, payload: dict, endpoint: str) -> None:
+        """Print the raw response of the first successful call per endpoint."""
+        if endpoint in self._samples:
+            return
+        self._samples.add(endpoint)
+        print(f"[fotmob] Sample response: GET {response.url} -> HTTP {response.status_code}")
+        print(f"[fotmob] Sample response: top-level keys: {list(payload)}")
+        print(f"[fotmob] Sample response: {json.dumps(payload)[:SAMPLE_CHARS]}")
+
+    # -- deep stats ----------------------------------------------------
+
+    def _deep_fetch(self, league_id: int, season_param, query: dict):
+        """One deep-stats request; returns (payload, rows or None)."""
+        payload = self._get("leagueseasondeepstats", {
+            "id": league_id, "season": season_param, **query,
+        })
+        rows = payload.get("statsData")
+        return payload, rows if isinstance(rows, list) and rows else None
+
+    def _ordered_queries(self, queries: list) -> list:
+        """Try the parameter style that already worked first."""
+        if not self._deep_style:
+            return list(queries)
+        style = self._deep_style
+
+        def matches(query):
+            return 0 if all(query.get(k) == v for k, v in style.items()) else 1
+
+        return sorted(queries, key=matches)
+
+    def _resolve_season(self, league_id: int, season: str):
+        """Map a readable season label to the deep-stats season parameter.
+
+        The deep-stats endpoint wants FotMob's internal numeric season id
+        (e.g. 27110), so a label like "2026/2027" is resolved through the
+        season directory the endpoint itself returns. Results are memoized.
+        """
+        key = (league_id, str(season))
+        if key in self._seasons:
+            return self._seasons[key]
+        payload = None
+        for query in self._ordered_queries(DEEP_STAT_QUERIES["expectedGoals"]):
+            payload, rows = self._deep_fetch(league_id, season, query)
+            if rows:
+                self._seasons[key] = season
+                return season
+        # No rows for the label: resolve the internal id via the seasons list.
+        season_id = _match_season((payload or {}).get("seasons") or [], season)
+        if season_id is None:
+            directory = self._get("leagueseasondeepstats", {"id": league_id})
+            season_id = _match_season(directory.get("seasons") or [], season)
+        if season_id is None:
+            raise ValueError(
+                f"FotMob publishes no season {season} for league {league_id}"
+            )
+        self._seasons[key] = season_id
+        return season_id
+
+    def get_team_xg_stats(self, league_id: int, season: str) -> dict:
+        """Team season stats for one league and season from the deep-stats API.
+
+        Combines one request per stat (expected goals, shots on target and
+        possession percentage, plus the goals, saves and clean sheets needed
+        for the database mapping) into a single dict keyed by team name:
+
+            {"Arsenal": {"expectedGoals": 35.4, "shotsOnTarget": 120.0,
+                         "possession": 58.3, "goals": 70.0, "saves": 41.0,
+                         "cleanSheets": 14.0, "matchesPlayed": 38}}
+        """
+        season_param = self._resolve_season(league_id, season)
+        if str(season_param) != str(season):
+            print(f"[fotmob] Season {season} -> internal id {season_param}")
+        teams = {}
+        for logical, queries in DEEP_STAT_QUERIES.items():
+            rows = None
+            used = None
+            for query in self._ordered_queries(queries):
+                _, rows = self._deep_fetch(league_id, season_param, query)
+                if rows:
+                    used = query
+                    break
+            if not rows:
+                print(f"[fotmob] WARNING: no {logical} stats for "
+                      f"league {league_id} {season}")
                 continue
-            match_id = match.get("id")
-            if match_id is None:
-                raise ValueError("Completed FotMob fixture has no ID")
-            match_id = str(match_id)
-            if match_id in seen:
+            style = {k: v for k, v in used.items() if k != "stat"}
+            if self._deep_style != style:
+                self._deep_style = style
+                print(f"[fotmob] Deep-stats params that worked: {style}")
+            per_match = str(used.get("stat", "")).endswith("_match")
+            unscaled = 0
+            for row in rows:
+                team = _row_team(row)
+                if team is None:
+                    continue
+                entry = teams.setdefault(team, {})
+                matches = _row_matches(row) or entry.get("matchesPlayed")
+                if matches is not None:
+                    entry["matchesPlayed"] = matches
+                value = _row_value(row)
+                if value is None:
+                    continue
+                if per_match:
+                    if matches:
+                        value = value * matches
+                    else:
+                        unscaled += 1
+                entry[logical] = value
+            if unscaled:
+                print(f"[fotmob] WARNING: {logical} kept as a per-match value "
+                      f"for {unscaled} teams (no match counts available)")
+        return teams
+
+    # -- standings -----------------------------------------------------
+
+    def get_league_table(self, league_id: int, ccode: str, season: str) -> dict:
+        """League standings: matches played, results and goals for/against."""
+        payload = self._get("leagues", {
+            "id": league_id, "ccode3": ccode, "season": season,
+        })
+        teams = {}
+        entries = payload.get("table")
+        if not isinstance(entries, list):
+            raise ValueError("FotMob league response has no table")
+        for entry in entries:
+            if not isinstance(entry, dict):
                 continue
-            seen.add(match_id)
-            details = self._get("matchDetails", matchId=match_id)
-            general = details.get("general") or {}
-            returned_season = general.get("parentLeagueSeason") or general.get("leagueSeason")
-            if returned_season is not None and returned_season != api_season:
-                raise ValueError(f"Match {match_id} belongs to season {returned_season}")
-            match_rows = _match_rows(details)
-            if not match_rows:
-                raise ValueError(f"Completed fixture {match_id} has unfinished match details")
-            rows.extend(match_rows)
-        # Any failed match aborts this season instead of saving partial totals.
-        return pd.DataFrame(rows)
+            data = entry.get("data") or {}
+            rows = (data.get("table") or {}).get("all") or []
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                name = row.get("name") if isinstance(row, dict) else None
+                if not isinstance(name, str) or not name.strip():
+                    continue
+                name = " ".join(name.split())
+                if name in teams:
+                    continue
+                goals_for, goals_against = _parse_scores(row.get("scoresStr"))
+                teams[name] = {
+                    "matchesPlayed": _safe(row.get("played")),
+                    "gk_w": _safe(row.get("wins")),
+                    "gk_d": _safe(row.get("draws")),
+                    "gk_l": _safe(row.get("losses")),
+                    "goalsFor": goals_for,
+                    "gk_ga": goals_against,
+                }
+        if not teams:
+            raise ValueError("FotMob league table is empty")
+        return teams
 
     def close(self) -> None:
         self.session.close()
 
 
 def collect_team_stats() -> int:
-    """Collect all league/seasons; return only successfully committed rows."""
-    print("[fotmob] Collecting team stats using the direct JSON API...")
+    """Collect both seasons for all leagues; return successfully committed rows."""
+    print("[fotmob] Collecting team stats via the FotMob JSON API...")
     total = 0
     client = _FotMobClient()
     try:
-        for league in LEAGUES:
-            for season in _get_seasons(league):
-                print(f"[fotmob] {league} {season}...")
+        for league, config in FOTMOB_LEAGUES.items():
+            league_id = config["id"]
+            for api_season in (config["season"], config["prev_season"]):
+                db_season = _db_season(api_season)
+                print(f"[fotmob] {league} {api_season}...")
                 try:
-                    df = client.read_team_match_stats(league, season)
-                    if df.empty:
-                        print(f"[fotmob] WARNING: no completed matches for {league} {season}")
+                    try:
+                        table = client.get_league_table(
+                            league_id, config["ccode"], api_season,
+                        )
+                    except Exception as exc:
+                        print(f"[fotmob] WARNING: league table failed for "
+                              f"{league} {api_season}: {exc}")
+                        table = {}
+                    try:
+                        stats = client.get_team_xg_stats(league_id, api_season)
+                    except Exception as exc:
+                        print(f"[fotmob] WARNING: deep stats failed for "
+                              f"{league} {api_season}: {exc}")
+                        stats = {}
+                    if not stats and not table:
+                        print(f"[fotmob] ERROR: no data for {league} {api_season}")
                         continue
-                    print(f"[fotmob] Got {len(df)} team-match rows. Columns: {list(df.columns)[:6]}...")
+                    if not stats:
+                        print(f"[fotmob] WARNING: storing standings only for "
+                              f"{league} {api_season}")
+                    teams = _merge_teams(stats, table)
+                    norm_table = {
+                        _norm_team(name): rec for name, rec in table.items()
+                    }
+                    print(f"[fotmob] {league} {api_season}: {len(stats)} teams "
+                          f"with deep stats, {len(teams)} to upsert")
                     db = SessionLocal()
                     committed = 0
                     try:
-                        for team, group in df.groupby("team"):
-                            attrs = _extract_attrs(group, len(group))
+                        for team, entry in teams.items():
+                            standing = norm_table.get(_norm_team(team), {})
+                            attrs = _team_attrs(entry, standing)
                             if attrs:
-                                _upsert_team(db, team, league, season, attrs)
+                                _upsert_team(db, team, league, db_season, attrs)
                                 committed += 1
                         db.commit()
                         total += committed
-                        print(f"[fotmob] {league} {season}: committed {committed} teams")
+                        print(f"[fotmob] {league} {api_season}: "
+                              f"committed {committed} teams")
                     except Exception:
                         db.rollback()
                         raise
                     finally:
                         db.close()
                 except Exception as exc:
-                    print(f"[fotmob] ERROR {league} {season}: {exc}")
+                    print(f"[fotmob] ERROR {league} {api_season}: {exc}")
     finally:
         client.close()
     print(f"[fotmob] Done. Total rows: {total}")
