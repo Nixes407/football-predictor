@@ -48,9 +48,12 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     # England
     "Arsenal":              "ENG-Premier League",
     "Aston Villa":          "ENG-Premier League",
+    "Chelsea":              "ENG-Premier League",
     "Liverpool":            "ENG-Premier League",
     "Manchester City":      "ENG-Premier League",
     "Manchester United":    "ENG-Premier League",
+    "Newcastle United":     "ENG-Premier League",
+    "Tottenham":            "ENG-Premier League",
     # Spain
     "Real Madrid":          "ESP-La Liga",
     "Barcelona":            "ESP-La Liga",
@@ -59,6 +62,10 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Real Betis":           "ESP-La Liga",
     "Betis":                "ESP-La Liga",          # football-data.org normaliser
     "Real Betis Balompié":  "ESP-La Liga",
+    "Real Sociedad":        "ESP-La Liga",
+    "Athletic Club":        "ESP-La Liga",
+    "Girona":               "ESP-La Liga",
+    "Sevilla":              "ESP-La Liga",
     "Villarreal":           "ESP-La Liga",
     "Villarreal CF":        "ESP-La Liga",
     "Club Atletico de Madrid":  "ESP-La Liga",
@@ -76,6 +83,10 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Bayer 04 Leverkusen":  "GER-Bundesliga",
     "FC Bayern München":    "GER-Bundesliga",
     "Borussia Mönchengladbach": "GER-Bundesliga",
+    "Gladbach":             "GER-Bundesliga",       # football-data.org normaliser
+    "Frankfurt":            "GER-Bundesliga",
+    "Union Berlin":         "GER-Bundesliga",
+    "Wolfsburg":            "GER-Bundesliga",
     # Italy
     "Internazionale":       "ITA-Serie A",
     "Inter":                "ITA-Serie A",
@@ -105,6 +116,9 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "LOSC Lille":           "FRA-Ligue 1",
     "Monaco":               "FRA-Ligue 1",
     "AS Monaco":            "FRA-Ligue 1",
+    "Marseille":            "FRA-Ligue 1",
+    "Lyon":                 "FRA-Ligue 1",
+    "Rennes":               "FRA-Ligue 1",
     "Racing Club de Lens":  "FRA-Ligue 1",
     "RC Strasbourg":        "FRA-Ligue 1",
     "Stade Brestois 29":    "FRA-Ligue 1",
@@ -114,6 +128,8 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Sporting CP":          "POR-Primeira Liga",
     "Benfica":              "POR-Primeira Liga",
     "SL Benfica":           "POR-Primeira Liga",
+    "Braga":                "POR-Primeira Liga",
+    "SC Braga":             "POR-Primeira Liga",
     "Sporting Clube de Portugal": "POR-Primeira Liga",
     # Netherlands
     "Feyenoord":            "NED-Eredivisie",
@@ -327,17 +343,26 @@ def _predict_with_formula(
     storing a prediction never has to know the engine's response shape.
     """
     if not _formula_engine_available or formula_predict is None:
+        print(f"[fixtures] Formula engine unavailable — cannot predict "
+              f"{home_team} vs {away_team}")
         return None
     if not (home_team and away_team and league):
+        print(f"[fixtures] Formula engine skipped for {home_team!r} vs "
+              f"{away_team!r}: home_team, away_team and league must all "
+              f"be set (league={league!r})")
         return None
 
     try:
+        print(f"[fixtures] formula_predict: {home_team!r} vs "
+              f"{away_team!r} league={league!r} "
+              f"season={(season or DEFAULT_SEASON)!r}")
         prediction = formula_predict(
             home_team=home_team,
             away_team=away_team,
             league=league,
             season=season or DEFAULT_SEASON,
         )
+        print(f"[fixtures] formula_predict returned: {bool(prediction)}")
     except Exception as exc:
         print(f"[fixtures] WARNING: formula prediction failed for "
               f"{home_team} vs {away_team}: {exc}")
@@ -416,31 +441,46 @@ def _predict_fixture_values(
     if league == UCL_LEAGUE:
         home_dom = _get_ucl_domestic_league(home_team)
         away_dom = _get_ucl_domestic_league(away_team)
+        print(f"[fixtures] UCL lookup: "
+              f"{home_team!r} -> {home_dom!r} | "
+              f"{away_team!r} -> {away_dom!r}")
         if not home_dom or not away_dom:
             print(f"[fixtures] UCL: skipping "
                   f"{home_team} vs {away_team} "
                   f"— domestic league not found")
             return {}
+
+        print(f"[fixtures] UCL: predicting "
+              f"{home_team} ({home_dom}) vs "
+              f"{away_team} ({away_dom})")
+
         if home_dom != away_dom:
-            # The formula engine rates both teams inside one league, so a
-            # pair from two leagues cannot be scored without looking up one
-            # side in the wrong league. Leave it unpredicted instead.
-            print(f"[fixtures] UCL: skipping "
-                  f"{home_team} ({home_dom}) vs {away_team} ({away_dom}) "
-                  f"— teams from different domestic leagues")
-            return {}
-        print(f"[fixtures] UCL: {home_team} "
-              f"({home_dom}) vs {away_team} "
-              f"({away_dom})")
+            # A UCL tie is normally between two domestic leagues, and the
+            # formula engine rates both teams inside a single league: the
+            # away side has no rows under the home league, so the engine
+            # cannot rate this fixture. It is still asked — its answer is
+            # logged below — and the league-agnostic ML models are the
+            # fallback, so the tie keeps a prediction instead of none.
+            print(f"[fixtures] UCL: {home_team} ({home_dom}) and "
+                  f"{away_team} ({away_dom}) come from different "
+                  f"domestic leagues — expecting no formula result")
+
         league = home_dom
 
     values = _empty_prediction_values()
 
+    print(f"[fixtures] Calling formula for "
+          f"{home_team} vs {away_team} "
+          f"league={league}")
     from_formula = _predict_with_formula(home_team, away_team, league, season)
+    print(f"[fixtures] Formula result: "
+          f"{bool(from_formula)}")
     if from_formula:
         values.update(from_formula)
 
     if not _has_result_prediction(values) and _ml_models_available():
+        print(f"[fixtures] Falling back to the ML models for "
+              f"{home_team} vs {away_team} (league={league})")
         try:
             from_models = _compute_prediction_values(
                 home_team=home_team,
@@ -454,11 +494,18 @@ def _predict_fixture_values(
             traceback.print_exc()
             from_models = None
 
+        print(f"[fixtures] ML result: {bool(from_models)}")
+
         for name, value in (from_models or {}).items():
             if values.get(name) is None:
                 values[name] = value
 
-    return _with_derived_markets(values)
+    values = _with_derived_markets(values)
+    if not _has_result_prediction(values):
+        print(f"[fixtures] No prediction could be produced for "
+              f"{home_team} vs {away_team} (league={league}) — "
+              f"ML models available: {_ml_models_available()}")
+    return values
 
 
 def _register_derived_columns() -> None:
