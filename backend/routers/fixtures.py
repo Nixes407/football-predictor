@@ -678,8 +678,10 @@ def fill_missing_predictions(rows: list[DailyMatch], db: Session) -> int:
     already stored with them.
 
     Each row is committed on its own, so one unusable fixture cannot roll
-    back the predictions already stored for the others. Returns how many rows
-    were filled in.
+    back the predictions already stored for the others. A fixture whose
+    prediction still cannot be produced is left exactly as it is — its
+    ``prediction_computed_at`` included. Returns how many rows actually
+    gained a prediction value.
     """
     if not rows:
         return 0
@@ -715,7 +717,21 @@ def fill_missing_predictions(rows: list[DailyMatch], db: Session) -> int:
                       f"fixture without one")
                 continue
 
-            _apply_prediction_values(row, values)
+            # Only values that actually change are written back. A row that
+            # still misses a market (no expected corners to derive one from,
+            # say) keeps its old timestamp: stamping it would report a fill
+            # that never happened and would keep the day looking fresh, so
+            # the staleness check could never refresh it again.
+            added = {
+                name: value
+                for name, value in values.items()
+                if value is not None
+                and getattr(row, name, None) != value
+            }
+            if not added:
+                continue
+
+            _apply_prediction_values(row, added)
             row.prediction_computed_at = datetime.now(timezone.utc).isoformat()
             db.commit()
             filled += 1
@@ -878,10 +894,15 @@ def _get_or_fetch_matches(target_date: str, db: Session) -> list[dict]:
         refresh_open_predictions(rows, new_fixtures, db)
         rows = _load_matches(target_date, db)
 
+    # Always try to fill missing predictions regardless of the staleness
+    # timer: a fixture cached while no prediction could be produced (models
+    # still loading, no team stats yet) gets one on the next API call, even
+    # if the day's stored predictions are otherwise fresh.
     filled = fill_missing_predictions(rows, db)
     if filled:
-        print(f"[fixtures] computed {filled} missing prediction(s) "
-              f"for {target_date}")
+        print(f"[fixtures] Filled {filled} "
+              f"missing predictions")
+        rows = _load_matches(target_date, db)
 
     return [_row_to_dict(row) for row in rows]
 
