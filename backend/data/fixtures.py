@@ -10,12 +10,15 @@ from datetime import date, datetime, timezone
 # not API-Football IDs: API-Football's ID 2 would be requested here as
 # /v4/competitions/2/matches, which does not exist.
 LEAGUE_MAP = {
-    "PL": "ENG-Premier League",
-    "PD": "ESP-La Liga",
+    "PL":  "ENG-Premier League",
+    "ELC": "ENG-Championship",
+    "PD":  "ESP-La Liga",
     "BL1": "GER-Bundesliga",
-    "SA": "ITA-Serie A",
+    "SA":  "ITA-Serie A",
     "FL1": "FRA-Ligue 1",
-    "CL": "UEFA-Champions League",
+    "PPL": "POR-Primeira Liga",
+    "DED": "NED-Eredivisie",
+    "CL":  "UEFA-Champions League",
 }
 
 TEAM_NAME_MAP = {
