@@ -1,39 +1,22 @@
 """
-Sofascore advanced stats collector — PRIMARY data source.
+Sofascore direct API collector.
 
-Collects team stats and player stats from Sofascore via soccerdata.
+Uses curl_cffi to impersonate Chrome TLS
+fingerprint when calling api.sofascore.com.
+Bypasses bot detection on cloud servers
+including GitHub Actions.
 
-soccerdata's Sofascore reader only covers leagues, seasons, tables and
-schedules — it exposes no stats readers of its own — so this module
-resolves league/season IDs through it and fetches the Sofascore
-statistics API with its cached session.
-
-Coverage: 9 leagues, seasons 2025-2026 and 2026-2027 (latest season
-only for players). UEFA Champions League is not stored here:
-team_season_stats and player_season_stats are domestic-only, matching
-api_football_collector ("UCL skipped: not stored").
-
-League averages are derived from these rows by models.formula_engine
-(load_league_averages) rather than collected separately.
-
-Fallback sources (API-Football, Understat) fill the same tables when
-this source fails — see api_football_collector.py and
-understat_collector.py.
-
+Primary data source for all advanced stats.
 Run from backend/ directory:
     python data/sofascore_collector.py
 """
 
 from __future__ import annotations
 
-import json
 import math
 import sys
-import warnings
+import time
 from pathlib import Path
-
-import pandas as pd
-import soccerdata as sd
 
 _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
@@ -47,89 +30,138 @@ from sqlalchemy import and_
 # CONFIG
 # ═══════════════════════════════════════════
 
-LEAGUES = [
-    "ENG-Premier League",
-    "ENG-Championship",
-    "ESP-La Liga",
-    "GER-Bundesliga",
-    "ITA-Serie A",
-    "FRA-Ligue 1",
-    "POR-Primeira Liga",
-    "NED-Eredivisie",
-    "USA-MLS",
-]
+BASE_URL = "https://api.sofascore.com/api/v1"
 
-
-SEASONS     = ["2025-2026", "2026-2027"]
-MLS_SEASONS = ["2025", "2026"]
-
-# Sofascore API base — the same host soccerdata talks to.
-SOFASCORE_API = "https://api.sofascore.com/api/v1/"
-
-# soccerdata's league registry only knows the Big 5 leagues plus a few
-# internationals and rejects everything else in its constructor. These
-# entries register the remaining leagues with their Sofascore tournament
-# names — what a ~/.soccerdata/config/league_dict.json would do, but
-# self-contained so the collector runs without extra environment setup.
-_SOFASCORE_LEAGUE_PATCH = {
-    "ENG-Championship": {
-        "Sofascore": "Championship",
-        "season_start": "Aug",
-        "season_end": "May",
-    },
-    "POR-Primeira Liga": {
-        "Sofascore": "Primeira Liga",
-        "season_start": "Aug",
-        "season_end": "May",
-    },
-    "NED-Eredivisie": {
-        "Sofascore": "Eredivisie",
-        "season_start": "Aug",
-        "season_end": "May",
-    },
-    "USA-MLS": {
-        "Sofascore": "Major League Soccer",
-        "season_start": "Mar",
-        "season_end": "Nov",
-        "season_code": "single-year",
-    },
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Referer":         "https://www.sofascore.com/",
+    "Accept":          "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin":          "https://www.sofascore.com",
 }
 
+LEAGUE_CONFIG = {
+    "ENG-Premier League":    {"tid": 17},
+    "ENG-Championship":      {"tid": 18},
+    "ESP-La Liga":           {"tid": 8},
+    "GER-Bundesliga":        {"tid": 35},
+    "ITA-Serie A":           {"tid": 23},
+    "FRA-Ligue 1":           {"tid": 34},
+    "POR-Primeira Liga":     {"tid": 238},
+    "NED-Eredivisie":        {"tid": 37},
+    "USA-MLS":               {"tid": 242},
+    "UEFA-Champions League": {"tid": 7},
+}
 
-def _register_leagues() -> None:
-    """Merge the missing league entries into soccerdata's registry."""
+TARGET_SEASONS     = [2025, 2026]
+MLS_TARGET_SEASONS = [2025, 2026]
+REQUEST_DELAY      = 2.0
+
+
+# ═══════════════════════════════════════════
+# HTTP CLIENT
+# ═══════════════════════════════════════════
+
+def _get_client():
+    """
+    Create curl_cffi session impersonating Chrome.
+    Falls back to plain requests if not installed.
+    """
     try:
-        from soccerdata._config import LEAGUE_DICT
-    except Exception as exc:  # pragma: no cover - soccerdata layout change
-        print(f"[sofascore] WARNING: cannot patch league dict: {exc}")
-        return
-
-    for key, entry in _SOFASCORE_LEAGUE_PATCH.items():
-        current = LEAGUE_DICT.get(key)
-        if current is None:
-            LEAGUE_DICT[key] = dict(entry)
-        elif "Sofascore" not in current:
-            current.update(entry)
-
-    # _all_leagues caches a filtered view — drop it so the patch takes
-    # effect even if another collector already ran in this process.
-    sofa = getattr(sd, "Sofascore", None)
-    if sofa is not None:
-        try:
-            delattr(sofa, "_all_leagues_dict")
-        except AttributeError:
-            pass
+        from curl_cffi import requests as cffi_req
+        session = cffi_req.Session(
+            impersonate="chrome120")
+        session.headers.update(HEADERS)
+        print("[sofascore] Using curl_cffi "
+              "(Chrome TLS impersonation)")
+        return session, True
+    except ImportError:
+        import requests
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        print("[sofascore] WARNING: curl_cffi "
+              "not found — using plain requests")
+        return session, False
 
 
-_register_leagues()
+def _get(
+    session,
+    url: str,
+    params: dict = None,
+) -> dict | None:
+    """Make one GET request. Returns JSON or None."""
+    try:
+        resp = session.get(
+            url,
+            params=params or {},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        elif resp.status_code == 429:
+            print("[sofascore] Rate limited — "
+                  "waiting 30s...")
+            time.sleep(30)
+            return None
+        elif resp.status_code == 403:
+            print(f"[sofascore] 403 Forbidden: "
+                  f"{url}")
+            return None
+        else:
+            print(f"[sofascore] HTTP "
+                  f"{resp.status_code}: {url}")
+            return None
+    except Exception as exc:
+        print(f"[sofascore] ERROR: {url}: {exc}")
+        return None
 
 
-try:
-    # Apply soccerdata's own team-name translation (normally empty) so
-    # standings names match the schedule names read below.
-    from soccerdata._config import TEAMNAME_REPLACEMENTS
-except Exception:  # pragma: no cover - soccerdata layout change
-    TEAMNAME_REPLACEMENTS = {}
+# ═══════════════════════════════════════════
+# SEASON DISCOVERY
+# ═══════════════════════════════════════════
+
+def get_seasons(
+    session,
+    tid: int,
+    target_years: list[int],
+) -> list[dict]:
+    """
+    Fetch available seasons for a tournament.
+    Returns list of {sid, year, name} dicts
+    matching target_years.
+    """
+    url  = (f"{BASE_URL}/unique-tournament"
+            f"/{tid}/seasons")
+    data = _get(session, url)
+    time.sleep(REQUEST_DELAY)
+
+    if not data:
+        return []
+
+    seasons = data.get("seasons", [])
+    matched = []
+
+    for s in seasons:
+        sid  = s.get("id")
+        name = s.get("name", "")
+        year = s.get("year")
+        for ty in target_years:
+            if year == ty or str(ty) in str(name):
+                matched.append({
+                    "sid":  sid,
+                    "year": ty,
+                    "name": name,
+                })
+                break
+
+    print(f"[sofascore] tid={tid}: "
+          f"{len(matched)} seasons matched: "
+          f"{[s['name'] for s in matched]}")
+    return matched
 
 
 # ═══════════════════════════════════════════
@@ -144,12 +176,18 @@ def _safe(val) -> float | None:
         return None
 
 
-def _get_seasons(league: str) -> list[str]:
-    return MLS_SEASONS if league == "USA-MLS" else SEASONS
+def _season_label(
+    league: str,
+    year: int,
+    name: str,
+) -> str:
+    if league == "USA-MLS":
+        return str(year)
+    return f"{year}-{year + 1}"
 
 
-def _upsert_team(db, team, league, season, attrs):
-    """Upsert team stats. Never overwrites with None."""
+def _upsert_team(
+    db, team, league, season, attrs):
     existing = (
         db.query(TeamSeasonStats)
         .filter(and_(
@@ -160,15 +198,16 @@ def _upsert_team(db, team, league, season, attrs):
     )
     if existing is None:
         existing = TeamSeasonStats(
-            team=team, league=league, season=season)
+            team=team, league=league,
+            season=season)
         db.add(existing)
     for k, v in attrs.items():
         if v is not None:
             setattr(existing, k, v)
 
 
-def _upsert_player(db, player, team, league, season, attrs):
-    """Upsert player stats. Never overwrites with None."""
+def _upsert_player(
+    db, player, team, league, season, attrs):
     existing = (
         db.query(PlayerSeasonStats)
         .filter(and_(
@@ -188,537 +227,164 @@ def _upsert_player(db, player, team, league, season, attrs):
             setattr(existing, k, v)
 
 
-def _get_scraper(league: str, season: str):
-    """Create Sofascore scraper with warnings suppressed."""
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return sd.Sofascore(
-            leagues=[league],
-            seasons=[season],
-        )
-
-
-def _find_col(df: pd.DataFrame,
-              candidates: list[str]) -> str | None:
-    """Find first matching column name."""
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-
-def _series_sum(group: pd.DataFrame,
-                candidates: list[str]) -> float | None:
-    """Sum the first matching column across all rows."""
-    col = _find_col(group, candidates)
-    if col is None:
-        return None
-    s = pd.to_numeric(group[col], errors="coerce")
-    total = s.sum()
-    return float(total) if pd.notna(total) else None
-
-
-def _series_mean(group: pd.DataFrame,
-                 candidates: list[str]) -> float | None:
-    """Average the first matching column across all rows."""
-    col = _find_col(group, candidates)
-    if col is None:
-        return None
-    s = pd.to_numeric(group[col], errors="coerce")
-    mean = s.mean()
-    return float(mean) if pd.notna(mean) else None
-
-
-def _group_games(group: pd.DataFrame) -> int:
-    """Games covered by a team group.
-
-    Season-aggregate rows carry a games/matches column; match-level
-    sources produce one row per game, so the row count is the fallback.
-    """
-    col = _find_col(group, ["games", "matches", "matches_played", "MP"])
-    if col is not None:
-        vals = pd.to_numeric(group[col], errors="coerce").dropna()
-        vals = vals[vals > 0]
-        if len(vals):
-            return int(round(float(vals.mean())))
-    return len(group)
-
-
-# ═══════════════════════════════════════════
-# SOFASCORE API READERS
-# ═══════════════════════════════════════════
-#
-# sd.Sofascore has no read_team_match_stats / read_player_season_stats
-# (those exist on the FBref/Understat readers), so team season totals
-# and per-player match stats are read from the Sofascore statistics API
-# and returned as DataFrames in the column layout the extractors below
-# expect.
-
-def _api_get(scraper, path: str, cache_name: str,
-             max_age: int | None = None) -> dict:
-    """GET one Sofascore API path through soccerdata's cached session."""
-    filepath = scraper.data_dir / "matches" / cache_name
-    filepath.parent.mkdir(parents=True, exist_ok=True)
-    reader = scraper.get(SOFASCORE_API + path, filepath, max_age=max_age)
-    return json.load(reader)
-
-
-def _resolve_season_ids(scraper):
-    """(league_id, season_id, league_key, season_key) for the selection."""
-    try:
-        seasons = scraper.read_seasons()
-    except Exception as exc:
-        print(f"[sofascore] WARNING: cannot resolve seasons: {exc}")
-        return None
-    if seasons is None or seasons.empty:
-        print(f"[sofascore] WARNING: no season entry for "
-              f"{scraper.leagues} {scraper.seasons}")
-        return None
-    row = seasons.reset_index().iloc[0]
-    return (
-        int(row["league_id"]),
-        int(row["season_id"]),
-        row["league"],
-        row["season"],
-    )
-
-
-def _max_age_for(scraper, league_key, season_key) -> int | None:
-    """Cache completed seasons forever, refresh current ones daily."""
-    try:
-        complete = scraper._is_complete(league_key, season_key)
-    except Exception:
-        complete = False
-    return None if complete else 1
-
-
-# Sofa labels positions G/D/M/F; the prediction engine matches the
-# FBref codes (formula_engine._position_groups), like
-# api_football_collector does.
-_POSITION_MAP = {
-    "G": "GK", "D": "DF", "M": "MF", "F": "FW",
-    "GK": "GK", "DF": "DF", "MF": "MF", "FW": "FW",
-}
-
-
-def _norm_position(value) -> str | None:
-    """FBref-style position code for a Sofascore position label."""
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    raw = str(value).strip()
-    if not raw or raw.lower() == "nan":
-        return None
-    return _POSITION_MAP.get(raw.upper(), raw)
-
-
-def _read_team_season_stats(scraper) -> pd.DataFrame:
-    """
-    Fetch team season totals from the Sofascore statistics API.
-
-    Returns one row per team with the column names _extract_team_attrs
-    looks for (xg, shots, shots_on_target, ...). Empty when the league
-    or season cannot be resolved.
-    """
-    resolved = _resolve_season_ids(scraper)
-    if resolved is None:
-        return pd.DataFrame()
-    league_id, season_id, league_key, season_key = resolved
-    max_age = _max_age_for(scraper, league_key, season_key)
-
-    teams: list[tuple[int, str]] = []
-    try:
-        standings = _api_get(
-            scraper,
-            f"unique-tournament/{league_id}/season/{season_id}"
-            f"/standings/total",
-            f"standings_{league_id}_{season_id}.json",
-            max_age=max_age,
-        )
-        for group in standings.get("standings") or []:
-            for row in group.get("rows") or []:
-                team = row.get("team") or {}
-                tid, name = team.get("id"), team.get("name")
-                if tid and name:
-                    teams.append((int(tid), str(name)))
-    except Exception as exc:
-        print(f"[sofascore] WARNING: no standings for "
-              f"{league_key} {season_key}: {exc}")
-        return pd.DataFrame()
-
-    rows = []
-    for team_id, name in teams:
-        try:
-            payload = _api_get(
-                scraper,
-                f"team/{team_id}/unique-tournament/{league_id}"
-                f"/season/{season_id}/statistics/overall",
-                f"team_stats_{team_id}_{league_id}_{season_id}.json",
-                max_age=max_age,
-            )
-        except Exception as exc:
-            print(f"[sofascore] WARNING: no stats for {name}: {exc}")
-            continue
-        stats = (payload or {}).get("statistics") or {}
-        if not stats:
-            continue
-        rows.append({
-            "team": TEAMNAME_REPLACEMENTS.get(name, name),
-            "games": _safe(stats.get("matches")),
-            "xg": _safe(stats.get("expectedGoals")),
-            "shots": _safe(stats.get("shots")),
-            "shots_on_target": _safe(stats.get("shotsOnTarget")),
-            "goals": _safe(stats.get("goalsScored")),
-            "possession": _safe(stats.get("averageBallPossession")),
-            "goals_conceded": _safe(stats.get("goalsConceded")),
-            "saves": _safe(stats.get("saves")),
-            "xa": _safe(stats.get("expectedAssists")),
-            "big_chances_created": _safe(stats.get("bigChancesCreated")),
-            "tackles": _safe(stats.get("tackles")),
-            "interceptions": _safe(stats.get("interceptions")),
-            "fouls": _safe(stats.get("fouls")),
-            "yellow_cards": _safe(stats.get("yellowCards")),
-            "passes": _safe(stats.get("totalPasses")),
-        })
-    return pd.DataFrame(rows)
-
-
-def _accumulate_player(rec: dict, stats: dict,
-                       field: str, *candidates: str) -> None:
-    """Add the first available Sofascore stat to a per-player total."""
-    for key in candidates:
-        if key in stats:
-            value = _safe(stats[key])
-            if value is not None:
-                rec[field] = (rec[field] or 0.0) + value
-            return
-
-
-def _read_player_season_stats(scraper) -> pd.DataFrame:
-    """
-    Aggregate player season stats from per-match lineup data.
-
-    Returns one row per player/team with the column names
-    _extract_player_attrs looks for. The Sofascore lineups endpoint
-    carries each player's match statistics (minutesPlayed, goals,
-    goalAssist, totalShots, ...).
-    """
-    resolved = _resolve_season_ids(scraper)
-    if resolved is None:
-        return pd.DataFrame()
-    _, _, league_key, season_key = resolved
-    max_age = _max_age_for(scraper, league_key, season_key)
-
-    try:
-        schedule = scraper.read_schedule().reset_index()
-    except Exception as exc:
-        print(f"[sofascore] WARNING: no schedule for "
-              f"{league_key} {season_key}: {exc}")
-        return pd.DataFrame()
-    if schedule.empty:
-        return pd.DataFrame()
-
-    players: dict[tuple[str, str], dict] = {}
-    for _, match in schedule.iterrows():
-        game_id = match.get("game_id")
-        if game_id is None or (isinstance(game_id, float)
-                               and math.isnan(game_id)):
-            continue
-        # Unplayed fixtures have no lineups yet — skip instead of
-        # burning a 404 per future match.
-        if pd.isna(match.get("home_score")):
-            continue
-        try:
-            lineups = _api_get(
-                scraper,
-                f"event/{int(game_id)}/lineups",
-                f"lineups_{int(game_id)}.json",
-                max_age=max_age,
-            )
-        except Exception as exc:
-            print(f"[sofascore] WARNING: no lineups for "
-                  f"game {game_id}: {exc}")
-            continue
-
-        for side, team in (("home", match.get("home_team")),
-                           ("away", match.get("away_team"))):
-            if not isinstance(team, str) or not team.strip():
-                continue
-            for entry in (lineups.get(side) or {}).get("players") or []:
-                stats = entry.get("statistics") or {}
-                if not stats:
-                    continue  # unused substitute
-                person = entry.get("player") or {}
-                name = person.get("name")
-                if not isinstance(name, str) or not name.strip():
-                    continue
-                rec = players.setdefault((name, team), {
-                    "position": None,
-                    "appearances": 0,
-                    "minutes": None,
-                    "goals": None,
-                    "assists": None,
-                    "xg": None,
-                    "xa": None,
-                    "shots": None,
-                    "shots_on_target": None,
-                    "tackles": None,
-                    "interceptions": None,
-                    "yellow_cards": None,
-                    "red_cards": None,
-                })
-                rec["appearances"] += 1
-                if rec["position"] is None:
-                    rec["position"] = _norm_position(
-                        entry.get("position")
-                        or person.get("position"))
-                _accumulate_player(rec, stats,
-                                   "minutes", "minutesPlayed",
-                                   "minutes")
-                _accumulate_player(rec, stats,
-                                   "goals", "goals")
-                _accumulate_player(rec, stats,
-                                   "assists", "goalAssist",
-                                   "assists")
-                _accumulate_player(rec, stats,
-                                   "xg", "expectedGoals", "xg")
-                _accumulate_player(rec, stats,
-                                   "xa", "expectedAssists", "xa")
-                _accumulate_player(rec, stats,
-                                   "shots", "totalShots", "shots")
-                _accumulate_player(rec, stats,
-                                   "shots_on_target", "shotsOnGoal",
-                                   "shotsOnTarget")
-                _accumulate_player(rec, stats,
-                                   "tackles", "tackles")
-                _accumulate_player(rec, stats,
-                                   "interceptions", "interceptions")
-                _accumulate_player(rec, stats,
-                                   "yellow_cards", "yellowCards")
-                _accumulate_player(rec, stats,
-                                   "red_cards", "redCards")
-
-    rows = []
-    for (name, team), rec in players.items():
-        row = {"player": name, "team": team}
-        row.update(rec)
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
 # ═══════════════════════════════════════════
 # TEAM STATS
 # ═══════════════════════════════════════════
 
-def _extract_team_attrs(
-    group: pd.DataFrame,
-    games: int,
-) -> dict:
-    """
-    Extract all team stats from the rows of one team.
 
-    Works on match-level rows (aggregated here) and on single
-    season-aggregate rows alike: totals are summed, percentages
-    averaged, then per-game values are derived.
-    """
+def _parse_team_stats(entry: dict, games: int) -> dict:
+    s = entry.get("statistics", {})
     attrs = {}
+    games = int(s.get("matches", games) or games)
 
-    # xG
-    xg = _series_sum(group, ["xg", "xG",
-        "expected_goals", "team_xg"])
+    xg = _safe(s.get("expectedGoals"))
     if xg is not None:
         attrs["sh_xg"] = round(xg, 3)
 
-    # Shots
-    shots = _series_sum(group, ["shots",
-        "total_shots", "shots_total",
-        "shots_attempted"])
+    goals = _safe(s.get("goals"))
+    if goals is not None:
+        attrs["sh_goals"] = round(goals, 1)
+
+    shots = _safe(s.get("shots") or s.get("totalShots"))
     if shots is not None:
         attrs["sh_shots"] = round(shots, 1)
         if games > 0:
-            attrs["sh_sh_per90"] = round(
-                shots / games, 2)
+            attrs["sh_sh_per90"] = round(shots / games, 2)
 
-    # Shots on target
-    sot = _series_sum(group, ["shots_on_target",
-        "on_target", "shotsOnTarget",
-        "shots_on_goal"])
+    sot = _safe(s.get("shotsOnTarget") or
+                s.get("onTargetScoringAttempt"))
     if sot is not None:
         attrs["sh_sot"] = round(sot, 1)
         if games > 0:
-            attrs["sh_sot_per90"] = round(
-                sot / games, 2)
+            attrs["sh_sot_per90"] = round(sot / games, 2)
 
-    # Goals scored
-    goals = _series_sum(group, ["goals",
-        "goals_scored", "score"])
-    if goals is not None:
-        attrs["sh_goals"] = round(goals, 1)
-        if shots and shots > 0:
-            attrs["sh_g_per_sh"] = round(
-                goals / shots, 3)
+    if goals and shots and shots > 0:
+        attrs["sh_g_per_sh"] = round(goals / shots, 3)
 
-    # Possession (average %)
-    poss = _series_mean(group, ["possession",
-        "ball_possession", "ballPossession"])
+    poss = _safe(s.get("possession") or
+                 s.get("ballPossession"))
     if poss is not None:
         attrs["pos_poss"] = round(poss, 1)
 
-    # Goals against
-    ga = _series_sum(group, ["goals_conceded",
-        "goals_against", "opponent_score"])
+    ga = _safe(s.get("goalsConceded") or
+               s.get("goalsAgainst"))
     if ga is not None:
         attrs["gk_ga"] = round(ga, 1)
         if games > 0:
-            attrs["gk_ga90"] = round(
-                ga / games, 2)
+            attrs["gk_ga90"] = round(ga / games, 2)
 
-    # Saves
-    saves = _series_sum(group, ["saves",
-        "goalkeeper_saves", "keeper_saves"])
+    saves = _safe(s.get("saves"))
     if saves is not None:
         attrs["gk_saves"] = round(saves, 1)
-        if ga is not None:
-            sot_against = ga + saves
-            if sot_against > 0:
-                attrs["gk_save_pct"] = round(
-                    saves / sot_against * 100, 1)
+        if ga is not None and (ga + saves) > 0:
+            attrs["gk_save_pct"] = round(
+                saves / (ga + saves) * 100, 1)
 
-    # NOTE: corners are deliberately not stored. team_season_stats has
-    # no corners column — pos_cpa is FBref "Carries into pen area" (see
-    # fbref_team_collector) and the corner markets are computed from the
-    # matches table in features/builder.
+    cs = _safe(s.get("cleanSheets") or
+               s.get("cleanSheet"))
+    if cs is not None:
+        attrs["gk_cs"] = round(cs, 1)
+        if games > 0:
+            attrs["gk_cs_pct"] = round(
+                cs / games * 100, 1)
 
-    # xA — stored in ps_xa (xA). ps_xag holds FBref's different xAG
-    # metric; see fbref_team_collector's column map.
-    xa = _series_sum(group, ["xa", "xA",
-        "expected_assists"])
+    xa = _safe(s.get("expectedAssists") or s.get("xA"))
     if xa is not None:
         attrs["ps_xa"] = round(xa, 3)
 
-    # Big chances created (proxy for GCA)
-    bcc = _series_sum(group, ["big_chances_created",
-        "bigChancesCreated", "big_chances"])
+    bcc = _safe(s.get("bigChancesCreated") or
+                s.get("bigChances"))
     if bcc is not None:
         attrs["gsc_gca"] = round(bcc, 1)
         if games > 0:
-            attrs["gsc_gca90"] = round(
-                bcc / games, 2)
+            attrs["gsc_gca90"] = round(bcc / games, 2)
 
-    # Tackles
-    tackles = _series_sum(group, ["tackles",
-        "tackles_won", "tacklesWon"])
+    tackles = _safe(s.get("tackles") or
+                    s.get("tacklesWon"))
     if tackles is not None:
         attrs["def_tkl"] = round(tackles, 1)
 
-    # Interceptions
-    ints = _series_sum(group, ["interceptions",
-        "interceptions_won"])
+    ints = _safe(s.get("interceptions"))
     if ints is not None:
         attrs["def_int"] = round(ints, 1)
         if tackles is not None:
             attrs["def_tkl_int"] = round(
                 tackles + ints, 1)
 
-    # Fouls
-    fouls = _series_sum(group, ["fouls",
-        "fouls_committed"])
-    if fouls is not None:
-        attrs["misc_fls"] = round(fouls, 1)
-
-    # Yellow cards
-    yellows = _series_sum(group, ["yellow_cards",
-        "yellowCards"])
+    yellows = _safe(s.get("yellowCards"))
     if yellows is not None:
         attrs["misc_crdy"] = round(yellows, 1)
 
-    # Passes
-    passes = _series_sum(group, ["passes",
-        "total_passes", "accurate_passes"])
+    reds = _safe(s.get("redCards"))
+    if reds is not None:
+        attrs["misc_crdr"] = round(reds, 1)
+
+    passes = _safe(s.get("accuratePasses") or
+                   s.get("totalPasses"))
     if passes is not None:
-        attrs["ps_att"] = round(passes, 1)
+        attrs["ps_cmp"] = round(passes, 1)
+
+    pass_pct = _safe(s.get("accuratePassesPercentage"))
+    if pass_pct is not None:
+        attrs["ps_cmp_pct"] = round(pass_pct, 1)
+
+    fouls = _safe(s.get("fouls") or
+                  s.get("foulsCommitted"))
+    if fouls is not None:
+        attrs["misc_fls"] = round(fouls, 1)
 
     return attrs
 
 
-def collect_team_stats() -> int:
-    """
-    Fetch team season stats from Sofascore.
-    Returns total rows upserted.
-    """
-    print("[sofascore] Collecting team stats...")
+def collect_team_stats(
+    session, league, tid, sid, season_label
+) -> int:
+    url  = (f"{BASE_URL}/unique-tournament/{tid}"
+            f"/season/{sid}/statistics/overall")
+    data = _get(session, url)
+    time.sleep(REQUEST_DELAY)
+
+    if not data:
+        return 0
+
+    results = data.get("results", [])
+    if not results:
+        print(f"[sofascore] No team results for "
+              f"{league} {season_label}")
+        return 0
+
+    print(f"[sofascore] {league} {season_label}: "
+          f"{len(results)} teams")
+
+    db    = SessionLocal()
     total = 0
-
-    for league in LEAGUES:
-        for season in _get_seasons(league):
-            print(f"[sofascore] Team: "
-                  f"{league} {season}...")
-            try:
-                scraper = _get_scraper(league, season)
-                df = _read_team_season_stats(scraper)
-
-                if df is None or df.empty:
-                    print(f"[sofascore] WARNING: "
-                          f"no team data for "
-                          f"{league} {season}")
-                    continue
-
-                # Reset index if multi-index
-                if isinstance(df.index,
-                              pd.MultiIndex):
-                    df = df.reset_index()
-
-                # Find team column
-                team_col = _find_col(df, [
-                    "team", "Team", "team_name"])
-                if team_col is None:
-                    print(f"[sofascore] WARNING: "
-                          f"no team column. "
-                          f"Cols: {list(df.columns)}")
-                    continue
-
-                db = SessionLocal()
-                try:
-                    for team_name, group in (
-                            df.groupby(team_col)):
-                        if not isinstance(
-                                team_name, str):
-                            continue
-                        games = _group_games(group)
-                        attrs = _extract_team_attrs(
-                            group, games)
-                        if attrs:
-                            _upsert_team(
-                                db, team_name,
-                                league, season,
-                                attrs)
-                            total += 1
-
-                    db.commit()
-                    print(f"[sofascore] "
-                          f"{league} {season}: "
-                          f"committed")
-
-                except Exception as exc:
-                    db.rollback()
-                    print(f"[sofascore] ERROR "
-                          f"commit {league} "
-                          f"{season}: {exc}")
-                    raise
-                finally:
-                    db.close()
-
-            except Exception as exc:
-                print(f"[sofascore] ERROR "
-                      f"{league} {season}: {exc}")
+    try:
+        for entry in results:
+            team_name = entry.get(
+                "team", {}).get("name", "")
+            if not team_name:
                 continue
+            games = int(
+                entry.get("statistics", {})
+                     .get("matches", 0) or 0)
+            attrs = _parse_team_stats(entry, games)
+            if attrs:
+                _upsert_team(
+                    db, team_name,
+                    league, season_label, attrs)
+                total += 1
+        db.commit()
+        print(f"[sofascore] Committed {total} "
+              f"team rows for "
+              f"{league} {season_label}")
+    except Exception as exc:
+        db.rollback()
+        print(f"[sofascore] ERROR team commit "
+              f"{league} {season_label}: {exc}")
+        raise
+    finally:
+        db.close()
 
-    print(f"[sofascore] Team stats done. "
-          f"Total: {total}")
     return total
 
 
@@ -726,215 +392,173 @@ def collect_team_stats() -> int:
 # PLAYER STATS
 # ═══════════════════════════════════════════
 
-def _extract_player_attrs(row: pd.Series) -> dict:
-    """Extract player stats from one row."""
-    attrs = {}
+POSITION_MAP = {
+    "G": "GK", "GK": "GK",
+    "D": "DF", "DF": "DF",
+    "M": "MF", "MF": "MF",
+    "F": "FW", "FW": "FW",
+    "A": "FW",
+}
 
-    def get(*candidates):
-        for c in candidates:
-            if c in row.index:
-                v = _safe(row[c])
-                if v is not None:
-                    return v
+
+def _parse_player(entry: dict):
+    player_info = entry.get("player", {})
+    team_info   = entry.get("team",   {})
+    s           = entry.get("statistics", {})
+
+    player_name = player_info.get("name", "")
+    team_name   = team_info.get("name",   "")
+    if not player_name or not team_name:
         return None
 
-    # Goals
-    goals = get("goals", "Goals", "goals_scored")
-    if goals is not None:
-        attrs["goals"] = goals
+    pos_raw  = player_info.get("position", "")
+    position = POSITION_MAP.get(
+        str(pos_raw).upper(), pos_raw or None)
 
-    # Assists
-    assists = get("assists", "Assists")
-    if assists is not None:
-        attrs["assists"] = assists
+    attrs = {}
+
+    goals   = _safe(s.get("goals"))
+    assists = _safe(s.get("assists") or
+                    s.get("goalAssist"))
+    xg      = _safe(s.get("expectedGoals") or
+                    s.get("xG"))
+    xa      = _safe(s.get("expectedAssists") or
+                    s.get("xA"))
+    mins    = _safe(s.get("minutesPlayed") or
+                    s.get("minutes"))
+
+    if goals   is not None: attrs["goals"]   = goals
+    if assists is not None: attrs["assists"]  = assists
+    if xg      is not None: attrs["xg"]      = xg
+    if xa      is not None: attrs["xag"]     = xa
+
     if goals is not None and assists is not None:
         attrs["g_plus_a"] = goals + assists
 
-    # xG
-    xg = get("xg", "xG", "expected_goals",
-             "player_xg")
-    if xg is not None:
-        attrs["xg"] = xg
-
-    # xA — xag is the only xA-family column on
-    # PlayerSeasonStats.
-    xa = get("xa", "xA", "expected_assists")
-    if xa is not None:
-        attrs["xag"] = xa
-
-    # Minutes
-    mins = get("minutes_played", "minutesPlayed",
-               "minutes", "time_played")
     if mins is not None:
         attrs["minutes"] = mins
-        per90 = mins / 90 if mins > 0 else 1
-        attrs["minutes_per90"] = round(per90, 2)
-        if goals is not None:
-            attrs["gls_per90"] = round(
-                goals / per90, 3)
-        if assists is not None:
-            attrs["ast_per90"] = round(
-                assists / per90, 3)
+        if mins > 0:
+            per90 = mins / 90
+            attrs["minutes_per90"] = round(per90, 2)
+            if goals   is not None:
+                attrs["gls_per90"] = round(
+                    goals / per90, 3)
+            if assists is not None:
+                attrs["ast_per90"] = round(
+                    assists / per90, 3)
+            if goals is not None and assists is not None:
+                attrs["g_plus_a_per90"] = round(
+                    (goals + assists) / per90, 3)
 
-    # Appearances
-    apps = get("appearances", "matches_played",
-               "games_played")
+    apps = _safe(s.get("appearances") or
+                 s.get("matches"))
     if apps is not None:
         attrs["mp"] = int(apps)
 
-    # Shots
-    shots = get("shots", "total_shots",
-                "shots_total")
+    shots = _safe(s.get("totalShots") or
+                  s.get("shots"))
     if shots is not None:
         attrs["sh_shots"] = shots
-        if goals is not None and shots > 0:
-            attrs["sh_g_per_sh"] = round(
-                goals / shots, 3)
 
-    # Shots on target
-    sot = get("shots_on_target", "on_target",
-              "shotsOnTarget")
+    sot = _safe(s.get("shotsOnTarget"))
     if sot is not None:
         attrs["sh_sot"] = sot
         if shots and shots > 0:
             attrs["sh_sot_pct"] = round(
                 sot / shots * 100, 1)
 
-    # Tackles
-    tackles = get("tackles", "tackles_won")
+    yellows = _safe(s.get("yellowCards"))
+    if yellows is not None:
+        attrs["crdy"] = yellows
+
+    reds = _safe(s.get("redCards"))
+    if reds is not None:
+        attrs["crdr"] = reds
+
+    tackles = _safe(s.get("tackles") or
+                    s.get("tacklesWon"))
     if tackles is not None:
         attrs["tkl"] = tackles
 
-    # Interceptions
-    ints = get("interceptions")
+    ints = _safe(s.get("interceptions"))
     if ints is not None:
         attrs["int_"] = ints
         if tackles is not None:
             attrs["tkl_plus_int"] = tackles + ints
 
-    # Yellow cards
-    yellows = get("yellow_cards", "yellowCards")
-    if yellows is not None:
-        attrs["crdy"] = yellows
-
-    # Red cards
-    reds = get("red_cards", "redCards")
-    if reds is not None:
-        attrs["crdr"] = reds
-
-    # NOTE: the Sofascore rating (1-10) is deliberately not stored.
-    # PlayerSeasonStats has no rating column and parking it in
-    # sh_g_per_sh (goals per shot) would corrupt that metric.
-
-    return attrs
+    return player_name, team_name, position, attrs
 
 
-def collect_player_stats() -> int:
-    """
-    Fetch player season stats from Sofascore.
-    Returns total rows upserted.
-    """
-    print("[sofascore] Collecting player stats...")
+def collect_player_stats(
+    session, league, tid, sid, season_label
+) -> int:
     total = 0
+    db    = SessionLocal()
+    seen  = set()
 
-    for league in LEAGUES:
-        # Latest season only for players
-        # to save time
-        season = _get_seasons(league)[-1]
-        print(f"[sofascore] Players: "
-              f"{league} {season}...")
-        try:
-            scraper = _get_scraper(league, season)
-            df = _read_player_season_stats(scraper)
+    try:
+        for page in range(0, 5):
+            url  = (
+                f"{BASE_URL}/unique-tournament/{tid}"
+                f"/season/{sid}/top-players/overall"
+            )
+            data = _get(session, url,
+                        params={"page": page})
+            time.sleep(REQUEST_DELAY)
 
-            if df is None or df.empty:
-                print(f"[sofascore] WARNING: "
-                      f"no player data for "
-                      f"{league} {season}")
-                continue
+            if not data:
+                break
 
-            # Reset multi-index if present
-            if isinstance(df.index, pd.MultiIndex):
-                df = df.reset_index()
+            top = data.get("topPlayers", {})
+            if not top:
+                break
 
-            print(f"[sofascore] Got {len(df)} "
-                  f"player rows")
-            print(f"[sofascore] Columns: "
-                  f"{list(df.columns)[:8]}...")
+            entries = []
+            for category, plist in top.items():
+                for entry in (plist or []):
+                    pid = (entry.get("player", {})
+                               .get("id"))
+                    if pid and pid not in seen:
+                        seen.add(pid)
+                        entries.append(entry)
 
-            # Find key columns
-            player_col = _find_col(df, [
-                "player", "player_name", "Player",
-                "name"])
-            team_col   = _find_col(df, [
-                "team", "Team", "team_name",
-                "club"])
-            pos_col    = _find_col(df, [
-                "position", "pos", "Position"])
+            if not entries:
+                break
 
-            if player_col is None:
-                print(f"[sofascore] WARNING: "
-                      f"no player column. "
-                      f"Cols: {list(df.columns)}")
-                continue
+            print(f"[sofascore] {league} "
+                  f"{season_label} page {page}: "
+                  f"{len(entries)} players")
 
-            db = SessionLocal()
-            try:
-                for _, row in df.iterrows():
-                    player_name = row.get(
-                        player_col)
-                    team_name   = row.get(
-                        team_col, "Unknown")
-                    position    = row.get(pos_col)
+            for entry in entries:
+                result = _parse_player(entry)
+                if result is None:
+                    continue
+                pname, tname, pos, attrs = result
+                if not attrs:
+                    continue
 
-                    if not isinstance(
-                            player_name, str):
-                        continue
-                    if not player_name.strip():
-                        continue
-                    if not isinstance(team_name, str) \
-                            or not team_name.strip():
-                        team_name = "Unknown"
+                if pos:
+                    attrs["position"] = pos
 
-                    attrs = _extract_player_attrs(
-                        row)
-                    if position is not None \
-                            and pd.notna(position) \
-                            and str(position).strip():
-                        attrs["position"] = str(
-                            position)
+                _upsert_player(
+                    db, pname, tname,
+                    league, season_label, attrs)
+                total += 1
 
-                    if attrs:
-                        _upsert_player(
-                            db,
-                            player_name,
-                            str(team_name),
-                            league,
-                            season,
-                            attrs,
-                        )
-                        total += 1
+            db.commit()
+            if len(entries) < 20:
+                break
 
-                db.commit()
-                print(f"[sofascore] {league} "
-                      f"{season}: "
-                      f"{total} players so far")
+    except Exception as exc:
+        db.rollback()
+        print(f"[sofascore] ERROR players "
+              f"{league} {season_label}: {exc}")
+        raise
+    finally:
+        db.close()
 
-            except Exception as exc:
-                db.rollback()
-                print(f"[sofascore] ERROR "
-                      f"players {league}: {exc}")
-                raise
-            finally:
-                db.close()
-
-        except Exception as exc:
-            print(f"[sofascore] ERROR players "
-                  f"{league} {season}: {exc}")
-            continue
-
-    print(f"[sofascore] Player stats done. "
-          f"Total: {total}")
+    print(f"[sofascore] {league} {season_label}: "
+          f"{total} players committed")
     return total
 
 
@@ -942,26 +566,96 @@ def collect_player_stats() -> int:
 # MAIN
 # ═══════════════════════════════════════════
 
-def collect_sofascore() -> None:
+
+def collect_sofascore() -> dict:
     """
-    Run all Sofascore collectors.
-    Primary data source for all advanced stats.
+    Primary data collection from Sofascore.
+    Exits with code 1 if zero rows collected
+    so GitHub Actions workflow can fall back
+    to Understat backup.
     """
     print("=" * 60)
     print("SOFASCORE — PRIMARY STATS COLLECTION")
     print("=" * 60)
 
-    print("\n--- TEAM STATS ---")
-    team_total = collect_team_stats()
+    session, using_cffi = _get_client()
+    if not using_cffi:
+        print("[sofascore] WARNING: install "
+              "curl_cffi for better results: "
+              "pip install curl_cffi")
 
-    print("\n--- PLAYER STATS ---")
-    player_total = collect_player_stats()
+    team_total   = 0
+    player_total = 0
+    failed       = []
+
+    for league, config in LEAGUE_CONFIG.items():
+        tid         = config["tid"]
+        is_mls      = league == "USA-MLS"
+        target_yrs  = (MLS_TARGET_SEASONS
+                       if is_mls else TARGET_SEASONS)
+
+        print(f"\n[sofascore] === {league} ===")
+
+        seasons = get_seasons(
+            session, tid, target_yrs)
+        if not seasons:
+            print(f"[sofascore] WARNING: no "
+                  f"seasons for {league}")
+            failed.append(league)
+            continue
+
+        for si in seasons:
+            sid   = si["sid"]
+            year  = si["year"]
+            label = _season_label(
+                league, year, si["name"])
+
+            print(f"[sofascore] {league} "
+                  f"{label} (sid={sid})...")
+
+            try:
+                n = collect_team_stats(
+                    session, league,
+                    tid, sid, label)
+                team_total += n
+            except Exception as exc:
+                print(f"[sofascore] team error "
+                      f"{league} {label}: {exc}")
+                failed.append(
+                    f"{league}/{label}/team")
+
+            if year == max(target_yrs):
+                try:
+                    n = collect_player_stats(
+                        session, league,
+                        tid, sid, label)
+                    player_total += n
+                except Exception as exc:
+                    print(
+                        f"[sofascore] player "
+                        f"error {league} "
+                        f"{label}: {exc}")
+                    failed.append(
+                        f"{league}/{label}/players")
 
     print("\n" + "=" * 60)
     print("SOFASCORE COLLECTION COMPLETE")
     print("=" * 60)
-    print(f"Team rows updated  : {team_total}")
-    print(f"Player rows updated: {player_total}")
+    print(f"Team rows   : {team_total}")
+    print(f"Player rows : {player_total}")
+    if failed:
+        print(f"Failed      : {failed}")
+
+    if team_total == 0 and player_total == 0:
+        print("\nERROR: Zero rows collected.")
+        print("Sofascore is blocking requests.")
+        sys.exit(1)
+
+    return {
+        "team_total":   team_total,
+        "player_total": player_total,
+        "failed":       failed,
+    }
 
 
 if __name__ == "__main__":
