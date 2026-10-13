@@ -57,6 +57,31 @@ LEAGUE_CONFIG = {
     "UEFA-Champions League": {"tid": 7},
 }
 
+# Real Sofascore league page URLs. Navigating here makes
+# the page's own JS fire the API calls we intercept.
+LEAGUE_PAGE_URLS = {
+    "ENG-Premier League":
+        "https://www.sofascore.com/tournament/football/england/premier-league/17",
+    "ENG-Championship":
+        "https://www.sofascore.com/tournament/football/england/championship/18",
+    "ESP-La Liga":
+        "https://www.sofascore.com/tournament/football/spain/laliga/8",
+    "GER-Bundesliga":
+        "https://www.sofascore.com/tournament/football/germany/bundesliga/35",
+    "ITA-Serie A":
+        "https://www.sofascore.com/tournament/football/italy/serie-a/23",
+    "FRA-Ligue 1":
+        "https://www.sofascore.com/tournament/football/france/ligue-1/34",
+    "POR-Primeira Liga":
+        "https://www.sofascore.com/tournament/football/portugal/liga-portugal/238",
+    "NED-Eredivisie":
+        "https://www.sofascore.com/tournament/football/netherlands/eredivisie/37",
+    "USA-MLS":
+        "https://www.sofascore.com/tournament/football/usa/mls/242",
+    "UEFA-Champions League":
+        "https://www.sofascore.com/tournament/football/europe/uefa-champions-league/7",
+}
+
 TARGET_SEASONS     = [2025, 2026]
 MLS_TARGET_SEASONS = [2025, 2026]
 REQUEST_DELAY      = 2.0
@@ -158,11 +183,22 @@ class _PatchrightClient:
             self._page.goto(
                 "https://www.sofascore.com/",
                 timeout=60000,
-                wait_until="domcontentloaded",
+                wait_until="networkidle",
             )
             time.sleep(5)
+            # Dismiss any cookie consent popup
+            try:
+                self._page.click(
+                    "button:has-text('Accept')",
+                    timeout=3000)
+                time.sleep(1)
+            except Exception:
+                pass
             print("[sofascore] Browser ready "
-                  "with real session")
+                  "with real session. "
+                  f"Intercepted "
+                  f"{len(self._intercepted)} "
+                  "initial API calls.")
         except Exception as exc:
             print(f"[sofascore] WARNING: "
                   f"homepage: {exc}")
@@ -185,22 +221,48 @@ class _PatchrightClient:
             pass
 
     def _navigate_to_league_page(
-        self, tid: int) -> None:
+            self, tid: int) -> None:
         """
-        Navigate to a Sofascore league page.
-        The page will automatically fetch
-        season and stats data from the API
-        which we capture via interception.
+        Navigate to the real Sofascore league page.
+        The page JS automatically fetches season
+        and stats data which we intercept.
         """
-        url = (f"https://www.sofascore.com/"
-               f"football/?tid={tid}")
+        # Find the real URL for this tid
+        page_url = None
+        for league, config in LEAGUE_CONFIG.items():
+            if config["tid"] == tid:
+                page_url = LEAGUE_PAGE_URLS.get(
+                    league)
+                break
+
+        if not page_url:
+            page_url = (
+                f"https://www.sofascore.com"
+                f"/tournament/football/x/x/{tid}"
+            )
+
+        print(f"[sofascore] Navigating to "
+              f"{page_url}...")
         try:
+            before = len(self._intercepted)
             self._page.goto(
-                url,
-                timeout=30000,
+                page_url,
+                timeout=60000,
                 wait_until="networkidle",
             )
-            time.sleep(3)
+            # Wait extra time for background
+            # API calls to complete
+            time.sleep(5)
+            # Explicit wait: poll up to 10s for
+            # any new API response to be captured
+            deadline = time.time() + 10
+            while (len(self._intercepted) == before
+                   and time.time() < deadline):
+                time.sleep(0.5)
+            print(f"[sofascore] Page loaded. "
+                  f"Intercepted "
+                  f"{len(self._intercepted)} "
+                  f"API responses so far.")
         except Exception as exc:
             print(f"[sofascore] WARNING: "
                   f"navigate tid={tid}: {exc}")
@@ -240,6 +302,17 @@ class _PatchrightClient:
         if tid_match:
             tid = int(tid_match.group(1))
             self._navigate_to_league_page(tid)
+
+        # Debug: show what we intercepted
+        tid_str = tid_match.group(1) if tid_match else "?"
+        relevant = [
+            u for u in self._intercepted
+            if tid_match and tid_str in u
+        ]
+        if relevant:
+            print(f"[sofascore] Intercepted "
+                  f"{len(relevant)} URLs for "
+                  f"tid={tid_str}")
 
         # Try direct fetch via page.evaluate
         # (runs inside the browser context with
