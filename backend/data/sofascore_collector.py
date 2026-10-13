@@ -99,74 +99,186 @@ def _get_client():
     return session, "requests"
 
 
+class _FakeResponse:
+    """Mimics requests.Response interface."""
+    def __init__(self, status_code: int,
+                 body: str):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        import json
+        return json.loads(self._body)
+
+
 class _PatchrightClient:
     """
-    Stealth browser client using patchright.
-    Opens one browser instance reused for
-    all requests to avoid overhead.
+    Stealth browser that intercepts background
+    API calls made by Sofascore pages.
+
+    Instead of calling api.sofascore.com directly
+    (which gets 403), we visit real Sofascore pages
+    and capture the API responses the page fetches
+    automatically in the background.
     """
 
     def __init__(self):
-        from patchright.sync_api import sync_playwright
+        from patchright.sync_api import (
+            sync_playwright)
         self._pw = sync_playwright().start()
-        try:
-            self._browser = self._pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features="
-                    "AutomationControlled",
-                ],
-            )
-            self._context = self._browser.new_context(
-                user_agent=HEADERS["User-Agent"],
-                extra_http_headers={
-                    "Referer": HEADERS["Referer"],
-                    "Accept-Language": HEADERS["Accept-Language"],
-                },
-            )
-            self._page = self._context.new_page()
-        except Exception:
-            self.close()
-            raise
+        self._browser = self._pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features="
+                "AutomationControlled",
+            ],
+        )
+        self._context = self._browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            extra_http_headers={
+                "Referer": HEADERS["Referer"],
+                "Accept-Language":
+                    HEADERS["Accept-Language"],
+            },
+            viewport={"width": 1280, "height": 720},
+        )
+        self._page = self._context.new_page()
+        self._intercepted: dict[str, str] = {}
 
-        # Visit homepage first to get cookies
+        # Set up network interception
+        # Capture all responses from api.sofascore.com
+        self._context.on(
+            "response", self._on_response)
+
+        # Visit homepage to get cookies and
+        # establish a real session
         try:
             self._page.goto(
-                "https://www.sofascore.com",
-                timeout=30000,
+                "https://www.sofascore.com/",
+                timeout=60000,
                 wait_until="domcontentloaded",
             )
-            time.sleep(3)
-            print("[sofascore] Browser "
-                  "initialised with cookies")
+            time.sleep(5)
+            print("[sofascore] Browser ready "
+                  "with real session")
         except Exception as exc:
             print(f"[sofascore] WARNING: "
-                  f"homepage visit failed: {exc}")
+                  f"homepage: {exc}")
 
-    def get(self, url: str,
-            params: dict = None,
-            timeout: int = 30,
-            **kwargs) -> "_FakeResponse":
-        """Fetch URL via stealth browser."""
-        if params:
-            qs = urlencode(params, doseq=True)
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}{qs}"
+    def _on_response(self, response) -> None:
+        """
+        Capture API responses as the page
+        fetches them in the background.
+        Store by URL for later retrieval.
+        """
+        url = response.url
+        if "api.sofascore.com/api/v1" not in url:
+            return
         try:
-            resp = self._page.goto(
+            if response.status == 200:
+                body = response.body()
+                self._intercepted[url] = (
+                    body.decode("utf-8"))
+        except Exception:
+            pass
+
+    def _navigate_to_league_page(
+        self, tid: int) -> None:
+        """
+        Navigate to a Sofascore league page.
+        The page will automatically fetch
+        season and stats data from the API
+        which we capture via interception.
+        """
+        url = (f"https://www.sofascore.com/"
+               f"football/?tid={tid}")
+        try:
+            self._page.goto(
                 url,
-                timeout=timeout * 1000,
+                timeout=30000,
                 wait_until="networkidle",
             )
-            body = self._page.inner_text("body")
-            status = resp.status if resp else 0
-            return _FakeResponse(status, body)
+            time.sleep(3)
         except Exception as exc:
-            print(f"[sofascore] Browser ERROR: "
-                  f"{exc}")
-            return _FakeResponse(0, "")
+            print(f"[sofascore] WARNING: "
+                  f"navigate tid={tid}: {exc}")
+
+    def get(
+        self,
+        url: str,
+        params: dict = None,
+        timeout: int = 30,
+        **kwargs,
+    ) -> "_FakeResponse":
+        """
+        Get an API URL by:
+        1. Checking if already intercepted
+        2. If not, triggering a page navigation
+           that causes the browser to fetch it
+        3. Waiting for interception
+        """
+        if params:
+            from urllib.parse import urlencode
+            qs = urlencode(params, doseq=True)
+            sep = "&" if "?" in url else "?"
+            full_url = f"{url}{sep}{qs}"
+        else:
+            full_url = url
+
+        # Check if already intercepted
+        if full_url in self._intercepted:
+            return _FakeResponse(
+                200, self._intercepted[full_url])
+
+        # Extract tournament ID from URL to
+        # navigate to the right league page
+        import re
+        tid_match = re.search(
+            r"/unique-tournament/(\d+)", url)
+        if tid_match:
+            tid = int(tid_match.group(1))
+            self._navigate_to_league_page(tid)
+
+        # Try direct fetch via page.evaluate
+        # (runs inside the browser context with
+        # real cookies and headers)
+        try:
+            result = self._page.evaluate(f"""
+                async () => {{
+                    const resp = await fetch(
+                        "{full_url}",
+                        {{
+                            headers: {{
+                                "Accept": "application/json",
+                                "Referer": "https://www.sofascore.com/",
+                            }}
+                        }}
+                    );
+                    if (!resp.ok) return null;
+                    return await resp.text();
+                }}
+            """)
+            if result:
+                return _FakeResponse(200, result)
+        except Exception as exc:
+            print(f"[sofascore] evaluate "
+                  f"error: {exc}")
+
+        # Check intercepted again after navigation
+        if full_url in self._intercepted:
+            return _FakeResponse(
+                200, self._intercepted[full_url])
+
+        # Partial match — URL without params
+        base_url = url.split("?")[0]
+        for intercepted_url, body in (
+                self._intercepted.items()):
+            if base_url in intercepted_url:
+                return _FakeResponse(200, body)
+
+        return _FakeResponse(403, "{}")
 
     def close(self):
         try:
@@ -179,19 +291,6 @@ class _PatchrightClient:
                 self._pw.stop()
             except Exception:
                 pass
-
-
-class _FakeResponse:
-    """Mimics requests.Response interface."""
-
-    def __init__(self, status_code: int,
-                 text: str):
-        self.status_code = status_code
-        self._text = text
-
-    def json(self):
-        import json
-        return json.loads(self._text)
 
 
 def _get(
