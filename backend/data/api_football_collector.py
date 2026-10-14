@@ -62,6 +62,20 @@ SEASON_MAP = {
     "UEFA-Champions League": [2025, 2026],
 }
 
+# Leagues whose season runs inside a single calendar year, so their season
+# label is just that year ("2026") rather than a "YYYY-YYYY" span. Kept in
+# step with the same set in fotmob_collector.py so both collectors write the
+# same season key for the same league.
+CALENDAR_YEAR_LEAGUES = {
+    103,   # NOR-Eliteserien
+    253,   # USA-MLS
+}
+
+# Both SEASON_MAP years and the `season` parameter API-Football wants are the
+# year the season STARTED in (2025 for 2025-2026, 2026 for 2026-2027), while
+# the database stores the readable label below. _season_label() derives a
+# label for any pair missing from this table, so a league added without an
+# entry cannot end up split across a bare year and a span.
 SEASON_LABEL = {
     (39,  2025): "2025-2026", (39,  2026): "2026-2027",
     (40,  2025): "2025-2026", (40,  2026): "2026-2027",
@@ -83,7 +97,62 @@ SEASON_LABEL = {
     (218, 2026): "2026-2027",
 }
 
+# /injuries and /standings-form are one call per league, and the four leagues
+# added later (BEL, TUR, NOR, AUT) pushed those loops past the 100 calls/day
+# free tier — the API answered 429 and the rest of the run collected nothing.
+# Both loops therefore only cover the priority leagues below; the others keep
+# whatever FBref/FotMob stored. UCL is listed for completeness but the loops
+# skip it, because nothing stores Champions League injuries or form.
+INJURY_LEAGUES = {
+    "ENG-Premier League",
+    "ESP-La Liga",
+    "GER-Bundesliga",
+    "ITA-Serie A",
+    "FRA-Ligue 1",
+    "ENG-Championship",
+    "POR-Primeira Liga",
+    "NED-Eredivisie",
+    "UEFA-Champions League",
+}
+
 _calls_made = 0
+
+
+def _season_label(league_id: int, season_year: int) -> str:
+    """Database season key for a league id and an API-Football season year.
+
+    API-Football takes the year the season STARTED in (2026 for 2026-2027),
+    and the database stores the readable span. The explicit SEASON_LABEL
+    table wins; anything not listed is derived from the league's season
+    calendar so a newly added league cannot silently write a bare year.
+    """
+    label = SEASON_LABEL.get((league_id, season_year))
+    if label:
+        return label
+    if league_id in CALENDAR_YEAR_LEAGUES:
+        return str(season_year)
+    return f"{season_year}-{season_year + 1}"
+
+
+def _validate_maps() -> None:
+    """Fail loudly on league-map mistakes instead of collecting wrong data.
+
+    A duplicate id makes two leagues read the same standings, and a league
+    missing from SEASON_MAP raises a bare KeyError deep inside the loops.
+    """
+    seen: dict = {}
+    for league_name, league_id in LEAGUE_MAP.items():
+        if league_id in seen:
+            raise ValueError(
+                f"LEAGUE_MAP: {league_name} and {seen[league_id]} share "
+                f"API-Football league id {league_id}"
+            )
+        seen[league_id] = league_name
+        if league_name not in SEASON_MAP:
+            raise ValueError(f"SEASON_MAP is missing {league_name}")
+    for league_name in SEASON_MAP:
+        if league_name not in LEAGUE_MAP:
+            raise ValueError(f"LEAGUE_MAP is missing {league_name}")
 
 
 def _safe(val) -> float | None:
@@ -147,11 +216,34 @@ def _get(endpoint: str, params: dict) -> dict | None:
             print(f"[api] [{_calls_made}] {endpoint} "
                   f"-> {n} items "
                   f"(remaining: {remaining})")
+            # API-Football also reports plan/quota problems in a 200 body
+            # ("errors": {...}) alongside an empty response. Silence here is
+            # what made an exhausted plan look like "no data for this
+            # league", so surface it.
+            errors = data.get("errors")
+            if errors:
+                print(f"[api] WARNING: {endpoint} reported "
+                      f"errors: {errors}")
+                if remaining not in (None, "?"):
+                    print(f"[api] Requests left today: {remaining}")
             time.sleep(1.2)
             return data
         else:
             print(f"[api] WARNING: HTTP "
                   f"{resp.status_code} for {endpoint}")
+            if resp.status_code == 429:
+                # Rate limited: the daily quota or the per-minute limit is
+                # gone, so hammering the API only burns more of it. Report
+                # the quota headers and pause before the next call.
+                print(f"[api] Rate limited — remaining: "
+                      f"{resp.headers.get('x-ratelimit-requests-remaining', '?')} "
+                      f"of "
+                      f"{resp.headers.get('x-ratelimit-requests-limit', '?')}, "
+                      f"retry-after: "
+                      f"{resp.headers.get('retry-after', '?')}s. "
+                      f"Trim LEAGUE_MAP / INJURY_LEAGUES or raise the plan.")
+                backoff = _safe(resp.headers.get("retry-after"))
+                time.sleep(min(max(backoff or 10.0, 10.0), 30.0))
             return None
     except Exception as exc:
         print(f"[api] ERROR: {endpoint}: {exc}")
@@ -290,9 +382,8 @@ def collect_team_stats() -> int:
         ):
             continue
         for season_year in SEASON_MAP[league_name]:
-            season_label = SEASON_LABEL.get(
-                (league_id, season_year),
-                str(season_year))
+            season_label = _season_label(
+                league_id, season_year)
             print(f"[team] {league_name} "
                   f"{season_year}...")
 
@@ -377,13 +468,19 @@ def collect_team_stats() -> int:
     print(f"[team] Done. Total rows: {total}")
     return total
 
+
 def collect_injuries() -> dict:
-    """13 API calls — one per domestic league (UCL skipped: not stored)."""
+    """8 API calls — one per priority league (see INJURY_LEAGUES)."""
     print("[injuries] Collecting injuries...")
     all_injuries = {}
     today = date.today().isoformat()
 
     for league_name, league_id in LEAGUE_MAP.items():
+        # Only the priority leagues: one /injuries call per league is what
+        # pushed the daily run over quota once the four new leagues were
+        # added.
+        if league_name not in INJURY_LEAGUES:
+            continue
         if league_name == "UEFA-Champions League":
             continue
         data = _get("injuries", {
@@ -409,16 +506,19 @@ def collect_injuries() -> dict:
 
 
 def collect_team_form() -> int:
-    """13 API calls — one per domestic league (UCL skipped)."""
+    """8 API calls — one per priority league (see INJURY_LEAGUES)."""
     print("[form] Collecting standings/form...")
     updated = 0
 
     for league_name, league_id in LEAGUE_MAP.items():
+        # Same priority list as injuries: the standings/form feed is the
+        # other per-league call that overran the quota.
+        if league_name not in INJURY_LEAGUES:
+            continue
         if league_name == "UEFA-Champions League":
             continue
         latest   = max(SEASON_MAP[league_name])
-        season_l = SEASON_LABEL.get(
-            (league_id, latest), str(latest))
+        season_l = _season_label(league_id, latest)
 
         data = _get("standings", {
             "league": league_id,
@@ -509,8 +609,7 @@ def collect_player_stats() -> int:
         if league_name == "UEFA-Champions League":
             continue
         latest   = max(SEASON_MAP[league_name])
-        season_l = SEASON_LABEL.get(
-            (league_id, latest), str(latest))
+        season_l = _season_label(league_id, latest)
         league_total = 0
 
         # Get teams for this league
@@ -736,17 +835,22 @@ def run_all() -> None:
       26  standings (13 domestic leagues x 2 seasons)
       13  /teams for the player collector (1 per league)
       ~250 /players calls (one per team; approximate)
-      13  injuries
-      13  team form
+      8   injuries (INJURY_LEAGUES only)
+      8   team form (INJURY_LEAGUES only)
       A full pass is over 300 calls, more than the daily quota, so
       collect_player_stats stops as soon as the API reports the limit and
       commits the teams it did reach; raise the plan or trim LEAGUE_MAP
-      (or run that collector on its own) to cover more of the list.
+      (or run that collector on its own) to cover more of the list. The
+      injuries and form loops cover only the priority leagues for the same
+      reason: those two loops used to run for every league and the added
+      leagues made the API answer 429 for the rest of the run.
     """
     print("=" * 60)
     print("API-FOOTBALL DAILY COLLECTION")
     print(f"Date: {date.today()}")
     print("=" * 60)
+
+    _validate_maps()
 
     if not API_KEY:
         print("FATAL: API_FOOTBALL_KEY not set")

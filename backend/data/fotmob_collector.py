@@ -72,8 +72,15 @@ FOTMOB_NAMES_FILE = _BACKEND / "data" / "fotmob_team_names.json"
 
 
 # FotMob tournament ids, country codes (ccode3) and season labels. Season
-# labels use FotMob's readable "YYYY/YYYY" (European) or "YYYY" (MLS and
-# Eliteserien) form; they are converted to the database's dash format on upsert.
+# labels use FotMob's readable "YYYY/YYYY" (European, including the
+# split-year Eliteserien) or "YYYY" (calendar-year MLS) form; they are
+# converted to the database's dash format on upsert.
+#
+# Every id below must be unique: a league that reuses another league's id
+# silently stores that league's data under the wrong name (the
+# BEL-Jupiler Pro League entry used id 55 — Serie A's id — which is why the
+# Belgian rows held Italian clubs). _validate_leagues() guards against a
+# repeat; see also the cleanup at the start of collect_team_stats().
 FOTMOB_LEAGUES = {
     "ENG-Premier League": {
         "id": 47,
@@ -124,7 +131,8 @@ FOTMOB_LEAGUES = {
         "prev_season": "2025/2026",
     },
     "BEL-Jupiler Pro League": {
-        "id": 55,
+        # 62 is Jupiler Pro League; 55 (used before) is ITA-Serie A.
+        "id": 62,
         "ccode": "BEL",
         "season": "2026/2027",
         "prev_season": "2025/2026",
@@ -136,10 +144,14 @@ FOTMOB_LEAGUES = {
         "prev_season": "2025/2026",
     },
     "NOR-Eliteserien": {
+        # 107 is correct. Eliteserien is a split-year season in this project's
+        # database convention (2025/2026), not a calendar year like MLS;
+        # _season_aliases() also accepts a bare "2026", so whichever spelling
+        # FotMob publishes for the league resolves to the same season.
         "id": 107,
         "ccode": "NOR",
-        "season": "2026",
-        "prev_season": "2025",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
     },
     "AUT-Bundesliga": {
         "id": 44,
@@ -250,28 +262,63 @@ def _db_season(season: str) -> str:
     return str(season).replace("/", "-")
 
 
+# Leagues whose season runs inside a single calendar year ("2026"). Every
+# other league — Eliteserien included — uses the split-year "YYYY/YYYY" form,
+# so a bare year here would split a league's rows across two season keys.
+CALENDAR_YEAR_LEAGUES = {
+    "USA-MLS",
+}
+
+
+def _validate_leagues() -> None:
+    """Fail loudly if two leagues share a FotMob id.
+
+    A duplicate id makes one league collect another league's teams, which is
+    how Serie A rows ended up stored under BEL-Jupiler Pro League.
+    """
+    seen: dict = {}
+    for league, config in FOTMOB_LEAGUES.items():
+        league_id = config.get("id")
+        if league_id is None:
+            raise ValueError(f"FOTMOB_LEAGUES: {league} has no FotMob id")
+        if league_id in seen:
+            raise ValueError(
+                f"FOTMOB_LEAGUES: {league} and {seen[league_id]} share "
+                f"FotMob id {league_id}"
+            )
+        seen[league_id] = league
+
+
 def _get_seasons(league: str) -> list[str]:
     """Return configured seasons in previous-to-current order for a league."""
-    CALENDAR_YEAR_LEAGUES = {
-        "USA-MLS",
-        "NOR-Eliteserien",
-    }
     config = FOTMOB_LEAGUES.get(league, {})
     seasons = []
     if config.get("prev_season"):
         seasons.append(config["prev_season"])
     if config.get("season"):
         seasons.append(config["season"])
-    return seasons if seasons else ["2026/2027"]
+    if seasons:
+        return seasons
+    # Nothing configured (unknown league): fall back to the label style the
+    # league's season calendar uses.
+    return ["2026"] if league in CALENDAR_YEAR_LEAGUES else ["2026/2027"]
 
 
 def _season_aliases(value) -> set[str]:
-    """Season label spellings: 2026/2027 == 2026/27."""
+    """Season label spellings: 2026/2027 == 2026/27 == 2026.
+
+    The bare start year is accepted for a split-year label because FotMob
+    publishes some split-year leagues (Eliteserien, the Austrian Bundesliga)
+    under a single year, and both spellings mean the same season. Season
+    ids are compared too, so only a lookup that would otherwise miss is
+    affected.
+    """
     text = str(value or "").strip().replace(" ", "")
     aliases = {text} if text else set()
     if "/" in text:
         left, right = text.split("/", 1)
         if len(left) == 4 and right.isdigit():
+            aliases.add(left)
             if len(right) == 2:
                 aliases.add(f"{left}/{left[:2]}{right}")
             elif len(right) == 4:
@@ -622,6 +669,29 @@ def _store_fotmob_name(db, fotmob_name: str, league: str) -> None:
 def collect_team_stats() -> int:
     """Collect both seasons for all leagues; return successfully committed rows."""
     print("[fotmob] Collecting team stats via the FotMob JSON API...")
+    _validate_leagues()
+
+    # Clean up potentially corrupted Belgian data: the previous release
+    # pointed BEL-Jupiler Pro League at id 55, which is ITA-Serie A, so the
+    # league's rows held Italian clubs. Drop them before recollecting from
+    # the correct id (62).
+    db_clean = SessionLocal()
+    try:
+        deleted = (
+            db_clean.query(TeamSeasonStats)
+            .filter(TeamSeasonStats.league == "BEL-Jupiler Pro League")
+            .delete()
+        )
+        db_clean.commit()
+        if deleted:
+            print(f"[fotmob] Cleaned up {deleted} corrupted "
+                  f"Belgian league rows")
+    except Exception as exc:
+        db_clean.rollback()
+        print(f"[fotmob] WARNING: Belgian cleanup failed: {exc}")
+    finally:
+        db_clean.close()
+
     total = 0
     client = _FotMobClient()
     try:
