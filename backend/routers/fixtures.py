@@ -1,10 +1,16 @@
 """Endpoints for daily football fixtures and their stored predictions."""
 
 import json
+import sys
+import threading
 import time
 import traceback
+import unicodedata
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
+# Imported by name: ``from sqlalchemy import inspect`` below shadows the module.
+from inspect import signature as _signature
 from pathlib import Path
 
 import pandas as pd
@@ -52,125 +58,252 @@ DEFAULT_SEASON = "2024-2025"
 
 UCL_LEAGUE = "UEFA-Champions League"
 
+# Fixture spelling (football-data.org, after data.fixtures.map_team_name) and
+# FotMob spelling -> the domestic league the club's stats live in.
+#
+# football-data.org names the same club differently from FotMob ("Bayern
+# Munich" vs "Bayern München", "Paris SG" vs "Paris Saint-Germain"), and the
+# UCL feed re-uses the national feed's names, so every variant either side can
+# send is listed here. Keys are matched exactly first and then accent-, case-,
+# punctuation- and whitespace-insensitively (see _get_ucl_domestic_league), so
+# a variant that only differs in a dotted abbreviation still resolves.
 UCL_TEAM_DOMESTIC_LEAGUE = {
     # England
-    "Arsenal":              "ENG-Premier League",
-    "Aston Villa":          "ENG-Premier League",
-    "Chelsea":              "ENG-Premier League",
-    "Liverpool":            "ENG-Premier League",
-    "Manchester City":      "ENG-Premier League",
-    "Man City":             "ENG-Premier League",
-    "Manchester United":    "ENG-Premier League",
-    "Man United":           "ENG-Premier League",
-    "Newcastle United":     "ENG-Premier League",
-    "Tottenham":            "ENG-Premier League",
+    "Arsenal":                  "ENG-Premier League",
+    "Aston Villa":              "ENG-Premier League",
+    "Chelsea":                  "ENG-Premier League",
+    "Liverpool":                "ENG-Premier League",
+    "Manchester City":          "ENG-Premier League",
+    "Man City":                 "ENG-Premier League",
+    "Manchester United":        "ENG-Premier League",
+    "Man United":               "ENG-Premier League",
+    "Man Utd":                  "ENG-Premier League",
+    "Newcastle United":         "ENG-Premier League",
+    "Newcastle":                "ENG-Premier League",
+    "Tottenham Hotspur":        "ENG-Premier League",
+    "Tottenham":                "ENG-Premier League",
+    "Spurs":                    "ENG-Premier League",
+
     # Spain
-    "Real Madrid":          "ESP-La Liga",
-    "Barcelona":            "ESP-La Liga",
-    "Atletico Madrid":      "ESP-La Liga",
-    "Atlético de Madrid":   "ESP-La Liga",
-    "Real Betis":           "ESP-La Liga",
-    "Betis":                "ESP-La Liga",          # football-data.org normaliser
-    "Real Betis Balompié":  "ESP-La Liga",
-    "Real Sociedad":        "ESP-La Liga",
-    "Athletic Club":        "ESP-La Liga",
-    "Girona":               "ESP-La Liga",
-    "Sevilla":              "ESP-La Liga",
-    "Villarreal":           "ESP-La Liga",
-    "Villarreal CF":        "ESP-La Liga",
+    "Real Madrid":              "ESP-La Liga",
+    "Barcelona":                "ESP-La Liga",
+    "FC Barcelona":             "ESP-La Liga",
+    "Atletico Madrid":          "ESP-La Liga",
+    "Atlético Madrid":          "ESP-La Liga",
+    "Atletico de Madrid":       "ESP-La Liga",
+    "Atlético de Madrid":       "ESP-La Liga",   # football-data.org spelling
     "Club Atletico de Madrid":  "ESP-La Liga",
+    "Athletic Club":            "ESP-La Liga",
+    "Athletic Bilbao":          "ESP-La Liga",
+    "Real Betis":               "ESP-La Liga",
+    "Betis":                    "ESP-La Liga",
+    "Real Betis Balompié":      "ESP-La Liga",
+    "Villarreal":               "ESP-La Liga",
+    "Villarreal CF":            "ESP-La Liga",
+    "Real Sociedad":            "ESP-La Liga",
+    "Sevilla":                  "ESP-La Liga",
+    "Sevilla FC":               "ESP-La Liga",
+    "Girona":                   "ESP-La Liga",
+
     # Germany
-    "Bayern Munchen":       "GER-Bundesliga",
-    "Bayern München":       "GER-Bundesliga",
-    "Bayern Munich":        "GER-Bundesliga",
-    "Borussia Dortmund":    "GER-Bundesliga",
-    "Dortmund":             "GER-Bundesliga",       # football-data.org normaliser
-    "RB Leipzig":           "GER-Bundesliga",
-    "VfB Stuttgart":        "GER-Bundesliga",
-    "Stuttgart":            "GER-Bundesliga",       # football-data.org normaliser
-    "Leverkusen":           "GER-Bundesliga",
-    "Bayer Leverkusen":     "GER-Bundesliga",
-    "Bayer 04 Leverkusen":  "GER-Bundesliga",
-    "FC Bayern München":    "GER-Bundesliga",
+    "Bayern München":           "GER-Bundesliga",
+    "Bayern Munich":            "GER-Bundesliga",
+    "Bayern Munchen":           "GER-Bundesliga",
+    "FC Bayern München":        "GER-Bundesliga",
+    "FC Bayern Munich":         "GER-Bundesliga",
+    "Borussia Dortmund":        "GER-Bundesliga",
+    "Dortmund":                 "GER-Bundesliga",
+    "BVB":                      "GER-Bundesliga",
+    "RB Leipzig":               "GER-Bundesliga",
+    "RasenBallsport Leipzig":   "GER-Bundesliga",
+    "Bayer Leverkusen":         "GER-Bundesliga",
+    "Bayer 04 Leverkusen":      "GER-Bundesliga",
+    "Leverkusen":               "GER-Bundesliga",
+    "VfB Stuttgart":            "GER-Bundesliga",
+    "Stuttgart":                "GER-Bundesliga",
+    "Eintracht Frankfurt":      "GER-Bundesliga",
+    "Frankfurt":                "GER-Bundesliga",
     "Borussia Mönchengladbach": "GER-Bundesliga",
-    "Gladbach":             "GER-Bundesliga",       # football-data.org normaliser
-    "Frankfurt":            "GER-Bundesliga",
-    "Union Berlin":         "GER-Bundesliga",
-    "Wolfsburg":            "GER-Bundesliga",
+    "Gladbach":                 "GER-Bundesliga",
+    "Union Berlin":             "GER-Bundesliga",
+    "Wolfsburg":                "GER-Bundesliga",
+
     # Italy
-    "Internazionale":       "ITA-Serie A",
-    "Inter":                "ITA-Serie A",
-    "Inter Milan":          "ITA-Serie A",
-    "Napoli":               "ITA-Serie A",
-    "AS Roma":              "ITA-Serie A",
-    "Roma":                 "ITA-Serie A",
-    "Como":                 "ITA-Serie A",
-    "Juventus":             "ITA-Serie A",
-    "Milan":                "ITA-Serie A",
-    "AC Milan":             "ITA-Serie A",
-    "Atalanta":             "ITA-Serie A",
-    "Bologna":              "ITA-Serie A",
-    "Lazio":                "ITA-Serie A",
-    "SS Lazio":             "ITA-Serie A",
-    "SSC Napoli":           "ITA-Serie A",
-    "Juventus FC":          "ITA-Serie A",
-    "Atalanta BC":          "ITA-Serie A",
-    "Bologna FC 1909":      "ITA-Serie A",
+    "Inter":                    "ITA-Serie A",
+    "Internazionale":           "ITA-Serie A",
+    "Inter Milan":              "ITA-Serie A",
+    "FC Internazionale":        "ITA-Serie A",
+    "AC Milan":                 "ITA-Serie A",
+    "Milan":                    "ITA-Serie A",
+    "Juventus":                 "ITA-Serie A",
+    "Juventus FC":              "ITA-Serie A",
+    "Napoli":                   "ITA-Serie A",
+    "SSC Napoli":               "ITA-Serie A",
+    "Roma":                     "ITA-Serie A",
+    "AS Roma":                  "ITA-Serie A",
+    "Atalanta":                 "ITA-Serie A",
+    "Atalanta BC":              "ITA-Serie A",
+    "Lazio":                    "ITA-Serie A",
+    "SS Lazio":                 "ITA-Serie A",
+    "Bologna":                  "ITA-Serie A",
+    "Bologna FC":               "ITA-Serie A",
+    "Bologna FC 1909":          "ITA-Serie A",
+    "Fiorentina":               "ITA-Serie A",
+    "ACF Fiorentina":           "ITA-Serie A",
+    "Como":                     "ITA-Serie A",
+
     # France
-    "Paris Saint-Germain":  "FRA-Ligue 1",
-    "Paris Saint Germain":  "FRA-Ligue 1",
-    "Paris SG":             "FRA-Ligue 1",          # football-data.org normaliser
-    "RC Lens":              "FRA-Ligue 1",
-    "Lens":                 "FRA-Ligue 1",
-    "Lille":                "FRA-Ligue 1",
-    "LOSC Lille":           "FRA-Ligue 1",
-    "Monaco":               "FRA-Ligue 1",
-    "AS Monaco":            "FRA-Ligue 1",
-    "Marseille":            "FRA-Ligue 1",
-    "Lyon":                 "FRA-Ligue 1",
-    "Rennes":               "FRA-Ligue 1",
-    "Racing Club de Lens":  "FRA-Ligue 1",
-    "RC Strasbourg":        "FRA-Ligue 1",
-    "Stade Brestois 29":    "FRA-Ligue 1",
+    "Paris Saint-Germain":      "FRA-Ligue 1",
+    "Paris Saint Germain":      "FRA-Ligue 1",
+    "Paris SG":                 "FRA-Ligue 1",
+    "PSG":                      "FRA-Ligue 1",
+    "Marseille":                "FRA-Ligue 1",
+    "Olympique de Marseille":   "FRA-Ligue 1",
+    "Monaco":                   "FRA-Ligue 1",
+    "AS Monaco":                "FRA-Ligue 1",
+    "Lens":                     "FRA-Ligue 1",
+    "RC Lens":                  "FRA-Ligue 1",
+    "Racing Club de Lens":      "FRA-Ligue 1",
+    "Lille":                    "FRA-Ligue 1",
+    "LOSC Lille":               "FRA-Ligue 1",
+    "Lyon":                     "FRA-Ligue 1",
+    "Olympique Lyonnais":       "FRA-Ligue 1",
+    "Brest":                    "FRA-Ligue 1",
+    "Stade Brestois 29":        "FRA-Ligue 1",
+    "Nice":                     "FRA-Ligue 1",
+    "OGC Nice":                 "FRA-Ligue 1",
+    "Rennes":                   "FRA-Ligue 1",
+    "Stade Rennais FC":         "FRA-Ligue 1",
+    "RC Strasbourg":            "FRA-Ligue 1",
+    "Strasbourg":               "FRA-Ligue 1",
+
     # Portugal
-    "FC Porto":             "POR-Primeira Liga",
-    "Porto":                "POR-Primeira Liga",
-    "Sporting CP":          "POR-Primeira Liga",
-    "Benfica":              "POR-Primeira Liga",
-    "SL Benfica":           "POR-Primeira Liga",
-    "Braga":                "POR-Primeira Liga",
-    "SC Braga":             "POR-Primeira Liga",
+    "Benfica":                  "POR-Primeira Liga",
+    "SL Benfica":               "POR-Primeira Liga",
+    "FC Porto":                 "POR-Primeira Liga",
+    "Porto":                    "POR-Primeira Liga",
+    "Sporting CP":              "POR-Primeira Liga",
     "Sporting Clube de Portugal": "POR-Primeira Liga",
+    "Braga":                    "POR-Primeira Liga",
+    "SC Braga":                 "POR-Primeira Liga",
+
     # Netherlands
-    "Feyenoord":            "NED-Eredivisie",
-    "Feyenoord Rotterdam":  "NED-Eredivisie",
-    "PSV Eindhoven":        "NED-Eredivisie",
-    "PSV":                  "NED-Eredivisie",
-    "Ajax":                 "NED-Eredivisie",
-    "AFC Ajax":             "NED-Eredivisie",
+    "Feyenoord":                "NED-Eredivisie",
+    "Feyenoord Rotterdam":      "NED-Eredivisie",
+    "PSV Eindhoven":            "NED-Eredivisie",
+    "PSV":                      "NED-Eredivisie",
+    "Ajax":                     "NED-Eredivisie",
+    "AFC Ajax":                 "NED-Eredivisie",
+    "Twente":                   "NED-Eredivisie",
+    "FC Twente":                "NED-Eredivisie",
+    "AZ":                       "NED-Eredivisie",
+    "AZ Alkmaar":               "NED-Eredivisie",
+
     # Belgium
-    "Club Brugge":          "BEL-Jupiler Pro League",
-    "Club Brugge KV":       "BEL-Jupiler Pro League",
-    "Anderlecht":           "BEL-Jupiler Pro League",
+    "Club Brugge":              "BEL-Jupiler Pro League",
+    "Club Brugge KV":           "BEL-Jupiler Pro League",
+    "Anderlecht":               "BEL-Jupiler Pro League",
+    "RSC Anderlecht":           "BEL-Jupiler Pro League",
+    "Genk":                     "BEL-Jupiler Pro League",
+    "KRC Genk":                 "BEL-Jupiler Pro League",
+    "Gent":                     "BEL-Jupiler Pro League",
+    "KAA Gent":                 "BEL-Jupiler Pro League",
+    "Union St.Gilloise":        "BEL-Jupiler Pro League",
+    "Union Saint-Gilloise":     "BEL-Jupiler Pro League",
+    "Royal Antwerp":            "BEL-Jupiler Pro League",
+    "Royal Antwerp FC":         "BEL-Jupiler Pro League",
+    "Antwerp":                  "BEL-Jupiler Pro League",
+    "Cercle Brugge":            "BEL-Jupiler Pro League",
+
     # Turkey
-    "Fenerbahçe":           "TUR-Süper Lig",
-    "Fenerbahce":           "TUR-Süper Lig",
-    "Fenerbahçe SK":        "TUR-Süper Lig",
-    "Galatasaray":          "TUR-Süper Lig",
-    "Galatasaray SK":       "TUR-Süper Lig",
-    "Besiktas":             "TUR-Süper Lig",
+    "Fenerbahçe":               "TUR-Süper Lig",
+    "Fenerbahce":               "TUR-Süper Lig",
+    "Fenerbahçe SK":            "TUR-Süper Lig",
+    "Galatasaray":              "TUR-Süper Lig",
+    "Galatasaray SK":           "TUR-Süper Lig",
+    "Beşiktaş":                 "TUR-Süper Lig",
+    "Besiktas":                 "TUR-Süper Lig",
+    "Beşiktaş JK":              "TUR-Süper Lig",
+    "Trabzonspor":              "TUR-Süper Lig",
+    "Başakşehir":               "TUR-Süper Lig",
+    "Istanbul Basaksehir":      "TUR-Süper Lig",
+
     # Norway
-    "Bodø/Glimt":           "NOR-Eliteserien",
-    "Bodo/Glimt":           "NOR-Eliteserien",
-    "FK Bodø/Glimt":        "NOR-Eliteserien",
-    "Viking FK":            "NOR-Eliteserien",
-    "Viking":               "NOR-Eliteserien",
+    "Bodø/Glimt":               "NOR-Eliteserien",
+    "Bodo/Glimt":               "NOR-Eliteserien",
+    "FK Bodø/Glimt":            "NOR-Eliteserien",
+    "Viking":                   "NOR-Eliteserien",
+    "Viking FK":                "NOR-Eliteserien",
+    "Rosenborg":                "NOR-Eliteserien",
+    "Rosenborg BK":             "NOR-Eliteserien",
+    "Molde":                    "NOR-Eliteserien",
+    "Molde FK":                 "NOR-Eliteserien",
+
     # Austria
-    "LASK":                 "AUT-Bundesliga",
-    "LASK Linz":            "AUT-Bundesliga",
-    "Salzburg":             "AUT-Bundesliga",
-    "Red Bull Salzburg":    "AUT-Bundesliga",
+    "LASK":                     "AUT-Bundesliga",
+    "LASK Linz":                "AUT-Bundesliga",
+    "FC LASK Linz":             "AUT-Bundesliga",
+    "Salzburg":                 "AUT-Bundesliga",
+    "Red Bull Salzburg":        "AUT-Bundesliga",
+    "FC Red Bull Salzburg":     "AUT-Bundesliga",
+    "FC Salzburg":              "AUT-Bundesliga",
+    "RB Salzburg":              "AUT-Bundesliga",
+    "Rapid Wien":               "AUT-Bundesliga",
+    "SK Rapid Wien":            "AUT-Bundesliga",
+    "Sturm Graz":               "AUT-Bundesliga",
+    "SK Sturm Graz":            "AUT-Bundesliga",
 }
+
+
+# Letters that are their own character rather than an accented Latin one, so
+# NFKD leaves them alone (ß is already folded to "ss" by casefold()).
+_RELAXED_CHARS = str.maketrans({
+    "ø": "o", "æ": "ae", "œ": "oe", "đ": "d", "ð": "d", "þ": "th",
+    "ł": "l", "ı": "i", "ĸ": "k",
+})
+
+
+def _relaxed_name(name: str) -> str:
+    """
+    Comparison key for team names: accents, case, punctuation and repeated
+    whitespace removed.
+
+    Providers disagree on more than spelling — "Union St.Gilloise" vs
+    "Union St. Gilloise", "Atlético" vs "Atletico", "Bodø/Glimt" vs
+    "Bodo/Glimt" — and none of that changes which club is meant. Used for
+    lookups only; the original spelling is what gets stored and displayed.
+    """
+    if not name:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", str(name))
+    stripped = "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    )
+    # Accents decompose, but letters like ø and đ are letters in their own
+    # right, so they need folding by hand to match their ASCII spelling.
+    folded = stripped.casefold().translate(_RELAXED_CHARS)
+    # Treat punctuation ("St.Gilloise", "Bodø/Glimt", "Paris Saint-Germain")
+    # as a separator, so the tokens line up whichever variant is used.
+    cleaned = "".join(
+        " " if not char.isalnum() else char for char in folded
+    )
+    return " ".join(cleaned.split())
+
+
+# Relaxed key -> domestic league, so a spelling that only differs in accents,
+# case or punctuation still resolves. Built once: the table above is static,
+# and the first spelling of a club wins if two ever relax to the same key.
+def _build_ucl_relaxed_index() -> dict[str, str]:
+    """Map every relaxed club name to its domestic league."""
+    index: dict[str, str] = {}
+    for team, league in UCL_TEAM_DOMESTIC_LEAGUE.items():
+        key = _relaxed_name(team)
+        if key:
+            index.setdefault(key, league)
+    return index
+
+
+UCL_DOMESTIC_LEAGUE_BY_RELAXED_NAME = _build_ucl_relaxed_index()
 
 # A stored prediction is refreshed at most this long after it was computed.
 FIXTURE_STALE_HOURS = 2
@@ -362,16 +495,160 @@ def _compute_prediction_values(
     return _with_derived_markets(values)
 
 
+# formula_engine.predict_match takes ONE league for both teams: it loads the
+# home team's season stats, squad and key players from it, and the away team's
+# from that same league. A UCL fixture between clubs from two countries would
+# therefore look the away club up in the home club's league, find nothing and
+# return no prediction at all — the single biggest source of UCL fixtures
+# without one. The engine resolves every team-scoped row through the
+# module-level loaders below, so the away club is pointed at its own domestic
+# league for the duration of the call (see _engine_team_league_overrides).
+_ENGINE_TEAM_LOADERS = (
+    "load_team_stats",
+    "load_squad_players",
+    "load_key_players",
+)
+
+# Serialises the calls that patch the engine, so two cross-league predictions
+# never rewrite the module's loaders on top of each other.
+_ENGINE_LEAGUE_OVERRIDE_LOCK = threading.RLock()
+
+# Engine parameters that could carry a per-team league directly, most
+# explicit first. Checked at call time: if the engine ever grows one, it is
+# used instead of patching, and this module keeps working unchanged.
+_AWAY_LEAGUE_PARAMETERS = (
+    "away_league",
+    "away_domestic_league",
+    "away_team_league",
+)
+
+
+def _formula_engine_module():
+    """
+    The imported ``formula_engine`` module, or None when it is not loaded.
+
+    Looked up through the predictor's own ``predict_match`` function, so the
+    module that actually serves predictions is the one that gets patched.
+    """
+    predictor = _current_predictor_value("formula_predict", formula_predict)
+    module_name = getattr(predictor, "__module__", None)
+    if not module_name:
+        return None
+    return sys.modules.get(module_name)
+
+
+def _engine_away_league_parameter() -> str | None:
+    """
+    Name of the engine parameter that takes the away team's league, if any.
+
+    Returns None for the current engine, whose ``predict_match`` accepts a
+    single league — the caller then falls back to the loader override.
+    """
+    predictor = _current_predictor_value("formula_predict", formula_predict)
+    if predictor is None:
+        return None
+    try:
+        parameters = _signature(predictor).parameters
+    except (TypeError, ValueError):
+        return None
+    for name in _AWAY_LEAGUE_PARAMETERS:
+        if name in parameters:
+            return name
+    return None
+
+
+@contextmanager
+def _engine_team_league_overrides(team_leagues: dict[str, str]):
+    """
+    Read the listed teams from their own league while the engine predicts.
+
+    ``formula_engine`` loads a match's teams through module-level functions
+    (``load_team_stats``, ``load_squad_players``, ``load_key_players``) that
+    all take the competition as their second argument. Wrapping them for the
+    duration of one prediction is what lets a UCL fixture use each club's own
+    domestic league — the season blend, the squad and the key players of the
+    away club all come from the league it actually plays in.
+
+    Only teams named in ``team_leagues`` are redirected, always towards the
+    league they belong to, so a lookup that another thread happens to run
+    meanwhile can only ever get the right league instead of none. Yields True
+    when the override is in place and False when the engine module is not
+    loaded (the prediction then just runs unpatched).
+    """
+    if not team_leagues:
+        yield False
+        return
+
+    engine = _formula_engine_module()
+    if engine is None:
+        yield False
+        return
+
+    def _redirect(loader):
+        @wraps(loader)
+        def wrapper(team, league, season=None, *args, **kwargs):
+            return loader(
+                team, team_leagues.get(team, league), season,
+                *args, **kwargs,
+            )
+
+        return wrapper
+
+    with _ENGINE_LEAGUE_OVERRIDE_LOCK:
+        originals: dict[str, object] = {}
+        try:
+            for name in _ENGINE_TEAM_LOADERS:
+                loader = getattr(engine, name, None)
+                if not callable(loader):
+                    continue
+                originals[name] = loader
+                setattr(engine, name, _redirect(loader))
+            yield bool(originals)
+        finally:
+            for name, loader in originals.items():
+                setattr(engine, name, loader)
+
+
+def _run_formula_predict(prediction_args: dict, away_league: str | None):
+    """
+    Call the engine with both domestic leagues where it can take them.
+
+    The away league is passed as a parameter when the engine defines one, and
+    otherwise applied by overriding the engine's team loaders for this call.
+    """
+    if not away_league or away_league == prediction_args["league"]:
+        return formula_predict(**prediction_args)
+
+    parameter = _engine_away_league_parameter()
+    if parameter:
+        return formula_predict(**{**prediction_args, parameter: away_league})
+
+    with _engine_team_league_overrides(
+        {prediction_args["away_team"]: away_league}
+    ) as applied:
+        if not applied:
+            print("[fixtures] NOTE: formula engine module not loaded — "
+                  f"predicting {prediction_args['home_team']} vs "
+                  f"{prediction_args['away_team']} with "
+                  f"{prediction_args['league']} for both teams")
+        return formula_predict(**prediction_args)
+
+
 def _predict_with_formula(
     home_team: str,
     away_team: str,
     league: str,
     season: str | None,
     original_league: str | None = None,
+    away_league: str | None = None,
 ) -> dict | None:
     """
     Prediction values from the formula engine, or None when it cannot
     produce one (engine unavailable, unknown teams, too little data).
+
+    ``league`` is the competition the Poisson baseline is taken from (for a
+    UCL fixture: the home team's domestic league) and, with ``away_league``,
+    the league the away team is read from when the two differ.
 
     The engine's response is mapped onto the fixtures prediction fields, so
     storing a prediction never has to know the engine's response shape.
@@ -389,6 +666,7 @@ def _predict_with_formula(
     try:
         print(f"[fixtures] formula_predict: {home_team!r} vs "
               f"{away_team!r} league={league!r} "
+              f"away_league={away_league!r} "
               f"season={(season or DEFAULT_SEASON)!r}")
         prediction_args = {
             "home_team": home_team,
@@ -398,7 +676,7 @@ def _predict_with_formula(
         }
         if original_league is not None:
             prediction_args["original_league"] = original_league
-        prediction = formula_predict(**prediction_args)
+        prediction = _run_formula_predict(prediction_args, away_league)
         print(f"[fixtures] formula_predict returned: {bool(prediction)}")
     except Exception as exc:
         print(f"[fixtures] WARNING: formula prediction failed for "
@@ -439,10 +717,25 @@ def _get_ucl_domestic_league(team: str) -> str | None:
     """
     Return the domestic league for a UCL team.
 
+    The exact spelling is tried first, then the accent/case/punctuation
+    insensitive spelling, so a variant that is not listed verbatim (a trailing
+    "FC", an accent, a dotted abbreviation) still maps to the right league
+    instead of hiding a coverable fixture.
+
     Returns None if the team is from a league
     we do not cover — those fixtures are hidden.
     """
-    return UCL_TEAM_DOMESTIC_LEAGUE.get(team)
+    if not team:
+        return None
+    league = UCL_TEAM_DOMESTIC_LEAGUE.get(team)
+    if league:
+        return league
+    league = UCL_DOMESTIC_LEAGUE_BY_RELAXED_NAME.get(_relaxed_name(team))
+    if league:
+        print(f"[fixtures] UCL: {team!r} resolved by normalised name to "
+              f"{league}")
+        return league
+    return None
 
 
 def _parse_utc(value) -> datetime | None:
@@ -568,31 +861,138 @@ def _find_fotmob_name(
         if token_matches:
             return unique(token_matches) or name
 
+    # Spellings whose provider name shares no token with the stored one:
+    # abbreviation ("PSG"), translated name ("Bayern Munich" vs "Bayern
+    # München"), or a different word order ("Feyenoord Rotterdam"). UCL
+    # fixtures hit these hardest, because football-data.org re-uses the
+    # national feed's name for the same club FotMob lists once.
     KNOWN_ALIASES = {
-        "paris sg":              "Paris Saint Germain",
-        "paris saint-germain":   "Paris Saint Germain",
-        "psg":                   "Paris Saint Germain",
-        "man city":              "Manchester City",
-        "man united":            "Manchester United",
-        "man utd":               "Manchester United",
-        "atletico":              "Atletico Madrid",
-        "inter milan":           "Inter",
-        "ac milan":              "AC Milan",
-        "qpr":                   "Queens Park Rangers",
-        "west brom":             "West Bromwich Albion",
-        "spurs":                 "Tottenham",
-        "wolves":                "Wolverhampton Wanderers",
-        "feyenoord rotterdam":   "Feyenoord",
-        "rb leipzig":            "RB Leipzig",
-        "rasenballsport leipzig":"RB Leipzig",
-        "borussia m.gladbach":   "Borussia Mönchengladbach",
-        "atletico madrid":       "Atlético Madrid",
+        # England
+        "man city":                  "Manchester City",
+        "man united":                "Manchester United",
+        "man utd":                   "Manchester United",
+        "qpr":                       "Queens Park Rangers",
+        "west brom":                 "West Bromwich Albion",
+        "spurs":                     "Tottenham",
+        "wolves":                    "Wolverhampton Wanderers",
+        # Spain
+        "atletico":                  "Atletico Madrid",
+        "atletico madrid":           "Atlético Madrid",
+        "atlético madrid":           "Atlético Madrid",
+        "atletico de madrid":        "Atlético Madrid",
+        "club atletico de madrid":   "Atlético Madrid",
+        "athletic bilbao":           "Athletic Club",
+        "betis":                     "Real Betis",
+        # Germany
+        "bayern munich":             "Bayern München",
+        "fc bayern munich":          "Bayern München",
+        "bayern munchen":            "Bayern München",
+        "fc bayern munchen":         "Bayern München",
+        "bvb":                       "Borussia Dortmund",
+        "dortmund":                  "Borussia Dortmund",
+        "rb leipzig":                "RB Leipzig",
+        "rasenballsport leipzig":    "RB Leipzig",
+        "leverkusen":                "Bayer Leverkusen",
+        "bayer 04 leverkusen":       "Bayer Leverkusen",
+        "borussia m.gladbach":       "Borussia Mönchengladbach",
+        "gladbach":                  "Borussia Mönchengladbach",
+        "frankfurt":                 "Eintracht Frankfurt",
+        "stuttgart":                 "VfB Stuttgart",
+        # Italy
+        "inter":                     "Inter",
+        "inter milan":               "Inter",
+        "internazionale":            "Inter",
+        "ac milan":                  "AC Milan",
+        "milan":                     "AC Milan",
+        "roma":                      "AS Roma",
+        "lazio":                     "SS Lazio",
+        "napoli":                    "SSC Napoli",
+        "atalanta":                  "Atalanta BC",
+        "bologna":                   "Bologna FC 1909",
+        "fiorentina":                "ACF Fiorentina",
+        # France
+        "psg":                       "Paris Saint-Germain",
+        "paris sg":                  "Paris Saint-Germain",
+        "paris saint germain":       "Paris Saint-Germain",
+        "paris saint-germain":       "Paris Saint-Germain",
+        "racing club de lens":       "Lens",
+        "rc lens":                   "Lens",
+        "olympique de marseille":    "Marseille",
+        "as monaco":                 "Monaco",
+        "losc lille":                "Lille",
+        "olympique lyonnais":        "Lyon",
+        "ogc nice":                  "Nice",
+        "stade brestois 29":         "Brest",
+        "stade rennais fc":          "Rennes",
+        # Portugal
+        "sporting clube de portugal": "Sporting CP",
+        "sl benfica":                "Benfica",
+        # Netherlands
+        "feyenoord rotterdam":       "Feyenoord",
+        "afc ajax":                  "Ajax",
+        "psv eindhoven":             "PSV",
+        "az alkmaar":                "AZ",
+        # Belgium
+        "club brugge kv":            "Club Brugge",
+        "rsc anderlecht":            "Anderlecht",
+        "krc genk":                  "Genk",
+        "kaa gent":                  "Gent",
+        "union st.gilloise":         "Union St.Gilloise",
+        "union saint-gilloise":      "Union St.Gilloise",
+        "royal antwerp":             "Antwerp",
+        # Turkey
+        "fenerbahce":                "Fenerbahçe",
+        "fenerbahçe sk":             "Fenerbahçe",
+        "galatasaray sk":            "Galatasaray",
+        "besiktas":                  "Beşiktaş",
+        "beşiktaş jk":               "Beşiktaş",
+        "istanbul basaksehir":       "Başakşehir",
+        # Norway
+        "bodo/glimt":                "Bodø/Glimt",
+        "fk bodo/glimt":             "Bodø/Glimt",
+        "viking fk":                 "Viking",
+        "rosenborg bk":              "Rosenborg",
+        "molde fk":                  "Molde",
+        # Austria
+        "lask linz":                 "LASK",
+        "fc lask linz":              "LASK",
+        "red bull salzburg":         "FC Salzburg",
+        "fc red bull salzburg":      "FC Salzburg",
+        "rb salzburg":               "FC Salzburg",
+        "sk rapid wien":             "Rapid Wien",
+        "sk sturm graz":             "Sturm Graz",
     }
     alias_result = KNOWN_ALIASES.get(name_lower)
     if alias_result:
-        for c in candidates:
-            if c.casefold() == alias_result.casefold():
-                return c
+        # An alias only counts when the league really holds that club: the
+        # list is global, the candidates are this league's teams. Matching is
+        # on the relaxed name (accents and punctuation) and, failing that, on
+        # whole tokens, so "Tottenham" still finds "Tottenham Hotspur" while
+        # never colliding two different clubs that share a word.
+        alias_key = alias_result.casefold()
+        alias_tokens = set(_relaxed_name(alias_result).split())
+
+        exact = [c for c in candidates if c.casefold() == alias_key]
+        if exact:
+            return exact[0]
+
+        relaxed = [
+            c for c in candidates
+            if _relaxed_name(c) == _relaxed_name(alias_result)
+        ]
+        if relaxed:
+            return unique(relaxed) or name
+
+        if alias_tokens:
+            token_matches = []
+            for candidate in candidates:
+                tokens = set(_relaxed_name(candidate).split())
+                if tokens and (
+                    alias_tokens <= tokens or tokens <= alias_tokens
+                ):
+                    token_matches.append(candidate)
+            if token_matches:
+                return unique(token_matches) or name
 
     return name
 
@@ -607,6 +1007,9 @@ def _predict_fixture_values(
     Best available prediction for one fixture.
 
     Resolve team names to FotMob spellings before asking the formula engine.
+    A UCL fixture also gets each club resolved in its own domestic league:
+    the home one is the baseline the engine predicts from, the away one is
+    where the away club's own stats, squad and key players are read from.
     ML is only a fallback when both teams occur in the training history;
     otherwise return no prediction rather than a default-valued forecast.
     """
@@ -614,6 +1017,7 @@ def _predict_fixture_values(
     # domestic league for team-name resolution and domestic stats.
     fixture_league = league
     fotmob_names = _load_fotmob_names()
+    away_dom: str | None = None
     if fixture_league == UCL_LEAGUE:
         home_dom = _get_ucl_domestic_league(home_team)
         away_dom = _get_ucl_domestic_league(away_team)
@@ -632,6 +1036,7 @@ def _predict_fixture_values(
         formula_result = _predict_with_formula(
             home_team, away_team, league, season,
             original_league=fixture_league,
+            away_league=away_dom,
         )
     else:
         formula_result = _predict_with_formula(
