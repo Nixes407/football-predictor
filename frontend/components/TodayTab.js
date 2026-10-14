@@ -369,13 +369,26 @@ export default function TodayTab() {
                   `${league}:${fx.home_team}:${fx.away_team}:${
                     fx.kickoff ?? fx.kickoff_time ?? fixtureIndex
                   }`;
-                const hasPreds = [
+                // The API flags every fixture with `has_prediction` (true only
+                // when all three result probabilities are stored). Fixtures
+                // without one are still listed — they just show a "not
+                // available" message instead of the prediction panel. The
+                // local probability check guards against a stale/incorrect
+                // flag so the panel can never render NaN values.
+                const hasValidProbs = [
                   fx.pred_home_win,
                   fx.pred_draw,
                   fx.pred_away_win,
                 ].every(isValidProbability);
-                const conf = hasPreds
-                  ? getConfidence(fx.pred_home_win, fx.pred_draw, fx.pred_away_win)
+                const hasPrediction =
+                  fx.has_prediction !== false && hasValidProbs;
+                // Confidence badge is derived only when a prediction exists.
+                const conf = hasPrediction
+                  ? getConfidence(
+                      Number(fx.pred_home_win),
+                      Number(fx.pred_draw),
+                      Number(fx.pred_away_win)
+                    )
                   : null;
                 return (
                   <motion.div
@@ -392,15 +405,12 @@ export default function TodayTab() {
                         {formatKickoff(fx.kickoff ?? fx.kickoff_time)}
                       </span>
                       <StatusBadge status={fx.status} />
-                      {conf ? (
+                      {/* Confidence badge — only shown when a prediction exists */}
+                      {conf && (
                         <span
                           className={`${conf.className} text-xs font-bold px-3 py-1 rounded-full`}
                         >
                           {conf.label}
-                        </span>
-                      ) : (
-                        <span className="badge-low text-xs font-bold px-3 py-1 rounded-full">
-                          ❔ N/A
                         </span>
                       )}
                     </div>
@@ -420,7 +430,7 @@ export default function TodayTab() {
                       </div>
                       <div className="text-center">
                         <div className="text-2xl font-bold gradient-text">VS</div>
-                        {hasPreds && (
+                        {hasPrediction && (
                           <div className="flex justify-center gap-2 text-xs font-semibold mt-1">
                             <span style={{ color: 'var(--green)' }}>
                               {(fx.pred_home_win * 100).toFixed(0)}%
@@ -447,40 +457,36 @@ export default function TodayTab() {
                       </div>
                     </div>
 
-                    {/* Get prediction button */}
-                    <button
-                      className="btn-neon w-full py-2.5 text-sm"
-                      onClick={() => toggleExpanded(fixtureKey)}
-                    >
-                      {expanded[fixtureKey] ? '🔼 Hide Prediction' : '🔮 Get Prediction'}
-                    </button>
-
-                    {/* Prediction panel */}
-                    <AnimatePresence initial={false}>
-                      {expanded[fixtureKey] && (
-                        <motion.div
-                          initial={{ height: 0, opacity: 0 }}
-                          animate={{ height: 'auto', opacity: 1 }}
-                          exit={{ height: 0, opacity: 0 }}
-                          transition={{ duration: 0.3 }}
-                          style={{ overflow: 'hidden' }}
+                    {hasPrediction ? (
+                      <>
+                        {/* Get prediction button */}
+                        <button
+                          className="btn-neon w-full py-2.5 text-sm"
+                          onClick={() => toggleExpanded(fixtureKey)}
                         >
-                          {hasPreds ? (
-                            <PredictionPanel fixture={fx} />
-                          ) : (
-                            <p
-                              className="mt-4 pt-4 text-sm text-center"
-                              style={{
-                                color: 'var(--text-muted)',
-                                borderTop: '1px solid var(--border)',
-                              }}
+                          {expanded[fixtureKey] ? '🔼 Hide Prediction' : '🔮 Get Prediction'}
+                        </button>
+
+                        {/* Prediction panel */}
+                        <AnimatePresence initial={false}>
+                          {expanded[fixtureKey] && (
+                            <motion.div
+                              initial={{ height: 0, opacity: 0 }}
+                              animate={{ height: 'auto', opacity: 1 }}
+                              exit={{ height: 0, opacity: 0 }}
+                              transition={{ duration: 0.3 }}
+                              style={{ overflow: 'hidden' }}
                             >
-                              Prediction not available for this match.
-                            </p>
+                              <PredictionPanel fixture={fx} />
+                            </motion.div>
                           )}
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
+                        </AnimatePresence>
+                      </>
+                    ) : (
+                      <div className="mt-3 text-xs text-gray-500 text-center py-2">
+                        Prediction not available for this match
+                      </div>
+                    )}
                   </motion.div>
                 );
               })}
