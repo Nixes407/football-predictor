@@ -78,6 +78,11 @@ FULL_WEIGHT_GAMES = 20
 # games it covers (per-game aggregates). Mid-season, so an even blend.
 DEFAULT_SEASON_GAMES = 10
 
+# UCL performance is supplementary to each team's domestic baseline.
+UCL_LEAGUE_NAME = "UEFA-Champions League"
+UCL_MAX_WEIGHT = 0.30
+UCL_FULL_GAMES = 10
+
 # Stat keys copied from the current season untouched by the season blend:
 # the keeper W-D-L columns are a record (or a five-game form window) that
 # games_played() reads, so blending them would corrupt the games estimate.
@@ -768,6 +773,82 @@ def _blend_with_previous_season(
           f"{w_cur:.0%} current + "
           f"{1.0 - w_cur:.0%} previous")
     return blended
+
+
+def load_ucl_stats(
+    team: str,
+    season: str | None = None,
+) -> dict | None:
+    """
+    Load UCL season stats for a team.
+    Returns stats dict or None if not found.
+    """
+    db = _new_session()
+    if db is None:
+        return None
+    try:
+        query = db.query(TeamSeasonStats).filter(
+            and_(
+                TeamSeasonStats.team   == team,
+                TeamSeasonStats.league == UCL_LEAGUE_NAME,
+            )
+        )
+        if season:
+            query = query.filter(
+                TeamSeasonStats.season == season)
+        else:
+            query = query.order_by(
+                TeamSeasonStats.season.desc())
+        row = query.first()
+        if row is None:
+            return None
+        return _row_to_stats_dict(row)
+    except Exception as exc:
+        print(f"[formula] WARNING: could not "
+              f"load UCL stats for {team}: {exc}")
+        return None
+    finally:
+        _close_session(db)
+
+
+def blend_ucl_with_domestic(
+    domestic_stats: dict,
+    ucl_stats: dict | None,
+    domestic_games: float,
+) -> dict:
+    """
+    Blend UCL stats with domestic league stats.
+
+    UCL weight = min(ucl_games / UCL_FULL_GAMES, UCL_MAX_WEIGHT). At 2 UCL
+    games, UCL contributes 20%; at 5 or more games the contribution caps
+    at 30%, keeping the domestic league as the representative baseline.
+
+    The cap accounts for UCL's different opposition quality and the small
+    sample sizes early in the season.
+    """
+    if ucl_stats is None:
+        return domestic_stats
+
+    ucl_games = games_played(ucl_stats) or 0
+    if ucl_games < 1:
+        return domestic_stats
+
+    w_ucl = min(
+        ucl_games / UCL_FULL_GAMES,
+        UCL_MAX_WEIGHT,
+    )
+    w_dom = 1.0 - w_ucl
+
+    print(f"[formula] UCL blend: "
+          f"{ucl_games} UCL games → "
+          f"{w_ucl:.0%} UCL + "
+          f"{w_dom:.0%} domestic")
+
+    return _blend_stats(
+        _per_game_values(domestic_stats, domestic_games),
+        _per_game_values(ucl_stats, ucl_games),
+        w_dom * FULL_WEIGHT_GAMES,
+    )
 
 
 def load_team_stats(
@@ -2442,6 +2523,7 @@ def predict_match(
     league: str,
     season: str | None = None,
     injuries: dict | None = None,
+    original_league: str | None = None,
 ) -> dict | None:
     """
     Public entry point: full prediction dict, or None when the fixture
@@ -2453,7 +2535,8 @@ def predict_match(
     """
     try:
         return _predict_match(
-            home_team, away_team, league, season, injuries)
+            home_team, away_team, league, season, injuries,
+            original_league)
     except Exception as exc:
         print(f"[formula] ERROR: prediction failed for {home_team} vs "
               f"{away_team} ({league}): {exc}")
@@ -2467,6 +2550,7 @@ def _predict_match(
     league: str,
     season: str | None = None,
     injuries: dict | None = None,
+    original_league: str | None = None,
 ) -> dict | None:
     """
     Generate a full match prediction using the
@@ -2475,9 +2559,10 @@ def _predict_match(
     Parameters:
         home_team : team name as stored in DB
         away_team : team name as stored in DB
-        league    : league name e.g. "ENG-Premier League"
-        season    : season label e.g. "2024-2025" or None
-        injuries  : dict of injured players per team
+        league          : domestic league used to load team stats
+        season          : season label e.g. "2024-2025" or None
+        injuries        : dict of injured players per team
+        original_league : source tournament, used to enable UCL blending
 
     Returns full prediction dict or None if
     insufficient data.
@@ -2488,6 +2573,7 @@ def _predict_match(
     engine can explain: engine, predicted_result, confidence,
     top_scorelines and ratings.
     """
+    original_league = original_league or league
     print(f"[formula] Predicting: {home_team} vs "
           f"{away_team} ({league})")
 
@@ -2517,6 +2603,20 @@ def _predict_match(
         print(f"[formula] WARNING: no stats found for: "
               f"{', '.join(missing)}")
         return None
+
+    # A UCL fixture keeps its domestic league for the baseline stats,
+    # while adding a capped contribution from each side's UCL row.
+    if original_league == UCL_LEAGUE_NAME:
+        home_ucl = load_ucl_stats(home_team, season)
+        away_ucl = load_ucl_stats(away_team, season)
+        home_games_count = games_played(home_stats) or 10
+        away_games_count = games_played(away_stats) or 10
+        if home_ucl:
+            home_stats = blend_ucl_with_domestic(
+                home_stats, home_ucl, home_games_count)
+        if away_ucl:
+            away_stats = blend_ucl_with_domestic(
+                away_stats, away_ucl, away_games_count)
 
     league_avgs = load_league_averages(league, season)
 

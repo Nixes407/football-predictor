@@ -59,7 +59,9 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Chelsea":              "ENG-Premier League",
     "Liverpool":            "ENG-Premier League",
     "Manchester City":      "ENG-Premier League",
+    "Man City":             "ENG-Premier League",
     "Manchester United":    "ENG-Premier League",
+    "Man United":           "ENG-Premier League",
     "Newcastle United":     "ENG-Premier League",
     "Tottenham":            "ENG-Premier League",
     # Spain
@@ -141,10 +143,33 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "Sporting Clube de Portugal": "POR-Primeira Liga",
     # Netherlands
     "Feyenoord":            "NED-Eredivisie",
+    "Feyenoord Rotterdam":  "NED-Eredivisie",
     "PSV Eindhoven":        "NED-Eredivisie",
     "PSV":                  "NED-Eredivisie",
     "Ajax":                 "NED-Eredivisie",
     "AFC Ajax":             "NED-Eredivisie",
+    # Belgium
+    "Club Brugge":          "BEL-Jupiler Pro League",
+    "Club Brugge KV":       "BEL-Jupiler Pro League",
+    "Anderlecht":           "BEL-Jupiler Pro League",
+    # Turkey
+    "Fenerbahçe":           "TUR-Süper Lig",
+    "Fenerbahce":           "TUR-Süper Lig",
+    "Fenerbahçe SK":        "TUR-Süper Lig",
+    "Galatasaray":          "TUR-Süper Lig",
+    "Galatasaray SK":       "TUR-Süper Lig",
+    "Besiktas":             "TUR-Süper Lig",
+    # Norway
+    "Bodø/Glimt":           "NOR-Eliteserien",
+    "Bodo/Glimt":           "NOR-Eliteserien",
+    "FK Bodø/Glimt":        "NOR-Eliteserien",
+    "Viking FK":            "NOR-Eliteserien",
+    "Viking":               "NOR-Eliteserien",
+    # Austria
+    "LASK":                 "AUT-Bundesliga",
+    "LASK Linz":            "AUT-Bundesliga",
+    "Salzburg":             "AUT-Bundesliga",
+    "Red Bull Salzburg":    "AUT-Bundesliga",
 }
 
 # A stored prediction is refreshed at most this long after it was computed.
@@ -342,6 +367,7 @@ def _predict_with_formula(
     away_team: str,
     league: str,
     season: str | None,
+    original_league: str | None = None,
 ) -> dict | None:
     """
     Prediction values from the formula engine, or None when it cannot
@@ -364,12 +390,15 @@ def _predict_with_formula(
         print(f"[fixtures] formula_predict: {home_team!r} vs "
               f"{away_team!r} league={league!r} "
               f"season={(season or DEFAULT_SEASON)!r}")
-        prediction = formula_predict(
-            home_team=home_team,
-            away_team=away_team,
-            league=league,
-            season=season or DEFAULT_SEASON,
-        )
+        prediction_args = {
+            "home_team": home_team,
+            "away_team": away_team,
+            "league": league,
+            "season": season or DEFAULT_SEASON,
+        }
+        if original_league is not None:
+            prediction_args["original_league"] = original_league
+        prediction = formula_predict(**prediction_args)
         print(f"[fixtures] formula_predict returned: {bool(prediction)}")
     except Exception as exc:
         print(f"[fixtures] WARNING: formula prediction failed for "
@@ -471,10 +500,11 @@ def _find_fotmob_name(
     league: str,
     fotmob_names: dict,
 ) -> str:
-    """Resolve a fixture spelling to an unambiguous FotMob name in its league.
+    """Resolve a fixture spelling to a FotMob name in its league.
 
     Try exact, case-insensitive, suffix-stripped, partial and token matches,
-    in that order. Leave unknown or ambiguous names unchanged.
+    in that order. Ambiguous matches prefer the longest candidate; unknown
+    names are left unchanged.
     """
     candidates = fotmob_names.get(league, [])
     if not isinstance(candidates, list):
@@ -508,7 +538,11 @@ def _find_fotmob_name(
         return name
 
     def unique(matches: list[str]) -> str | None:
-        return matches[0] if len(matches) == 1 else None
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return max(matches, key=len)
+        return None
 
     clean_matches = [c for c in candidates if clean(c) == name_clean]
     if clean_matches:
@@ -531,7 +565,34 @@ def _find_fotmob_name(
                 len(name_tokens), len(tokens)
             ):
                 token_matches.append(candidate)
-        return unique(token_matches) or name
+        if token_matches:
+            return unique(token_matches) or name
+
+    KNOWN_ALIASES = {
+        "paris sg":              "Paris Saint Germain",
+        "paris saint-germain":   "Paris Saint Germain",
+        "psg":                   "Paris Saint Germain",
+        "man city":              "Manchester City",
+        "man united":            "Manchester United",
+        "man utd":               "Manchester United",
+        "atletico":              "Atletico Madrid",
+        "inter milan":           "Inter",
+        "ac milan":              "AC Milan",
+        "qpr":                   "Queens Park Rangers",
+        "west brom":             "West Bromwich Albion",
+        "spurs":                 "Tottenham",
+        "wolves":                "Wolverhampton Wanderers",
+        "feyenoord rotterdam":   "Feyenoord",
+        "rb leipzig":            "RB Leipzig",
+        "rasenballsport leipzig":"RB Leipzig",
+        "borussia m.gladbach":   "Borussia Mönchengladbach",
+        "atletico madrid":       "Atlético Madrid",
+    }
+    alias_result = KNOWN_ALIASES.get(name_lower)
+    if alias_result:
+        for c in candidates:
+            if c.casefold() == alias_result.casefold():
+                return c
 
     return name
 
@@ -549,10 +610,11 @@ def _predict_fixture_values(
     ML is only a fallback when both teams occur in the training history;
     otherwise return no prediction rather than a default-valued forecast.
     """
-    # Dynamically resolve team names to FotMob spelling. For UCL matches,
-    # find each side's domestic league before resolving its name.
+    # Preserve the tournament before replacing it with each team's
+    # domestic league for team-name resolution and domestic stats.
+    fixture_league = league
     fotmob_names = _load_fotmob_names()
-    if league == UCL_LEAGUE:
+    if fixture_league == UCL_LEAGUE:
         home_dom = _get_ucl_domestic_league(home_team)
         away_dom = _get_ucl_domestic_league(away_team)
         if not home_dom or not away_dom:
@@ -566,9 +628,15 @@ def _predict_fixture_values(
         home_team = _find_fotmob_name(home_team, league, fotmob_names)
         away_team = _find_fotmob_name(away_team, league, fotmob_names)
 
-    formula_result = _predict_with_formula(
-        home_team, away_team, league, season
-    )
+    if fixture_league == UCL_LEAGUE:
+        formula_result = _predict_with_formula(
+            home_team, away_team, league, season,
+            original_league=fixture_league,
+        )
+    else:
+        formula_result = _predict_with_formula(
+            home_team, away_team, league, season
+        )
     if formula_result:
         return formula_result
 
