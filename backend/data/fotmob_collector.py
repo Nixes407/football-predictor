@@ -124,7 +124,7 @@ FOTMOB_LEAGUES = {
         "prev_season": "2025/2026",
     },
     "BEL-Jupiler Pro League": {
-        "id": 57,
+        "id": 55,
         "ccode": "BEL",
         "season": "2026/2027",
         "prev_season": "2025/2026",
