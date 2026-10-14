@@ -18,6 +18,10 @@ LEAGUE_MAP = {
     "FL1": "FRA-Ligue 1",
     "PPL": "POR-Primeira Liga",
     "DED": "NED-Eredivisie",
+    "BSA": "BEL-Jupiler Pro League",
+    "TR1": "TUR-Süper Lig",
+    "NOR": "NOR-Eliteserien",
+    "AUT": "AUT-Bundesliga",
     "CL":  "UEFA-Champions League",
 }
 
