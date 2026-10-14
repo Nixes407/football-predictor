@@ -164,19 +164,31 @@ domestic league instead of their own. Also fixed
 
 163 UCL team name mappings.
 
-### PRIORITY 2 — ADD FOTMOB PLAYER STATS
+### PRIORITY 2 — ADD FOTMOB PLAYER STATS — COMPLETED ✅
 
-`fotmob_collector.py` currently only collects team
+`fotmob_collector.py` now collects both TEAM and PLAYER stats via
+FotMob's `leagueseasondeepstats` hub (type=teams + type=players).
+Player stats are merged across goals/assists/rating/expected_goals/
+expected_assists and upserted into `player_season_stats`
+(unique on player, team, league, season).
 
-stats. FotMob has player stats endpoints too.
+Implemented 2026-10-14: DEEP_PLAYER_QUERIES, get_player_stats(),
+_upsert_player(), collect_player_stats(), collect_fotmob() now runs
+teams then players. Team failure exits 1; player zero-rows with team
+success also exits 1 so broken player endpoints are noticed.
+Verified via mocked SQLite smoke tests (imports, parsers, merges,
+upserts, exit codes). Live FotMob probing is egress-blocked in sandbox
+(allowed hosts: github.com only) — real run will occur on GitHub
+Actions where FotMob is reachable.
 
-Adding player collection fixes:
+Fixes:
 
 - `top_scorer_goals: 0` in predictions
 
 - `squad_xg_total: 0` in predictions
 
 - Player impact modifier becomes real
+  (formula_engine.load_squad_players / load_key_players / _summarise_squad)
 
 FotMob player stats endpoint:
 
