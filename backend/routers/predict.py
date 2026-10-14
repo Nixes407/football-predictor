@@ -1216,3 +1216,39 @@ def clear_fixtures_cache(
         return {"error": str(exc)}
     finally:
         db.close()
+
+
+@router.get("/admin/fotmob-team-names")
+def fotmob_team_names() -> dict:
+    """
+    Show all team names stored in
+    team_season_stats grouped by league.
+    Used to debug team name mismatches.
+    """
+    try:
+        from database import (
+            SessionLocal, TeamSeasonStats)
+        db = SessionLocal()
+        try:
+            rows = db.query(
+                TeamSeasonStats.team,
+                TeamSeasonStats.league,
+            ).distinct().order_by(
+                TeamSeasonStats.league,
+                TeamSeasonStats.team,
+            ).all()
+
+            result = {}
+            for team, league in rows:
+                if league not in result:
+                    result[league] = []
+                result[league].append(team)
+
+            return {
+                "total_teams": len(rows),
+                "by_league": result,
+            }
+        finally:
+            db.close()
+    except Exception as exc:
+        return {"error": str(exc)}
