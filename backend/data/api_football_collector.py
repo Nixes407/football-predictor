@@ -37,6 +37,10 @@ LEAGUE_MAP = {
     "FRA-Ligue 1":        61,
     "POR-Primeira Liga":  94,
     "NED-Eredivisie":     88,
+    "BEL-Jupiler Pro League": 144,
+    "TUR-Süper Lig":      203,
+    "NOR-Eliteserien":    103,
+    "AUT-Bundesliga":     218,
     "USA-MLS":            253,
     "UEFA-Champions League": 2,
 }
@@ -50,6 +54,10 @@ SEASON_MAP = {
     "FRA-Ligue 1":        [2025, 2026],
     "POR-Primeira Liga":  [2025, 2026],
     "NED-Eredivisie":     [2025, 2026],
+    "BEL-Jupiler Pro League": [2025, 2026],
+    "TUR-Süper Lig":      [2025, 2026],
+    "NOR-Eliteserien":    [2025, 2026],
+    "AUT-Bundesliga":     [2025, 2026],
     "USA-MLS":            [2025, 2026],
     "UEFA-Champions League": [2025, 2026],
 }
@@ -65,6 +73,14 @@ SEASON_LABEL = {
     (88,  2025): "2025-2026", (88,  2026): "2026-2027",
     (253, 2025): "2025",      (253, 2026): "2026",
     (2,   2025): "2025-2026", (2,   2026): "2026-2027",
+    (144, 2025): "2025-2026",
+    (144, 2026): "2026-2027",
+    (203, 2025): "2025-2026",
+    (203, 2026): "2026-2027",
+    (103, 2025): "2025",
+    (103, 2026): "2026",
+    (218, 2025): "2025-2026",
+    (218, 2026): "2026-2027",
 }
 
 _calls_made = 0
@@ -260,7 +276,7 @@ def collect_fixtures_and_results() -> dict:
 
 def collect_team_stats() -> int:
     """
-    18 API calls — standings per league per season.
+    26 API calls — standings per domestic league per season.
     Standings returns all teams at once so we never
     need per-team requests. Stays within 100/day.
     """
@@ -269,7 +285,9 @@ def collect_team_stats() -> int:
     total = 0
 
     for league_name, league_id in LEAGUE_MAP.items():
-        if league_name == "UEFA-Champions League":
+        if league_name in (
+            "UEFA-Champions League",
+        ):
             continue
         for season_year in SEASON_MAP[league_name]:
             season_label = SEASON_LABEL.get(
@@ -360,7 +378,7 @@ def collect_team_stats() -> int:
     return total
 
 def collect_injuries() -> dict:
-    """9 API calls — one per domestic league (UCL skipped: not stored)."""
+    """13 API calls — one per domestic league (UCL skipped: not stored)."""
     print("[injuries] Collecting injuries...")
     all_injuries = {}
     today = date.today().isoformat()
@@ -391,7 +409,7 @@ def collect_injuries() -> dict:
 
 
 def collect_team_form() -> int:
-    """9 API calls — one per league."""
+    """13 API calls — one per domestic league (UCL skipped)."""
     print("[form] Collecting standings/form...")
     updated = 0
 
@@ -478,8 +496,8 @@ def collect_player_stats() -> int:
     rows. /teams supplies the team ids per league, then page 1 of
     /players is read for every team.
 
-    Budget: 1 /teams call per league plus ~1 /players call per team —
-    roughly 10 calls per league, ~185 for all nine. That is more than the
+    Budget: 1 /teams call per league plus ~1 /players call per team
+    across thirteen domestic leagues. That is more than the
     100/day free-tier quota, so the loop stops as soon as the API reports
     the limit (a quota or plan error arrives in a 200 body) and the rows
     collected up to that point are committed.
@@ -715,12 +733,12 @@ def run_all() -> None:
     API call budget (100/day free tier):
       1   status check
       2   fixtures + yesterday results
-      18  team stats (9 leagues x 2 seasons)
-      9   /teams for the player collector (1 per league)
-      ~185 player stats (1 /players call per team)
-      9   injuries
-      9   team form
-      A full pass is ~230+ calls, more than the daily quota, so
+      26  standings (13 domestic leagues x 2 seasons)
+      13  /teams for the player collector (1 per league)
+      ~250 /players calls (one per team; approximate)
+      13  injuries
+      13  team form
+      A full pass is over 300 calls, more than the daily quota, so
       collect_player_stats stops as soon as the API reports the limit and
       commits the teams it did reach; raise the plan or trim LEAGUE_MAP
       (or run that collector on its own) to cover more of the list.
