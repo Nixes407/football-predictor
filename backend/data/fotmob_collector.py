@@ -74,6 +74,18 @@ FOTMOB_NAMES_FILE = _BACKEND / "data" / "fotmob_team_names.json"
 # FotMob tournament ids, country codes (ccode3) and season labels. Season
 # labels use FotMob's readable "YYYY/YYYY" (European) or "YYYY" (MLS and
 # Eliteserien) form; they are converted to the database's dash format on upsert.
+#
+# Every id below was checked against FotMob's live API on 2026-10-14
+# (GET /api/data/leagues?id=... and /api/data/leagueseasondeepstats?id=...).
+# Ids that were used or proposed before and are wrong:
+#   BEL 57 -> NED Eredivisie, 55 -> ITA Serie A (Italian rows stored as BEL),
+#       62 -> no league (null). The Belgian First Division A is id 40.
+#   NOR 107 -> no league (null). Eliteserien is id 59 and publishes
+#       calendar-year seasons ("2026", "2025") like MLS; asking for
+#       "2025/2026" silently returns the 2026 table.
+#   AUT 44 -> Copa America. The Austrian Bundesliga is id 38.
+# A wrong id now fails loudly: league tables and deep stats from a country
+# other than the league-key prefix are rejected (see _check_league).
 FOTMOB_LEAGUES = {
     "ENG-Premier League": {
         "id": 47,
@@ -124,7 +136,7 @@ FOTMOB_LEAGUES = {
         "prev_season": "2025/2026",
     },
     "BEL-Jupiler Pro League": {
-        "id": 55,
+        "id": 40,
         "ccode": "BEL",
         "season": "2026/2027",
         "prev_season": "2025/2026",
@@ -136,13 +148,13 @@ FOTMOB_LEAGUES = {
         "prev_season": "2025/2026",
     },
     "NOR-Eliteserien": {
-        "id": 107,
+        "id": 59,
         "ccode": "NOR",
         "season": "2026",
         "prev_season": "2025",
     },
     "AUT-Bundesliga": {
-        "id": 44,
+        "id": 38,
         "ccode": "AUT",
         "season": "2026/2027",
         "prev_season": "2025/2026",
@@ -250,19 +262,72 @@ def _db_season(season: str) -> str:
     return str(season).replace("/", "-")
 
 
+def _fotmob_season(label, calendar_year: bool) -> str:
+    """A season label in the league's own FotMob form, keeping the start year.
+
+    Calendar-year leagues publish "2026", split-year leagues "2026/2027".
+    A label in the wrong form does not fail: FotMob's league table silently
+    falls back to the latest season, which would store the current table
+    under another season's label.
+    """
+    text = str(label).strip().replace("-", "/")
+    start = text.split("/", 1)[0]
+    if len(start) != 4 or not start.isdigit():
+        return text
+    year = int(start)
+    return str(year) if calendar_year else f"{year}/{year + 1}"
+
+
 def _get_seasons(league: str) -> list[str]:
-    """Return configured seasons in previous-to-current order for a league."""
+    """Return configured seasons in previous-to-current order for a league.
+
+    Labels are normalised to the league's FotMob season form, so a
+    calendar-year league is never asked for a split-year season (or the
+    reverse) even if FOTMOB_LEAGUES is edited with the wrong form.
+    """
     CALENDAR_YEAR_LEAGUES = {
         "USA-MLS",
+        # Eliteserien runs March-December. FotMob lists its seasons as
+        # "2026", "2025", ... (verified 2026-10-14), and a "2025/2026"
+        # request silently returns the 2026 table.
         "NOR-Eliteserien",
     }
+    calendar_year = league in CALENDAR_YEAR_LEAGUES
     config = FOTMOB_LEAGUES.get(league, {})
     seasons = []
-    if config.get("prev_season"):
-        seasons.append(config["prev_season"])
-    if config.get("season"):
-        seasons.append(config["season"])
-    return seasons if seasons else ["2026/2027"]
+    for key in ("prev_season", "season"):
+        if config.get(key):
+            label = _fotmob_season(config[key], calendar_year)
+            if label not in seasons:
+                seasons.append(label)
+    return seasons or [_fotmob_season("2026/2027", calendar_year)]
+
+
+def _league_country(league: str) -> str:
+    """FotMob country code expected for a league key ("BEL-..." -> "BEL").
+
+    FotMob files UEFA competitions under "INT"; for every other configured
+    league the key prefix equals FotMob's country code (verified 2026-10-14).
+    """
+    prefix = league.split("-", 1)[0].strip().upper()
+    return {"UEFA": "INT"}.get(prefix, prefix)
+
+
+def _check_league(details, key: str, league_id: int, expected: str | None) -> None:
+    """Reject a FotMob response that belongs to another country's league.
+
+    A wrong id does not fail on its own: it quietly returns some other
+    competition (id 55 is Serie A, so Italian clubs were stored as Belgian).
+    Comparing the country code FotMob reports turns that into an error.
+    """
+    if not expected or not isinstance(details, dict):
+        return
+    actual = str(details.get(key) or "").strip().upper()
+    if actual and actual != expected:
+        raise ValueError(
+            f"FotMob league id {league_id} is {details.get('name')!r} "
+            f"({actual}), not a {expected} league - fix its id in FOTMOB_LEAGUES"
+        )
 
 
 def _season_aliases(value) -> set[str]:
@@ -466,11 +531,18 @@ class _FotMobClient:
 
     # -- deep stats ----------------------------------------------------
 
-    def _deep_fetch(self, league_id: int, season_param, query: dict):
-        """One deep-stats request; returns (payload, rows or None)."""
+    def _deep_fetch(self, league_id: int, season_param, query: dict,
+                    country: str | None = None):
+        """One deep-stats request; returns (payload, rows or None).
+
+        ``country`` is the FotMob country code the league must belong to;
+        a response for another country's league raises ValueError.
+        """
         payload = self._get("leagueseasondeepstats", {
             "id": league_id, "season": season_param, **query,
         })
+        _check_league(payload.get("leagueDetails"), "countryCode",
+                      league_id, country)
         rows = payload.get("statsData")
         return payload, rows if isinstance(rows, list) and rows else None
 
@@ -485,7 +557,8 @@ class _FotMobClient:
 
         return sorted(queries, key=matches)
 
-    def _resolve_season(self, league_id: int, season: str):
+    def _resolve_season(self, league_id: int, season: str,
+                        country: str | None = None):
         """Map a readable season label to the deep-stats season parameter.
 
         The deep-stats endpoint wants FotMob's internal numeric season id
@@ -497,7 +570,7 @@ class _FotMobClient:
             return self._seasons[key]
         payload = None
         for query in self._ordered_queries(DEEP_STAT_QUERIES["expectedGoals"]):
-            payload, rows = self._deep_fetch(league_id, season, query)
+            payload, rows = self._deep_fetch(league_id, season, query, country)
             if rows:
                 self._seasons[key] = season
                 return season
@@ -505,6 +578,8 @@ class _FotMobClient:
         season_id = _match_season((payload or {}).get("seasons") or [], season)
         if season_id is None:
             directory = self._get("leagueseasondeepstats", {"id": league_id})
+            _check_league(directory.get("leagueDetails"), "countryCode",
+                          league_id, country)
             season_id = _match_season(directory.get("seasons") or [], season)
         if season_id is None:
             raise ValueError(
@@ -513,7 +588,8 @@ class _FotMobClient:
         self._seasons[key] = season_id
         return season_id
 
-    def get_team_xg_stats(self, league_id: int, season: str) -> dict:
+    def get_team_xg_stats(self, league_id: int, season: str,
+                          country: str | None = None) -> dict:
         """Team season stats for one league and season from the deep-stats API.
 
         Combines one request per stat (expected goals, shots on target and
@@ -524,7 +600,7 @@ class _FotMobClient:
                          "possession": 58.3, "goals": 70.0, "saves": 41.0,
                          "cleanSheets": 14.0, "matchesPlayed": 38}}
         """
-        season_param = self._resolve_season(league_id, season)
+        season_param = self._resolve_season(league_id, season, country)
         if str(season_param) != str(season):
             print(f"[fotmob] Season {season} -> internal id {season_param}")
         teams = {}
@@ -532,7 +608,9 @@ class _FotMobClient:
             rows = None
             used = None
             for query in self._ordered_queries(queries):
-                _, rows = self._deep_fetch(league_id, season_param, query)
+                _, rows = self._deep_fetch(
+                    league_id, season_param, query, country,
+                )
                 if rows:
                     used = query
                     break
@@ -570,11 +648,25 @@ class _FotMobClient:
 
     # -- standings -----------------------------------------------------
 
-    def get_league_table(self, league_id: int, ccode: str, season: str) -> dict:
-        """League standings: matches played, results and goals for/against."""
+    def get_league_table(self, league_id: int, ccode: str, season: str,
+                         country: str | None = None) -> dict:
+        """League standings: matches played, results and goals for/against.
+
+        Raises ValueError when FotMob answers with another country's league
+        (wrong id) or with a different season than requested: for an
+        unknown season label FotMob silently returns the latest table.
+        """
         payload = self._get("leagues", {
             "id": league_id, "ccode3": ccode, "season": season,
         })
+        details = payload.get("details")
+        _check_league(details, "country", league_id, country)
+        selected = details.get("selectedSeason") if isinstance(details, dict) else None
+        if selected and not (_season_aliases(selected) & _season_aliases(season)):
+            raise ValueError(
+                f"FotMob returned season {selected} for league {league_id} "
+                f"instead of {season}"
+            )
         teams = {}
         entries = payload.get("table")
         if not isinstance(entries, list):
@@ -583,25 +675,34 @@ class _FotMobClient:
             if not isinstance(entry, dict):
                 continue
             data = entry.get("data") or {}
-            rows = (data.get("table") or {}).get("all") or []
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                name = row.get("name") if isinstance(row, dict) else None
-                if not isinstance(name, str) or not name.strip():
+            # Split tables are "composite": MLS conferences and the Belgian /
+            # Austrian play-off groups keep their rows in data["tables"][i]
+            # rather than data["table"]. Their rows carry full-season totals.
+            groups = [data] + [
+                group for group in (data.get("tables") or [])
+                if isinstance(group, dict)
+            ]
+            for group in groups:
+                table = group.get("table")
+                rows = table.get("all") if isinstance(table, dict) else None
+                if not isinstance(rows, list):
                     continue
-                name = " ".join(name.split())
-                if name in teams:
-                    continue
-                goals_for, goals_against = _parse_scores(row.get("scoresStr"))
-                teams[name] = {
-                    "matchesPlayed": _safe(row.get("played")),
-                    "gk_w": _safe(row.get("wins")),
-                    "gk_d": _safe(row.get("draws")),
-                    "gk_l": _safe(row.get("losses")),
-                    "goalsFor": goals_for,
-                    "gk_ga": goals_against,
-                }
+                for row in rows:
+                    name = row.get("name") if isinstance(row, dict) else None
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    name = " ".join(name.split())
+                    if name in teams:
+                        continue
+                    goals_for, goals_against = _parse_scores(row.get("scoresStr"))
+                    teams[name] = {
+                        "matchesPlayed": _safe(row.get("played")),
+                        "gk_w": _safe(row.get("wins")),
+                        "gk_d": _safe(row.get("draws")),
+                        "gk_l": _safe(row.get("losses")),
+                        "goalsFor": goals_for,
+                        "gk_ga": goals_against,
+                    }
         if not teams:
             raise ValueError("FotMob league table is empty")
         return teams
@@ -621,26 +722,49 @@ def _store_fotmob_name(db, fotmob_name: str, league: str) -> None:
 
 def collect_team_stats() -> int:
     """Collect both seasons for all leagues; return successfully committed rows."""
+    # Clean up potentially corrupted Belgian data
+    db_clean = SessionLocal()
+    try:
+        deleted = db_clean.query(
+            TeamSeasonStats
+        ).filter(
+            TeamSeasonStats.league ==
+            "BEL-Jupiler Pro League"
+        ).delete()
+        db_clean.commit()
+        if deleted:
+            print(f"[fotmob] Cleaned up "
+                  f"{deleted} corrupted "
+                  f"Belgian league rows")
+    except Exception as exc:
+        db_clean.rollback()
+        print(f"[fotmob] WARNING: Belgian cleanup failed: {exc}")
+    finally:
+        db_clean.close()
+
     print("[fotmob] Collecting team stats via the FotMob JSON API...")
     total = 0
     client = _FotMobClient()
     try:
         for league, config in FOTMOB_LEAGUES.items():
             league_id = config["id"]
+            country = _league_country(league)
             for api_season in _get_seasons(league):
                 db_season = _db_season(api_season)
                 print(f"[fotmob] {league} {api_season}...")
                 try:
                     try:
                         table = client.get_league_table(
-                            league_id, config["ccode"], api_season,
+                            league_id, config["ccode"], api_season, country,
                         )
                     except Exception as exc:
                         print(f"[fotmob] WARNING: league table failed for "
                               f"{league} {api_season}: {exc}")
                         table = {}
                     try:
-                        stats = client.get_team_xg_stats(league_id, api_season)
+                        stats = client.get_team_xg_stats(
+                            league_id, api_season, country,
+                        )
                     except Exception as exc:
                         print(f"[fotmob] WARNING: deep stats failed for "
                               f"{league} {api_season}: {exc}")
@@ -682,24 +806,30 @@ def collect_team_stats() -> int:
     finally:
         client.close()
 
-    # Export persisted team names for fixture matching. Keep previously
-    # collected leagues when a league's API request fails this time.
+    # Export persisted team names for fixture matching. The database is
+    # authoritative for every league it holds, so stale names (such as the
+    # Italian clubs once stored as Belgian) are dropped; leagues missing
+    # from the database keep their previously exported names.
     try:
         existing = {}
         if FOTMOB_NAMES_FILE.exists():
             existing = json.loads(FOTMOB_NAMES_FILE.read_text())
+        # Rebuilt from the database only, after the cleanup above.
+        existing.pop("BEL-Jupiler Pro League", None)
+        current = {}
         db_check = SessionLocal()
         try:
             rows = db_check.query(
                 TeamSeasonStats.team, TeamSeasonStats.league,
             ).distinct().all()
             for team, league in rows:
-                if league not in existing:
-                    existing[league] = []
-                if team not in existing[league]:
-                    existing[league].append(team)
+                if league not in current:
+                    current[league] = []
+                if team not in current[league]:
+                    current[league].append(team)
         finally:
             db_check.close()
+        existing.update(current)
         FOTMOB_NAMES_FILE.write_text(json.dumps(existing, indent=2))
         print(f"[fotmob] Saved team names to {FOTMOB_NAMES_FILE.name}")
     except Exception as exc:

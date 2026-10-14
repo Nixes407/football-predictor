@@ -5,6 +5,9 @@ Run from backend/ directory:
 
     python data/api_football_collector.py
 
+Requests are paced to the key's per-minute limit (10/min on the free plan)
+and API errors (plan, quota, parameters), which arrive as HTTP 200 with an
+empty response, are printed instead of looking like "0 items".
 """
 
 from __future__ import annotations
@@ -45,6 +48,10 @@ LEAGUE_MAP = {
     "UEFA-Champions League": 2,
 }
 
+# API-Football seasons are 4-digit start years: 2025 is the 2025-2026
+# season of a European league and the 2025 calendar season of MLS and
+# Eliteserien. Free plans cannot read recent seasons; the API then answers
+# HTTP 200 with no rows and errors={"plan": ...}, which _get() prints.
 SEASON_MAP = {
     "ENG-Premier League": [2025, 2026],
     "ENG-Championship":   [2025, 2026],
@@ -83,7 +90,41 @@ SEASON_LABEL = {
     (218, 2026): "2026-2027",
 }
 
-_calls_made = 0
+# Leagues whose injuries and recent form are fetched. The newer leagues
+# (BEL, TUR, NOR, AUT, MLS) are left out to stay inside the request budget;
+# their form still comes from the standings read by collect_team_stats.
+INJURY_LEAGUES = {
+    "ENG-Premier League",
+    "ESP-La Liga",
+    "GER-Bundesliga",
+    "ITA-Serie A",
+    "FRA-Ligue 1",
+    "ENG-Championship",
+    "POR-Primeira Liga",
+    "NED-Eredivisie",
+    "UEFA-Champions League",
+}
+
+# API-Football limits requests per minute as well as per day: Free 10/min,
+# Pro 300/min, Ultra 450/min, Mega 900/min
+# (https://www.api-football.com/news/post/how-ratelimit-works).
+# A fixed 1.2 s gap sends ~50 requests a minute, so free keys got HTTP 429
+# from the eleventh call on. Requests are now spaced by 60 / limit seconds
+# using the X-RateLimit-Limit header, at the free-plan pace until the first
+# response reports the key's real limit. A 429 is retried once the minute
+# window has passed.
+MIN_REQUEST_GAP  = 1.2   # seconds; floor for paid plans
+FREE_PLAN_GAP    = 6.5   # seconds; 10 requests a minute plus a margin
+RATE_LIMIT_WAIT  = 65    # seconds to wait after HTTP 429
+MAX_RATE_RETRIES = 2
+
+_calls_made      = 0
+_request_gap     = FREE_PLAN_GAP
+_last_request    = 0.0
+_quota_exhausted = False
+# Standings by (league id, season): collect_team_stats and
+# collect_team_form read the same tables, so each is fetched once per run.
+_standings_cache: dict[tuple[int, int], dict] = {}
 
 
 def _safe(val) -> float | None:
@@ -127,46 +168,125 @@ def _norm_position(value) -> str | None:
     return POSITION_MAP.get(raw.lower())
 
 
+def _api_errors(payload) -> dict:
+    """The ``errors`` object of an API-Football reply, as a dict.
+
+    The API reports quota, plan and parameter problems with HTTP 200, an
+    empty ``response`` and the reason in ``errors`` (``[]`` when fine),
+    e.g. {"requests": "You have reached the request limit for the day"}
+    or {"plan": "Free plans do not have access to this season, ..."}.
+    """
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if isinstance(errors, dict):
+        return errors
+    if isinstance(errors, list) and errors:
+        return {"errors": errors}
+    return {}
+
+
+def _pace(headers) -> None:
+    """Space requests to the per-minute limit the API reports for this key."""
+    global _request_gap
+    limit = _safe(headers.get("x-ratelimit-limit"))
+    if limit and limit > 0:
+        _request_gap = max(MIN_REQUEST_GAP, 60.0 / limit + 0.5)
+
+
 def _get(endpoint: str, params: dict) -> dict | None:
-    global _calls_made
+    global _calls_made, _last_request, _quota_exhausted
     if not API_KEY:
         print("[api] ERROR: API_FOOTBALL_KEY not set")
         sys.exit(1)
+    if _quota_exhausted:
+        print(f"[api] SKIP {endpoint}: daily request quota exhausted")
+        return None
     headers = {"x-apisports-key": API_KEY}
     url     = f"{BASE_URL}/{endpoint}"
-    try:
-        resp = requests.get(
-            url, headers=headers,
-            params=params, timeout=30)
+    for attempt in range(MAX_RATE_RETRIES + 1):
+        wait = _request_gap - (time.monotonic() - _last_request)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = requests.get(
+                url, headers=headers,
+                params=params, timeout=30)
+        except Exception as exc:
+            print(f"[api] ERROR: {endpoint}: {exc}")
+            return None
+        finally:
+            _last_request = time.monotonic()
         _calls_made += 1
-        if resp.status_code == 200:
-            data      = resp.json()
-            remaining = resp.headers.get(
-                "x-ratelimit-requests-remaining", "?")
-            n = len(data.get("response", []))
-            print(f"[api] [{_calls_made}] {endpoint} "
-                  f"-> {n} items "
-                  f"(remaining: {remaining})")
-            time.sleep(1.2)
-            return data
-        else:
+        _pace(resp.headers)
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        errors = _api_errors(data)
+
+        if resp.status_code == 429 and "requests" not in errors:
+            if attempt < MAX_RATE_RETRIES:
+                print(f"[api] WARNING: HTTP 429 for {endpoint} "
+                      f"(per-minute limit) - retrying in "
+                      f"{RATE_LIMIT_WAIT}s "
+                      f"({attempt + 1}/{MAX_RATE_RETRIES})")
+                time.sleep(RATE_LIMIT_WAIT)
+                continue
+            print(f"[api] WARNING: HTTP 429 for {endpoint} - "
+                  f"giving up after {MAX_RATE_RETRIES} retries")
+            return None
+        if "requests" in errors:
+            # Daily quota used up: every further call would fail as well.
+            _quota_exhausted = True
+            print(f"[api] ERROR: {errors['requests']} - "
+                  f"skipping the remaining API calls")
+        if resp.status_code != 200 or not isinstance(data, dict):
             print(f"[api] WARNING: HTTP "
                   f"{resp.status_code} for {endpoint}")
             return None
-    except Exception as exc:
-        print(f"[api] ERROR: {endpoint}: {exc}")
-        return None
+
+        remaining = resp.headers.get(
+            "x-ratelimit-requests-remaining", "?")
+        n = len(data.get("response") or [])
+        print(f"[api] [{_calls_made}] {endpoint} "
+              f"-> {n} items "
+              f"(remaining: {remaining})")
+        if errors and "requests" not in errors:
+            print(f"[api] API error for {endpoint} "
+                  f"{params}: {errors}")
+        return data
+    return None
+
+
+def _get_standings(league_id: int, season: int) -> dict | None:
+    """Standings for one league season, fetched at most once per run."""
+    key = (league_id, season)
+    if key not in _standings_cache:
+        data = _get("standings", {
+            "league": league_id,
+            "season": season,
+        })
+        if data is None:
+            return None
+        _standings_cache[key] = data
+    return _standings_cache[key]
 
 
 def check_status() -> bool:
     data = _get("status", {})
     if not data:
         return False
-    r    = data.get("response", {})
-    acct = r.get("account", {})
-    reqs = r.get("requests", {})
+    errors = _api_errors(data)
+    r = data.get("response")
+    if errors or not isinstance(r, dict):
+        print(f"[api] ERROR: status check failed: "
+              f"{errors or 'no account data'}")
+        return False
+    acct = r.get("account") or {}
+    sub  = r.get("subscription") or {}
+    reqs = r.get("requests") or {}
     print(f"[api] Account: {acct.get('firstname')} "
           f"{acct.get('lastname')}")
+    print(f"[api] Plan: {sub.get('plan')}")
     print(f"[api] Calls today: "
           f"{reqs.get('current')} / "
           f"{reqs.get('limit_day')}")
@@ -296,10 +416,7 @@ def collect_team_stats() -> int:
             print(f"[team] {league_name} "
                   f"{season_year}...")
 
-            data = _get("standings", {
-                "league": league_id,
-                "season": season_year,
-            })
+            data = _get_standings(league_id, season_year)
             if not data:
                 continue
 
@@ -378,16 +495,20 @@ def collect_team_stats() -> int:
     return total
 
 def collect_injuries() -> dict:
-    """13 API calls — one per domestic league (UCL skipped: not stored)."""
+    """8 API calls — one per INJURY_LEAGUES league (UCL skipped: not stored)."""
     print("[injuries] Collecting injuries...")
     all_injuries = {}
     today = date.today().isoformat()
 
     for league_name, league_id in LEAGUE_MAP.items():
+        if league_name not in INJURY_LEAGUES:
+            continue
         if league_name == "UEFA-Champions League":
             continue
         data = _get("injuries", {
             "league": league_id,
+            # The API requires "season" whenever "league" is given.
+            "season": max(SEASON_MAP[league_name]),
             "date":   today,
         })
         injuries = []
@@ -409,21 +530,25 @@ def collect_injuries() -> dict:
 
 
 def collect_team_form() -> int:
-    """13 API calls — one per domestic league (UCL skipped)."""
+    """
+    Recent form for the INJURY_LEAGUES leagues (UCL skipped).
+
+    Reuses the latest-season standings collect_team_stats already fetched
+    in this run: no extra calls inside run_all, 8 when run on its own.
+    """
     print("[form] Collecting standings/form...")
     updated = 0
 
     for league_name, league_id in LEAGUE_MAP.items():
+        if league_name not in INJURY_LEAGUES:
+            continue
         if league_name == "UEFA-Champions League":
             continue
         latest   = max(SEASON_MAP[league_name])
         season_l = SEASON_LABEL.get(
             (league_id, latest), str(latest))
 
-        data = _get("standings", {
-            "league": league_id,
-            "season": latest,
-        })
+        data = _get_standings(league_id, latest)
         if not data:
             continue
 
@@ -485,11 +610,9 @@ def collect_team_form() -> int:
 def collect_player_stats() -> int:
     """
     Fetch players for each team using
-    the /players endpoint with team parameter.
-    Uses standing data to get team IDs first.
-    One call per league for standings (already
-    done in collect_team_form) then one call
-    per team for players.
+    the /players endpoint with team parameter:
+    one /teams call per league for the team ids,
+    then one /players call per team.
 
     The league-wide page (league + season, no team / player) comes back
     empty on the free tier, which is why this collector used to store no
@@ -730,18 +853,21 @@ def run_all() -> None:
     Run all collectors in sequence.
     Exits with code 1 on any failure.
 
-    API call budget (100/day free tier):
-      1   status check
+    API call budget (100/day free tier), in run order:
+      1   status check (does not count against the daily quota)
       2   fixtures + yesterday results
       26  standings (13 domestic leagues x 2 seasons)
+      8   injuries (INJURY_LEAGUES, UCL skipped)
+      0   team form (reuses the standings fetched above)
       13  /teams for the player collector (1 per league)
       ~250 /players calls (one per team; approximate)
-      13  injuries
-      13  team form
-      A full pass is over 300 calls, more than the daily quota, so
-      collect_player_stats stops as soon as the API reports the limit and
-      commits the teams it did reach; raise the plan or trim LEAGUE_MAP
-      (or run that collector on its own) to cover more of the list.
+      Injuries and form run before the player collector, which spends
+      whatever quota is left. A full player pass is over 250 calls, more
+      than the daily quota, so collect_player_stats stops as soon as the
+      API reports the limit and commits the teams it did reach; raise the
+      plan or trim LEAGUE_MAP (or run that collector on its own) to cover
+      more of the list. Calls are paced to the per-minute limit (about
+      6.5 s apart on the free plan, 10 requests/minute).
     """
     print("=" * 60)
     print("API-FOOTBALL DAILY COLLECTION")
@@ -763,14 +889,14 @@ def run_all() -> None:
     print("\n--- TEAM STATISTICS ---")
     collect_team_stats()
 
-    print("\n--- PLAYER STATISTICS ---")
-    collect_player_stats()
-
     print("\n--- INJURIES ---")
     collect_injuries()
 
     print("\n--- TEAM FORM ---")
     collect_team_form()
+
+    print("\n--- PLAYER STATISTICS ---")
+    collect_player_stats()
 
     print("\n" + "=" * 60)
     print("COLLECTION COMPLETE")
