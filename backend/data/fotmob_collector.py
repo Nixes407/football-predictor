@@ -72,8 +72,8 @@ FOTMOB_NAMES_FILE = _BACKEND / "data" / "fotmob_team_names.json"
 
 
 # FotMob tournament ids, country codes (ccode3) and season labels. Season
-# labels use FotMob's readable "YYYY/YYYY" (European) or "YYYY" (MLS) form;
-# they are converted to the database's dash format on upsert.
+# labels use FotMob's readable "YYYY/YYYY" (European) or "YYYY" (MLS and
+# Eliteserien) form; they are converted to the database's dash format on upsert.
 FOTMOB_LEAGUES = {
     "ENG-Premier League": {
         "id": 47,
@@ -120,6 +120,36 @@ FOTMOB_LEAGUES = {
     "NED-Eredivisie": {
         "id": 57,
         "ccode": "NLD",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "BEL-Jupiler Pro League": {
+        "id": 57,
+        "ccode": "BEL",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "TUR-Süper Lig": {
+        "id": 71,
+        "ccode": "TUR",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "NOR-Eliteserien": {
+        "id": 107,
+        "ccode": "NOR",
+        "season": "2026",
+        "prev_season": "2025",
+    },
+    "AUT-Bundesliga": {
+        "id": 44,
+        "ccode": "AUT",
+        "season": "2026/2027",
+        "prev_season": "2025/2026",
+    },
+    "UEFA-Champions League": {
+        "id": 42,
+        "ccode": "EUR",
         "season": "2026/2027",
         "prev_season": "2025/2026",
     },
@@ -218,6 +248,21 @@ def _norm_team(name) -> str:
 def _db_season(season: str) -> str:
     """Convert FotMob season labels to the dash format used in the database."""
     return str(season).replace("/", "-")
+
+
+def _get_seasons(league: str) -> list[str]:
+    """Return configured seasons in previous-to-current order for a league."""
+    CALENDAR_YEAR_LEAGUES = {
+        "USA-MLS",
+        "NOR-Eliteserien",
+    }
+    config = FOTMOB_LEAGUES.get(league, {})
+    seasons = []
+    if config.get("prev_season"):
+        seasons.append(config["prev_season"])
+    if config.get("season"):
+        seasons.append(config["season"])
+    return seasons if seasons else ["2026/2027"]
 
 
 def _season_aliases(value) -> set[str]:
@@ -582,7 +627,7 @@ def collect_team_stats() -> int:
     try:
         for league, config in FOTMOB_LEAGUES.items():
             league_id = config["id"]
-            for api_season in (config["season"], config["prev_season"]):
+            for api_season in _get_seasons(league):
                 db_season = _db_season(api_season)
                 print(f"[fotmob] {league} {api_season}...")
                 try:
