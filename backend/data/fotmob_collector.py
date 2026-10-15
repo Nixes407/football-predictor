@@ -77,7 +77,10 @@ _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from database import SessionLocal, TeamSeasonStats, PlayerSeasonStats
+from database import (
+    SessionLocal, TeamSeasonStats, PlayerSeasonStats,
+    ensure_team_corners_column,
+)
 from sqlalchemy import and_
 
 
@@ -241,6 +244,28 @@ DEEP_STAT_QUERIES = {
         {"stat": "clean_sheet_team", "type": "teams"},
         {"stat": "clean_sheets", "teamOrPlayer": "team"},
     ],
+    "corners": [
+        {"stat": "corner_taken_team", "type": "teams"},
+        {"stat": "corner_taken", "teamOrPlayer": "team"},
+        {"stat": "corners_team", "type": "teams"},
+        {"stat": "corners", "teamOrPlayer": "team"},
+    ],
+    "crosses": [
+        {"stat": "accurate_cross_team", "type": "teams"},
+        {"stat": "accurate_cross", "teamOrPlayer": "team"},
+        {"stat": "crosses_team", "type": "teams"},
+        {"stat": "crosses", "teamOrPlayer": "team"},
+    ],
+    "touchesOppBox": [
+        {"stat": "touches_in_opp_box_team", "type": "teams"},
+        {"stat": "touches_in_opp_box", "teamOrPlayer": "team"},
+    ],
+    "shotsTotal": [
+        {"stat": "total_scoring_att_team", "type": "teams"},
+        {"stat": "total_scoring_att", "teamOrPlayer": "team"},
+        {"stat": "shots_team", "type": "teams"},
+        {"stat": "shots", "teamOrPlayer": "team"},
+    ],
 }
 
 # Deep-stats response key -> TeamSeasonStats column (task spec mapping).
@@ -251,6 +276,10 @@ STAT_COLUMNS = {
     "goals": "sh_goals",
     "saves": "gk_saves",
     "cleanSheets": "gk_cs",
+    "corners": "misc_corners",
+    "crosses": "misc_crs",
+    "touchesOppBox": "pos_touch_attpen",
+    "shotsTotal": "sh_shots",
 }
 
 # ---------------------------------------------------------------------------
@@ -593,6 +622,29 @@ def _row_value(row: dict) -> float | None:
     return None
 
 
+def _team_stat_is_per_match(logical: str, stat_name: str, rows: list) -> bool:
+    """Detect rate-valued pressure leaderboards that must become totals."""
+    if str(stat_name).casefold().endswith("_match"):
+        return True
+    thresholds = {
+        "corners": 15.0,
+        "crosses": 30.0,
+        "shotsTotal": 30.0,
+        "touchesOppBox": 100.0,
+    }
+    threshold = thresholds.get(logical)
+    if threshold is None:
+        return False
+    values = sorted(
+        value for row in rows if isinstance(row, dict)
+        for value in [_row_value(row)] if value is not None
+    )
+    if not values:
+        return False
+    median = values[len(values) // 2]
+    return median < threshold
+
+
 def _row_matches(row: dict, *, allow_substat: bool = False) -> float | None:
     """Matches played from explicit fields, optionally falling back to substat.
 
@@ -912,6 +964,7 @@ class _FotMobClient:
         self._player_samples = set() # player deep-stats sample keys
         self._player_statslist_logged = set()
         self._player_team_map_logged = set()
+        self._team_statslist_logged = set()
 
     # -- HTTP ----------------------------------------------------------
 
@@ -1189,10 +1242,11 @@ class _FotMobClient:
             print(f"[fotmob] Season {season} -> internal id {season_param}")
         teams = {}
         for logical, queries in DEEP_STAT_QUERIES.items():
+            payload = None
             rows = None
             used = None
             for query in self._ordered_queries(queries):
-                _, rows = self._deep_fetch(
+                payload, rows = self._deep_fetch(
                     league_id, season_param, query, country,
                 )
                 if rows:
@@ -1201,13 +1255,24 @@ class _FotMobClient:
             if not rows:
                 print(f"[fotmob] WARNING: no {logical} stats for "
                       f"league {league_id} {season}")
+                if logical in {"corners", "crosses", "shotsTotal"}:
+                    print(f"[fotmob] {logical} rows fetched: 0; merged teams: 0")
                 continue
             style = {k: v for k, v in used.items() if k != "stat"}
             if self._deep_style != style:
                 self._deep_style = style
                 print(f"[fotmob] Deep-stats params that worked: {style}")
-            per_match = str(used.get("stat", "")).endswith("_match")
-            unscaled = 0
+            if league_id not in self._team_statslist_logged and payload is not None:
+                self._team_statslist_logged.add(league_id)
+                names = _stats_list_names(payload)
+                print(f"[fotmob] Team statsList names for league {league_id} {season}: "
+                      f"{names if names else 'not present in payload'}")
+            stat_name = str(used.get("stat", ""))
+            per_match = _team_stat_is_per_match(logical, stat_name, rows)
+            if logical in {"corners", "crosses", "touchesOppBox", "shotsTotal"}:
+                units = "per-match (scaling by matchesPlayed)" if per_match else "season totals"
+                print(f"[fotmob] {logical}: stat={stat_name} worked; detected {units}")
+            skipped_unscaled = 0
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -1232,11 +1297,22 @@ class _FotMobClient:
                     if matches:
                         value = value * matches
                     else:
-                        unscaled += 1
+                        # A rate in a season-total column is worse than no
+                        # value; preserve any existing DB value instead.
+                        skipped_unscaled += 1
+                        continue
                 entry[logical] = value
-            if unscaled:
-                print(f"[fotmob] WARNING: {logical} kept as a per-match value "
-                      f"for {unscaled} teams (no match counts available)")
+            if skipped_unscaled:
+                print(f"[fotmob] WARNING: {logical} skipped for "
+                      f"{skipped_unscaled} teams (per-match values without matchesPlayed)")
+            if logical in {"corners", "crosses", "shotsTotal"}:
+                merged = sum(1 for entry in teams.values() if entry.get(logical) is not None)
+                print(f"[fotmob] {logical} rows fetched: {len(rows)}; merged teams: {merged}")
+        corners_non_null = sum(
+            1 for entry in teams.values() if entry.get("corners") is not None
+        )
+        print(f"[fotmob] league {league_id} {season}: "
+              f"{corners_non_null} teams got misc_corners non-null after merge")
         return teams
 
     def get_player_stats(self, league_id: int, season: str,
@@ -1488,6 +1564,12 @@ def collect_team_stats(client: _FotMobClient | None = None) -> int:
     A caller may pass a shared client so its season and team-id caches are
     reused by player collection; no-argument public use remains supported.
     """
+    # Daily jobs do not necessarily pass through FastAPI's init_db startup.
+    # Evolve the existing production table before ORM writes reference the
+    # newly mapped column.
+    if not ensure_team_corners_column():
+        raise RuntimeError("team_season_stats.misc_corners is not ready")
+
     # Clean up potentially corrupted Belgian data
     db_clean = SessionLocal()
     try:

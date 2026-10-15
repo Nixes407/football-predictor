@@ -258,7 +258,7 @@ PER_GAME_KEYS = (
     "blocks", "clr", "err",
     "touch_att3rd", "cpa",
     "ga", "sota", "saves", "cs", "psxg", "psxg_diff",
-    "misc_crs",
+    "misc_crs", "corners",
 )
 
 # Total / rate pairs used to recover games played when W-D-L is missing.
@@ -554,6 +554,7 @@ def _row_to_stats_dict(row) -> dict:
         "opa90":        row.gka_opa90,
         # Misc
         "misc_crs":     row.misc_crs,
+        "corners":      row.misc_corners,
         "aerial_pct":   row.misc_aerial_pct,
         # Form stored fields
         "form_wins":    row.gk_w,
@@ -2397,90 +2398,64 @@ def compute_corner_markets(
     away_stats: dict,
     league_avgs: dict | None = None,
 ) -> dict:
-    """
-    Estimate expected corners using available
-    team stats. Primary source: shots and SoT
-    per game (corners correlate strongly with
-    attacking pressure). Secondary: goals per
-    game as proxy for attacking intent.
+    """Build corner markets, preferring observed corners taken per game.
 
-    Empirical calibration:
-      Average PL team: ~5.3 corners/game
-      Top attacker: ~6.5 corners/game
-      Bottom attacker: ~4.0 corners/game
+    Inputs from the main prediction path are already normalised by
+    :func:`to_per_game`. Each side is selected independently, so a fixture
+    can use a real rate for one team and the established pressure proxy for
+    the other while a season is being backfilled.
     """
-    # Base corners per game — league average
     BASE_CORNERS = 5.3
     AWAY_PENALTY = 0.85
 
-    def _estimate_corners(stats: dict,
-                          is_home: bool) -> float:
-        shots   = _safe(stats.get("sh_per90")
-                  or stats.get("shots"), 0.0)
-        sot     = _safe(stats.get("sot_per90")
-                  or stats.get("sot"), 0.0)
-        goals   = _safe(stats.get("goals")
-                  or stats.get("sh_goals"), 0.0)
-        xg      = _safe(stats.get("xg")
-                  or stats.get("sh_xg"), 0.0)
-
-        # Normalise shots to per-game if needed
+    def pressure_proxy(stats: dict, is_home: bool) -> float:
+        # Retain the previous fallback calibration for rows without corners.
+        shots = _safe(stats.get("sh_per90") or stats.get("shots"), 0.0)
+        sot = _safe(stats.get("sot_per90") or stats.get("sot"), 0.0)
+        goals = _safe(stats.get("goals") or stats.get("sh_goals"), 0.0)
+        xg = _safe(stats.get("xg") or stats.get("sh_xg"), 0.0)
         if shots > 20:
-            shots = shots / 38
+            shots /= 38
         if sot > 10:
-            sot = sot / 38
+            sot /= 38
         if goals > 10:
-            goals = goals / 38
+            goals /= 38
         if xg > 10:
-            xg = xg / 38
+            xg /= 38
 
-        # Build attacking pressure score
-        # Each measure contributes proportionally
-        score = 0.0
-        count = 0
-
+        ratios = []
         if shots > 0:
-            score += shots / 12.0
-            count += 1
+            ratios.append(shots / 12.0)
         if sot > 0:
-            score += sot / 4.5
-            count += 1
+            ratios.append(sot / 4.5)
         if goals > 0:
-            score += goals / 1.5
-            count += 1
+            ratios.append(goals / 1.5)
         if xg > 0:
-            score += xg / 1.4
-            count += 1
-
-        if count == 0:
-            pressure = 1.0
-        else:
-            pressure = score / count
-
-        corners = BASE_CORNERS * pressure
+            ratios.append(xg / 1.4)
+        pressure = sum(ratios) / len(ratios) if ratios else 1.0
+        estimate = BASE_CORNERS * pressure
         if not is_home:
-            corners *= AWAY_PENALTY
+            estimate *= AWAY_PENALTY
+        return estimate
 
-        return float(np.clip(corners, 2.5, 9.0))
+    def estimate(stats: dict, is_home: bool) -> float:
+        observed = _safe(stats.get("corners"), 0.0)
+        if observed > 0:
+            # A modest venue split preserves a realistic total: equal 5.5
+            # rates become 5.78 + 5.23 = 11.0, rather than being rescaled.
+            estimate_value = observed * (
+                CORNER_HOME_TILT if is_home else CORNER_AWAY_TILT
+            )
+        else:
+            estimate_value = pressure_proxy(stats, is_home)
+        return float(np.clip(
+            estimate_value, MIN_EXPECTED_CORNERS, MAX_EXPECTED_CORNERS
+        ))
 
-    exp_home = _estimate_corners(home_stats, True)
-    exp_away = _estimate_corners(away_stats, False)
-    total    = exp_home + exp_away
-
-    over_8_5  = float(1 - poisson.cdf(8,  total))
-    over_9_5  = float(1 - poisson.cdf(9,  total))
-    over_10_5 = float(1 - poisson.cdf(10, total))
-    over_11_5 = float(1 - poisson.cdf(11, total))
-
-    return {
-        "expected_home":  round(exp_home, 2),
-        "expected_away":  round(exp_away, 2),
-        "expected_total": round(total,    2),
-        "over_8_5":       round(over_8_5,  4),
-        "over_9_5":       round(over_9_5,  4),
-        "over_10_5":      round(over_10_5, 4),
-        "over_11_5":      round(over_11_5, 4),
-    }
+    return corner_markets_from_expected(
+        estimate(home_stats, True),
+        estimate(away_stats, False),
+    )
 
 
 def calibrate_corners(raw_corners: dict, baselines: dict) -> dict:

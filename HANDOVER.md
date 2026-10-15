@@ -177,9 +177,9 @@ _upsert_player(), collect_player_stats(), collect_fotmob() now runs
 teams then players. Team failure exits 1; player zero-rows with team
 success also exits 1 so broken player endpoints are noticed.
 Verified via mocked SQLite smoke tests (imports, parsers, merges,
-upserts, exit codes). Live FotMob probing is egress-blocked in sandbox
-(allowed hosts: github.com only) — real run will occur on GitHub
-Actions where FotMob is reachable.
+upserts, exit codes), then verified live in production: the latest collect
+committed about 577 team rows and 14,759 player rows with exit 0;
+goal_assist and teamId→name resolution are working.
 
 Fixes:
 
@@ -204,17 +204,13 @@ Also fetch: assists, rating, expected_goals
 
 Store in `player_season_stats` table (already exists).
 
-### PRIORITY 3 — FIX CORNERS PREDICTION
+### PRIORITY 3 — FIX CORNERS PREDICTION — COMPLETED ✅
 
-Currently corners use goals/xG as proxy because
-
-shots/corners columns are null in team_season_stats.
-
-FotMob deep stats has corner data per team.
-
-Map FotMob corner data to correct columns so
-
-corner O/U markets use real data.
+FotMob `corner_taken_team` is stored as season totals in the new
+`misc_corners` column. Accurate crosses, opponent-box touches, and
+best-effort total shots are mapped alongside it. Corner O/U markets now
+prefer each team's real per-game corner rate and retain the pressure proxy
+only where real corners are missing.
 
 ### PRIORITY 4 — RETRAIN ML BACKUP MODELS
 
@@ -270,9 +266,9 @@ Implement after formula engine is fully stable.
 
    Do not attempt to fix — needs paid plan upgrade
 
-2. Player stats only 160 rows (old 2023-2024 data)
+2. Player stats row-count issue is fixed (Priority 2; latest live collect
 
-   Will be fixed by Priority 2
+   wrote 14,759 player rows).
 
 3. ELO ratings show 1500 for all teams
 
