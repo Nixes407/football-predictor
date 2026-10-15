@@ -1389,7 +1389,12 @@ def _row_to_dict(row: DailyMatch) -> dict:
     return data
 
 
-def _load_matches(target_date: str, db: Session) -> list[DailyMatch]:
+def _load_matches(
+    target_date: str,
+    db: Session,
+    *,
+    fetch_spillover: bool = True,
+) -> list[DailyMatch]:
     """Every stored fixture for one date, plus late-UTC USA-MLS spillover.
 
     USA-MLS kickoffs from 22:00 UTC onwards are stored under the previous
@@ -1410,16 +1415,45 @@ def _load_matches(target_date: str, db: Session) -> list[DailyMatch]:
     # failure here leaves the date's own fixtures untouched.
     try:
         previous_date = date.fromisoformat(target_date) - timedelta(days=1)
+        previous_date_str = previous_date.isoformat()
         kickoff_cutoff = datetime(
             previous_date.year, previous_date.month, previous_date.day,
             22, 0, tzinfo=timezone.utc,
         )
         spillover = (
             db.query(DailyMatch)
-            .filter(DailyMatch.match_date == previous_date.isoformat())
+            .filter(DailyMatch.match_date == previous_date_str)
             .filter(DailyMatch.league == "USA-MLS")
             .all()
         )
+        if not spillover and fetch_spillover:
+            try:
+                previous_fixtures = fetch_fixtures(previous_date_str)
+                usa_mls_fixtures = [
+                    {
+                        **fixture,
+                        "match_date": (
+                            fixture.get("match_date") or previous_date_str
+                        ),
+                    }
+                    for fixture in (previous_fixtures or [])
+                    if isinstance(fixture, dict)
+                    and fixture.get("league") == "USA-MLS"
+                ]
+                compute_and_store_predictions(usa_mls_fixtures, db)
+                spillover = (
+                    db.query(DailyMatch)
+                    .filter(DailyMatch.match_date == previous_date_str)
+                    .filter(DailyMatch.league == "USA-MLS")
+                    .all()
+                )
+            except Exception as exc:
+                print(
+                    f"[fixtures] WARNING: could not fetch or store late "
+                    f"USA-MLS fixtures for {previous_date_str}: {exc}"
+                )
+                traceback.print_exc()
+
         # Parse before comparing: stored strings may differ in format
         # ("...Z" vs "...+00:00"), same as _fixtures_are_stale.
         late_usa_mls = [
@@ -1549,7 +1583,7 @@ def _get_or_fetch_matches(target_date: str, db: Session) -> list[dict]:
     if not day_rows:
         fixtures = fetch_fixtures(target_date)
         compute_and_store_predictions(fixtures, db)
-        rows = _load_matches(target_date, db)
+        rows = _load_matches(target_date, db, fetch_spillover=False)
     elif _fixtures_are_stale(day_rows) and _has_open_fixtures(day_rows):
         # Only dates with fixtures still to play are refreshed. Re-predicting
         # a finished match would overwrite the forecast it was judged on.
@@ -1558,7 +1592,7 @@ def _get_or_fetch_matches(target_date: str, db: Session) -> list[dict]:
         new_fixtures = fetch_fixtures(target_date)
         compute_and_store_predictions(new_fixtures, db)
         refresh_open_predictions(day_rows, new_fixtures, db)
-        rows = _load_matches(target_date, db)
+        rows = _load_matches(target_date, db, fetch_spillover=False)
 
     # Always try to fill missing predictions regardless of the staleness
     # timer: a fixture cached while no prediction could be produced (models
@@ -1568,7 +1602,7 @@ def _get_or_fetch_matches(target_date: str, db: Session) -> list[dict]:
     if filled:
         print(f"[fixtures] Filled {filled} "
               f"missing predictions")
-        rows = _load_matches(target_date, db)
+        rows = _load_matches(target_date, db, fetch_spillover=False)
 
     return [_row_to_dict(row) for row in rows]
 

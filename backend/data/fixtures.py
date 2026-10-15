@@ -5,12 +5,21 @@ import requests
 from datetime import date, datetime, timezone
 
 try:
+    from . import api_football_collector as _af_collector
     from .api_football_collector import collect_fixtures_and_results
 except Exception:
     try:
-        from api_football_collector import collect_fixtures_and_results
-    except Exception:  # pragma: no cover - optional dependency
-        collect_fixtures_and_results = None
+        from data import api_football_collector as _af_collector
+        from data.api_football_collector import collect_fixtures_and_results
+    except Exception:
+        try:
+            import api_football_collector as _af_collector
+            from api_football_collector import collect_fixtures_and_results
+        except Exception:  # pragma: no cover - optional dependency
+            _af_collector = None
+            collect_fixtures_and_results = None
+
+_default_collect_fixtures_and_results = collect_fixtures_and_results
 
 
 # football-data.org competition code -> internal league name.
@@ -194,65 +203,136 @@ def derive_season(utc_date_str: str) -> str:
     return f"{match_date.year - 1}-{match_date.year}"
 
 
+def _collect_af_fixtures_for_date(target_date: str) -> list[dict]:
+    """Fetch API-Football fixtures for ``target_date`` (YYYY-MM-DD).
+
+    ``api_football_collector.collect_fixtures_and_results()`` only fetches
+    ``date.today()`` into its ``fixtures`` list (and queries ``yesterday``
+    with ``status="FT"`` into ``results`` without kickoff times). When
+    ``target_date`` is any other date — such as yesterday's UTC date for the
+    late USA-MLS spillover — we query API-Football's ``fixtures`` endpoint
+    for ``target_date`` directly so all fixtures for that date are returned.
+    """
+    api_football_key = os.environ.get("API_FOOTBALL_KEY", "")
+    if _af_collector is not None and api_football_key:
+        # Sync module-level API_KEY in case .env was loaded after import.
+        _af_collector.API_KEY = api_football_key
+
+    if collect_fixtures_and_results is not None and (
+        collect_fixtures_and_results is not _default_collect_fixtures_and_results
+        or target_date == date.today().isoformat()
+    ):
+        af_result = collect_fixtures_and_results() or {}
+        items = list(af_result.get("fixtures", []) or [])
+        if (
+            collect_fixtures_and_results is not _default_collect_fixtures_and_results
+            or any(
+                str(item.get("kickoff") or "")[:10] == target_date
+                for item in items
+            )
+        ):
+            return items
+
+    if _af_collector is None or not hasattr(_af_collector, "_get"):
+        return []
+
+    data = _af_collector._get("fixtures", {"date": target_date})
+    if not data:
+        return []
+
+    af_league_map = getattr(_af_collector, "LEAGUE_MAP", None) or {
+        "USA-MLS": 253,
+    }
+    items: list[dict] = []
+    for f in data.get("response", []) or []:
+        try:
+            lid = (f.get("league") or {}).get("id")
+            ln = next((k for k, v in af_league_map.items() if v == lid), None)
+            if not ln:
+                continue
+            fixture_info = f.get("fixture") or {}
+            teams_info = f.get("teams") or {}
+            home_info = teams_info.get("home") or {}
+            away_info = teams_info.get("away") or {}
+            status_info = fixture_info.get("status") or {}
+            items.append(
+                {
+                    "fixture_id": fixture_info.get("id"),
+                    "league": ln,
+                    "home_team": home_info.get("name"),
+                    "away_team": away_info.get("name"),
+                    "kickoff": fixture_info.get("date"),
+                    "status": status_info.get("short"),
+                    "home_id": home_info.get("id"),
+                    "away_id": away_info.get("id"),
+                }
+            )
+        except Exception as exc:
+            print(
+                f"[fixtures] WARNING: could not parse an API-Football "
+                f"fixture for {target_date}: {exc}"
+            )
+    return items
+
+
 def fetch_fixtures(target_date: str = None) -> list[dict]:
     """Fetch and normalize fixtures for ``target_date`` (UTC), if available."""
     fixtures = []
+    if target_date is None:
+        utc_today = datetime.now(timezone.utc).date()
+        target_date = date(utc_today.year, utc_today.month, utc_today.day).isoformat()
+
     api_key = os.environ.get("FOOTBALL_DATA_API_KEY")
     if not api_key:
         print(
             "[fixtures] WARNING: FOOTBALL_DATA_API_KEY is not set; "
             "skipping fixture fetch."
         )
-        return fixtures
-
-    if target_date is None:
-        utc_today = datetime.now(timezone.utc).date()
-        target_date = date(utc_today.year, utc_today.month, utc_today.day).isoformat()
-
-    headers = {"X-Auth-Token": api_key}
-    for code, league_name in LEAGUE_MAP.items():
-        url = f"https://api.football-data.org/v4/competitions/{code}/matches"
-        try:
-            response = requests.get(
-                url,
-                params={"dateFrom": target_date, "dateTo": target_date},
-                headers=headers,
-                timeout=10,
-            )
-            response.raise_for_status()
-            matches = response.json().get("matches", [])
-            if not isinstance(matches, list):
-                raise ValueError("response 'matches' value is not a list")
-        except Exception as exc:
-            print(f"[fixtures] WARNING: failed to fetch league {code}: {exc}")
-            continue
-
-        for match in matches:
+    else:
+        headers = {"X-Auth-Token": api_key}
+        for code, league_name in LEAGUE_MAP.items():
+            url = f"https://api.football-data.org/v4/competitions/{code}/matches"
             try:
-                utc_date = match["utcDate"]
-                fixtures.append(
-                    {
-                        "external_id": str(match["id"]),
-                        "match_date": target_date,
-                        "kickoff_time": utc_date,
-                        "home_team": map_team_name(match["homeTeam"]["name"]),
-                        "away_team": map_team_name(match["awayTeam"]["name"]),
-                        "league": league_name,
-                        "season": derive_season(utc_date),
-                        "status": match["status"].lower(),
-                    }
+                response = requests.get(
+                    url,
+                    params={"dateFrom": target_date, "dateTo": target_date},
+                    headers=headers,
+                    timeout=10,
                 )
+                response.raise_for_status()
+                matches = response.json().get("matches", [])
+                if not isinstance(matches, list):
+                    raise ValueError("response 'matches' value is not a list")
             except Exception as exc:
-                print(
-                    f"[fixtures] WARNING: could not parse a match in league "
-                    f"{code}: {exc}"
-                )
+                print(f"[fixtures] WARNING: failed to fetch league {code}: {exc}")
+                continue
+
+            for match in matches:
+                try:
+                    utc_date = match["utcDate"]
+                    fixtures.append(
+                        {
+                            "external_id": str(match["id"]),
+                            "match_date": target_date,
+                            "kickoff_time": utc_date,
+                            "home_team": map_team_name(match["homeTeam"]["name"]),
+                            "away_team": map_team_name(match["awayTeam"]["name"]),
+                            "league": league_name,
+                            "season": derive_season(utc_date),
+                            "status": match["status"].lower(),
+                        }
+                    )
+                except Exception as exc:
+                    print(
+                        f"[fixtures] WARNING: could not parse a match in league "
+                        f"{code}: {exc}"
+                    )
 
     # Supplement football-data.org with USA-MLS fixtures from API-Football.
     # football-data.org does not cover MLS, but api_football_collector already
     # maps and fetches it. Keep this optional so a missing key or a failed
     # request never affects the leagues above.
-    if collect_fixtures_and_results is not None:
+    if collect_fixtures_and_results is not None or _af_collector is not None:
         if not os.environ.get("API_FOOTBALL_KEY"):
             print(
                 "[fixtures] WARNING: API_FOOTBALL_KEY is not set; "
@@ -260,8 +340,8 @@ def fetch_fixtures(target_date: str = None) -> list[dict]:
             )
         else:
             try:
-                af_result = collect_fixtures_and_results() or {}
-                for item in af_result.get("fixtures", []) or []:
+                af_fixtures = _collect_af_fixtures_for_date(target_date)
+                for item in af_fixtures:
                     if item.get("league") != "USA-MLS":
                         continue
                     kickoff = item.get("kickoff")
