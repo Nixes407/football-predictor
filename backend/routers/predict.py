@@ -1142,6 +1142,56 @@ def new_tables_check() -> dict:
                 .all()
             )
 
+            # misc_corners coverage. Isolated so a failure here degrades
+            # to an error object instead of costing the rest of the
+            # snapshot. Note this cannot rescue a database that has not
+            # run ensure_team_corners_column yet: every TeamSeasonStats
+            # query selects all mapped columns, so the count above fails
+            # first and the outer handler answers with its own error.
+            try:
+                corners_non_null = (
+                    db.query(TeamSeasonStats)
+                    .filter(
+                        TeamSeasonStats.misc_corners
+                        .isnot(None)
+                    )
+                    .count()
+                )
+                corners_sample = (
+                    db.query(
+                        TeamSeasonStats.team,
+                        TeamSeasonStats.league,
+                        TeamSeasonStats.season,
+                        TeamSeasonStats.misc_corners,
+                    )
+                    .filter(
+                        TeamSeasonStats.misc_corners
+                        .isnot(None)
+                    )
+                    .order_by(
+                        TeamSeasonStats.team,
+                        TeamSeasonStats.league,
+                        TeamSeasonStats.season,
+                    )
+                    .limit(3)
+                    .all()
+                )
+                misc_corners_check = {
+                    "non_null_count": corners_non_null,
+                    "total_rows":     team_count,
+                    "sample": [
+                        {
+                            "team":         r[0],
+                            "league":       r[1],
+                            "season":       r[2],
+                            "misc_corners": r[3],
+                        }
+                        for r in corners_sample
+                    ],
+                }
+            except Exception as exc:
+                misc_corners_check = {"error": str(exc)}
+
             return {
                 "team_season_stats_rows":    team_count,
                 "player_season_stats_rows":  player_count,
@@ -1161,6 +1211,7 @@ def new_tables_check() -> dict:
                     }
                     for p in top_scorers
                 ],
+                "misc_corners_check": misc_corners_check,
             }
         finally:
             db.close()
