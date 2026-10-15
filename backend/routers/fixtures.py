@@ -1390,12 +1390,59 @@ def _row_to_dict(row: DailyMatch) -> dict:
 
 
 def _load_matches(target_date: str, db: Session) -> list[DailyMatch]:
-    """Every stored fixture for one date."""
-    return (
+    """Every stored fixture for one date, plus late-UTC USA-MLS spillover.
+
+    USA-MLS kickoffs from 22:00 UTC onwards are stored under the previous
+    day's ``match_date``, so without this pass they would never appear in
+    the response for the day they are played. The previous day's late
+    fixtures are therefore merged in as well: rows whose ``match_date`` is
+    the day before ``target_date``, whose league is USA-MLS and whose
+    kickoff is at or after 22:00 UTC that previous day. No other league is
+    affected.
+    """
+    rows = (
         db.query(DailyMatch)
         .filter(DailyMatch.match_date == target_date)
         .all()
     )
+
+    # Second query: the previous day's late-UTC USA-MLS fixtures. Any
+    # failure here leaves the date's own fixtures untouched.
+    try:
+        previous_date = date.fromisoformat(target_date) - timedelta(days=1)
+        kickoff_cutoff = datetime(
+            previous_date.year, previous_date.month, previous_date.day,
+            22, 0, tzinfo=timezone.utc,
+        )
+        spillover = (
+            db.query(DailyMatch)
+            .filter(DailyMatch.match_date == previous_date.isoformat())
+            .filter(DailyMatch.league == "USA-MLS")
+            .all()
+        )
+        # Parse before comparing: stored strings may differ in format
+        # ("...Z" vs "...+00:00"), same as _fixtures_are_stale.
+        late_usa_mls = [
+            row
+            for row in spillover
+            if (kickoff := _parse_utc(row.kickoff_time)) is not None
+            and kickoff >= kickoff_cutoff
+        ]
+    except Exception as exc:
+        print(f"[fixtures] WARNING: could not load late USA-MLS fixtures "
+              f"from the day before {target_date}: {exc}")
+        traceback.print_exc()
+        return rows
+
+    # Merge without duplicates: a fixture is identified by external_id.
+    merged = list(rows)
+    seen_external_ids = {row.external_id for row in merged}
+    for row in late_usa_mls:
+        if row.external_id in seen_external_ids:
+            continue
+        seen_external_ids.add(row.external_id)
+        merged.append(row)
+    return merged
 
 
 def _fixtures_are_stale(rows: list) -> bool:
@@ -1494,18 +1541,23 @@ def _get_or_fetch_matches(target_date: str, db: Session) -> list[dict]:
     ensure_derived_prediction_columns(db)
 
     rows = _load_matches(target_date, db)
-    if not rows:
+    # ``_load_matches`` also merges in the previous day's late-UTC USA-MLS
+    # spillover, so ``rows`` can be non-empty even when this date has no
+    # stored fixtures of its own yet. The cache checks below are about the
+    # date's own fixtures only, so a day without any is still fetched.
+    day_rows = [row for row in rows if row.match_date == target_date]
+    if not day_rows:
         fixtures = fetch_fixtures(target_date)
         compute_and_store_predictions(fixtures, db)
         rows = _load_matches(target_date, db)
-    elif _fixtures_are_stale(rows) and _has_open_fixtures(rows):
+    elif _fixtures_are_stale(day_rows) and _has_open_fixtures(day_rows):
         # Only dates with fixtures still to play are refreshed. Re-predicting
         # a finished match would overwrite the forecast it was judged on.
         print(f"[fixtures] Stale — refreshing "
               f"{target_date}...")
         new_fixtures = fetch_fixtures(target_date)
         compute_and_store_predictions(new_fixtures, db)
-        refresh_open_predictions(rows, new_fixtures, db)
+        refresh_open_predictions(day_rows, new_fixtures, db)
         rows = _load_matches(target_date, db)
 
     # Always try to fill missing predictions regardless of the staleness
