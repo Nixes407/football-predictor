@@ -4,6 +4,14 @@ import os
 import requests
 from datetime import date, datetime, timezone
 
+try:
+    from .api_football_collector import collect_fixtures_and_results
+except Exception:
+    try:
+        from api_football_collector import collect_fixtures_and_results
+    except Exception:  # pragma: no cover - optional dependency
+        collect_fixtures_and_results = None
+
 
 # football-data.org competition code -> internal league name.
 # The codes are football-data.org's own (e.g. "CL" = UEFA Champions League),
@@ -238,6 +246,46 @@ def fetch_fixtures(target_date: str = None) -> list[dict]:
                 print(
                     f"[fixtures] WARNING: could not parse a match in league "
                     f"{code}: {exc}"
+                )
+
+    # Supplement football-data.org with USA-MLS fixtures from API-Football.
+    # football-data.org does not cover MLS, but api_football_collector already
+    # maps and fetches it. Keep this optional so a missing key or a failed
+    # request never affects the leagues above.
+    if collect_fixtures_and_results is not None:
+        if not os.environ.get("API_FOOTBALL_KEY"):
+            print(
+                "[fixtures] WARNING: API_FOOTBALL_KEY is not set; "
+                "skipping USA-MLS fixture fetch."
+            )
+        else:
+            try:
+                af_result = collect_fixtures_and_results() or {}
+                for item in af_result.get("fixtures", []) or []:
+                    if item.get("league") != "USA-MLS":
+                        continue
+                    kickoff = item.get("kickoff")
+                    if kickoff is None:
+                        continue
+                    kickoff_str = str(kickoff)
+                    if kickoff_str[:10] != target_date:
+                        continue
+                    fixtures.append(
+                        {
+                            "external_id": str(item.get("fixture_id")),
+                            "match_date": target_date,
+                            "kickoff_time": kickoff_str,
+                            "home_team": item.get("home_team"),
+                            "away_team": item.get("away_team"),
+                            "league": item.get("league"),
+                            "season": derive_season(kickoff_str),
+                            "status": str(item.get("status") or "").lower(),
+                        }
+                    )
+            except Exception as exc:
+                print(
+                    f"[fixtures] WARNING: failed to fetch USA-MLS fixtures "
+                    f"from API-Football: {exc}"
                 )
 
     return fixtures
