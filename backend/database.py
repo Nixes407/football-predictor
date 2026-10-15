@@ -421,6 +421,7 @@ class TeamSeasonStats(Base):
     misc_fld = Column(Float)  # Fouls drawn
     misc_off = Column(Float)  # Offsides
     misc_crs = Column(Float)  # Crosses
+    misc_corners = Column(Float)  # Corners taken (season total)
     misc_tklw = Column(Float)  # Tackles won
     misc_pkwon = Column(Float)  # Penalties won
     misc_pkcon = Column(Float)  # Penalties conceded
@@ -588,14 +589,44 @@ class PlayerSeasonStats(Base):
 # --------------------------------------------------------------------------- #
 
 
-def init_db(bind=None) -> bool:
-    """
-    Create every table that does not exist yet.
+def ensure_team_corners_column(bind=None) -> bool:
+    """Add the season-total corners column to an existing table safely.
 
-    Idempotent: ``Base.metadata.create_all`` skips tables that are already
-    present. Returns ``True`` on success and ``False`` if the database could
-    not be reached, so callers (e.g. the API startup hook) never crash.
+    ``create_all`` cannot evolve existing tables. Inspection makes this
+    idempotent on every dialect; PostgreSQL additionally uses IF NOT EXISTS
+    to remain race-safe when API startup and the daily collector overlap.
     """
+    target = engine if bind is None else bind
+    if target is None:
+        print("[database] ERROR: no database engine configured, cannot ensure misc_corners.")
+        return False
+    try:
+        inspector = inspect(target)
+        if "team_season_stats" not in inspector.get_table_names():
+            print("[database] misc_corners will be created with team_season_stats")
+            return True
+        columns = {column["name"] for column in inspector.get_columns("team_season_stats")}
+        if "misc_corners" in columns:
+            print("[database] team_season_stats.misc_corners already present")
+            return True
+        dialect = target.dialect.name
+        statement = (
+            "ALTER TABLE team_season_stats ADD COLUMN IF NOT EXISTS "
+            "misc_corners DOUBLE PRECISION"
+            if dialect == "postgresql"
+            else "ALTER TABLE team_season_stats ADD COLUMN misc_corners FLOAT"
+        )
+        with target.begin() as connection:
+            connection.exec_driver_sql(statement)
+        print("[database] Added team_season_stats.misc_corners")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[database] ERROR: could not ensure misc_corners: {exc}")
+        return False
+
+
+def init_db(bind=None) -> bool:
+    """Create tables and safely apply the small additive schema evolution."""
     target = engine if bind is None else bind
 
     if target is None:
@@ -604,6 +635,8 @@ def init_db(bind=None) -> bool:
 
     try:
         Base.metadata.create_all(bind=target)
+        if not ensure_team_corners_column(target):
+            return False
         tables = sorted(inspect(target).get_table_names())
         print(f"[database] Tables ready: {', '.join(tables) or 'none'}")
         return True
@@ -624,6 +657,7 @@ __all__ = [
     "SessionLocal",
     "TeamSeasonStats",
     "engine",
+    "ensure_team_corners_column",
     "get_database_url",
     "get_engine_url",
     "init_db",
