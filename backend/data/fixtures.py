@@ -109,7 +109,7 @@ TEAM_NAME_MAP = {
     # Promoted clubs: football-data.org spellings -> the names the stats
     # collectors store (FotMob/FBref spellings), so the fixture, the
     # formula engine and the H2H history all agree on one name.
-    "RC Deportivo La Coruña": "Deportivo La Coruña",
+    "RC Deportivo La Coruña": "Deportivo A Coruña",
     "Levante UD": "Levante",
     # Bundesliga
     "FC Bayern München": "Bayern Munich",
