@@ -77,8 +77,13 @@ jobs:
           fi
           echo "==> Understat backup complete"
 
+      # Kept (not deleted) in case the API-Football account is restored, but
+      # its failure must not gate the rest of the pipeline: run_all() calls
+      # sys.exit(1) when check_status() rejects the key, which used to abort
+      # the job before fbref, builder and trainer ever ran.
       - name: Run API-Football collector
         working-directory: backend
+        continue-on-error: true
         run: |
           echo "==> [3/4] Collecting API-Football data..."
           python data/api_football_collector.py

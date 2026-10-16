@@ -1,31 +1,38 @@
-"""Fetch and normalize daily football fixtures from football-data.org."""
+"""Fetch and normalize daily football fixtures from football-data.org.
+
+football-data.org does not cover USA-MLS, so that one league is appended from
+FotMob's date-based match listing (``fotmob_collector.fetch_fixtures_for_date``).
+The MLS source is optional by design: if the FotMob collector cannot be
+imported, or answers with nothing, the leagues above are returned untouched.
+"""
 
 import os
 import requests
 from datetime import date, datetime, timezone
 
+# USA-MLS comes from FotMob. API-Football is gone: that account is suspended
+# and answers with errors, so nothing in this module may reach for it. The
+# collector is imported defensively because it pulls in the database layer,
+# and a fixture feed must not depend on that being importable.
 try:
-    from . import api_football_collector as _af_collector
-    from .api_football_collector import collect_fixtures_and_results
+    from .fotmob_collector import fetch_fixtures_for_date
 except Exception:
     try:
-        from data import api_football_collector as _af_collector
-        from data.api_football_collector import collect_fixtures_and_results
+        from data.fotmob_collector import fetch_fixtures_for_date
     except Exception:
         try:
-            import api_football_collector as _af_collector
-            from api_football_collector import collect_fixtures_and_results
+            from fotmob_collector import fetch_fixtures_for_date
         except Exception:  # pragma: no cover - optional dependency
-            _af_collector = None
-            collect_fixtures_and_results = None
+            fetch_fixtures_for_date = None
 
-_default_collect_fixtures_and_results = collect_fixtures_and_results
+
+# The one league this module sources outside football-data.org.
+MLS_LEAGUE = "USA-MLS"
 
 
 # football-data.org competition code -> internal league name.
 # The codes are football-data.org's own (e.g. "CL" = UEFA Champions League),
-# not API-Football IDs: API-Football's ID 2 would be requested here as
-# /v4/competitions/2/matches, which does not exist.
+# not API-Football IDs, which this module no longer speaks at all.
 LEAGUE_MAP = {
     "PL":  "ENG-Premier League",
     "ELC": "ENG-Championship",
@@ -203,76 +210,76 @@ def derive_season(utc_date_str: str) -> str:
     return f"{match_date.year - 1}-{match_date.year}"
 
 
-def _collect_af_fixtures_for_date(target_date: str) -> list[dict]:
-    """Fetch API-Football fixtures for ``target_date`` (YYYY-MM-DD).
+def _collect_mls_fixtures(target_date: str) -> list[dict]:
+    """USA-MLS fixtures for ``target_date`` from FotMob, in this file's shape.
 
-    ``api_football_collector.collect_fixtures_and_results()`` only fetches
-    ``date.today()`` into its ``fixtures`` list (and queries ``yesterday``
-    with ``status="FT"`` into ``results`` without kickoff times). When
-    ``target_date`` is any other date — such as yesterday's UTC date for the
-    late USA-MLS spillover — we query API-Football's ``fixtures`` endpoint
-    for ``target_date`` directly so all fixtures for that date are returned.
+    Returns ``[]`` (never raises) when the collector is unavailable or the day
+    has no MLS fixtures, so the football-data.org leagues are unaffected.
     """
-    api_football_key = os.environ.get("API_FOOTBALL_KEY", "")
-    if _af_collector is not None and api_football_key:
-        # Sync module-level API_KEY in case .env was loaded after import.
-        _af_collector.API_KEY = api_football_key
-
-    if collect_fixtures_and_results is not None and (
-        collect_fixtures_and_results is not _default_collect_fixtures_and_results
-        or target_date == date.today().isoformat()
-    ):
-        af_result = collect_fixtures_and_results() or {}
-        items = list(af_result.get("fixtures", []) or [])
-        if (
-            collect_fixtures_and_results is not _default_collect_fixtures_and_results
-            or any(
-                str(item.get("kickoff") or "")[:10] == target_date
-                for item in items
-            )
-        ):
-            return items
-
-    if _af_collector is None or not hasattr(_af_collector, "_get"):
+    if fetch_fixtures_for_date is None:
+        print(
+            "[fixtures] WARNING: fotmob_collector.fetch_fixtures_for_date is "
+            "not importable; skipping USA-MLS fixtures."
+        )
         return []
 
-    data = _af_collector._get("fixtures", {"date": target_date})
-    if not data:
+    try:
+        collected = fetch_fixtures_for_date(target_date) or []
+    except Exception as exc:
+        print(
+            f"[fixtures] WARNING: failed to fetch USA-MLS fixtures from "
+            f"FotMob for {target_date}: {exc}"
+        )
         return []
 
-    af_league_map = getattr(_af_collector, "LEAGUE_MAP", None) or {
-        "USA-MLS": 253,
-    }
-    items: list[dict] = []
-    for f in data.get("response", []) or []:
+    fixtures: list[dict] = []
+    for item in collected:
         try:
-            lid = (f.get("league") or {}).get("id")
-            ln = next((k for k, v in af_league_map.items() if v == lid), None)
-            if not ln:
+            if not isinstance(item, dict) or item.get("league") != MLS_LEAGUE:
                 continue
-            fixture_info = f.get("fixture") or {}
-            teams_info = f.get("teams") or {}
-            home_info = teams_info.get("home") or {}
-            away_info = teams_info.get("away") or {}
-            status_info = fixture_info.get("status") or {}
-            items.append(
+            home_team = item.get("home_team")
+            away_team = item.get("away_team")
+            external_id = item.get("external_id")
+            if not home_team or not away_team or external_id in (None, ""):
+                continue
+            kickoff = str(item.get("kickoff_time") or "") or None
+            day = str(item.get("match_date") or "")[:10] or target_date
+            # FotMob already returns the calendar-year season ("2026"). Do not
+            # re-derive it with derive_season(): MLS rows in team_season_stats
+            # are keyed by year, and a July-based "2025-2026" label would find
+            # nothing and silently lose every MLS prediction.
+            season = str(item.get("season") or "") or (
+                (kickoff or day)[:4] if (kickoff or day)[:4].isdigit() else None
+            )
+            fixtures.append(
                 {
-                    "fixture_id": fixture_info.get("id"),
-                    "league": ln,
-                    "home_team": home_info.get("name"),
-                    "away_team": away_info.get("name"),
-                    "kickoff": fixture_info.get("date"),
-                    "status": status_info.get("short"),
-                    "home_id": home_info.get("id"),
-                    "away_id": away_info.get("id"),
+                    "external_id": str(external_id),
+                    "match_date": day,
+                    "kickoff_time": kickoff,
+                    # FotMob spellings are kept verbatim: TEAM_NAME_MAP exists
+                    # to translate football-data.org names, and the stats the
+                    # predictor joins against were written by the FotMob
+                    # collector using these same spellings.
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "league": MLS_LEAGUE,
+                    "season": season,
+                    "status": str(item.get("status") or "").lower() or None,
                 }
             )
         except Exception as exc:
             print(
-                f"[fixtures] WARNING: could not parse an API-Football "
+                f"[fixtures] WARNING: could not parse a FotMob USA-MLS "
                 f"fixture for {target_date}: {exc}"
             )
-    return items
+            continue
+
+    if not fixtures:
+        print(
+            f"[fixtures] WARNING: no USA-MLS fixtures available for "
+            f"{target_date} from FotMob (expected outside the MLS season)."
+        )
+    return fixtures
 
 
 def fetch_fixtures(target_date: str = None) -> list[dict]:
@@ -328,44 +335,9 @@ def fetch_fixtures(target_date: str = None) -> list[dict]:
                         f"{code}: {exc}"
                     )
 
-    # Supplement football-data.org with USA-MLS fixtures from API-Football.
-    # football-data.org does not cover MLS, but api_football_collector already
-    # maps and fetches it. Keep this optional so a missing key or a failed
-    # request never affects the leagues above.
-    if collect_fixtures_and_results is not None or _af_collector is not None:
-        if not os.environ.get("API_FOOTBALL_KEY"):
-            print(
-                "[fixtures] WARNING: API_FOOTBALL_KEY is not set; "
-                "skipping USA-MLS fixture fetch."
-            )
-        else:
-            try:
-                af_fixtures = _collect_af_fixtures_for_date(target_date)
-                for item in af_fixtures:
-                    if item.get("league") != "USA-MLS":
-                        continue
-                    kickoff = item.get("kickoff")
-                    if kickoff is None:
-                        continue
-                    kickoff_str = str(kickoff)
-                    if kickoff_str[:10] != target_date:
-                        continue
-                    fixtures.append(
-                        {
-                            "external_id": str(item.get("fixture_id")),
-                            "match_date": target_date,
-                            "kickoff_time": kickoff_str,
-                            "home_team": item.get("home_team"),
-                            "away_team": item.get("away_team"),
-                            "league": item.get("league"),
-                            "season": derive_season(kickoff_str),
-                            "status": str(item.get("status") or "").lower(),
-                        }
-                    )
-            except Exception as exc:
-                print(
-                    f"[fixtures] WARNING: failed to fetch USA-MLS fixtures "
-                    f"from API-Football: {exc}"
-                )
+    # Supplement football-data.org with USA-MLS fixtures from FotMob.
+    # football-data.org does not cover MLS. Keep this optional so an
+    # unavailable collector or an empty day never affects the leagues above.
+    fixtures.extend(_collect_mls_fixtures(target_date))
 
     return fixtures
