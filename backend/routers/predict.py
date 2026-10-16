@@ -1525,7 +1525,7 @@ def la_liga_check() -> dict:
         return {"error": str(exc)}
 
 
-@router.post("/admin/fix-bsa-label")
+@router.get("/admin/fix-bsa-label")
 def fix_bsa_label(secret: str = "", dry_run: bool = False) -> dict:
     """
     Apply the one-off ``daily_matches`` label repair over HTTP, for a
@@ -1535,6 +1535,9 @@ def fix_bsa_label(secret: str = "", dry_run: bool = False) -> dict:
     Requires PIPELINE_SECRET, like the other write endpoints. Idempotent —
     a second call reports ``"updated": 0``. Pass ``dry_run=true`` to list the
     rows without writing anything.
+
+    GET (not POST) so the repair can be triggered straight from a browser
+    address bar on a phone, where issuing a POST is not practical.
     """
     import os
 
