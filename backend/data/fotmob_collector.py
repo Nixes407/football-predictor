@@ -36,6 +36,24 @@ League table / standings:
     GET /api/data/leagues
         id={league_id} ccode3={ccode} season={season}
 
+Date-based fixture listing (USA-MLS only):
+    GET /api/matches?vts={epoch ms of midnight UTC of the target date}
+
+    This route still lives on the legacy /api hub; _get() prefers /api/data
+    and falls back on 404, so it resolves under either layout. FotMob answers
+    with every competition playing that day, so fetch_fixtures_for_date()
+    filters the payload down to USA-MLS and no other league is served here.
+
+Public API
+----------
+    collect_fotmob()                    full team + player stats run
+    collect_team_stats(client=None)     team_season_stats upserts
+    collect_player_stats(client=None)   player_season_stats upserts
+    fetch_fixtures_for_date(date_str)   USA-MLS fixtures for one UTC day
+
+    There is deliberately no module-level client instance: requests.Session is
+    not thread-safe, so every entry point builds and closes its own.
+
 Data flow
 ---------
 For every league in FOTMOB_LEAGUES, both seasons (current + previous) are
@@ -67,6 +85,7 @@ import json
 import math
 import sys
 import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import requests
@@ -212,6 +231,49 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://www.fotmob.com",
+}
+
+# ---------------------------------------------------------------------------
+# Date-based fixture listing (see fetch_fixtures_for_date)
+# ---------------------------------------------------------------------------
+# FotMob's day listing is "GET {hub}/matches?vts={epoch ms of midnight UTC}".
+# It is the one endpoint here that is not keyed by league id, so the MLS rows
+# have to be selected out of a response that lists every competition playing
+# that day.
+MATCHES_ENDPOINT = "matches"
+
+# The only league this collector serves fixtures for.
+MLS_LEAGUE = "USA-MLS"
+
+# FotMob labels the competition "MLS" and occasionally "Major League Soccer".
+MLS_NAME_MARKERS = ("mls", "major league soccer")
+
+# Sub-competitions that repeat the marker and must not be mistaken for the
+# first division: matching them would inject reserve/academy clubs into the
+# USA-MLS rows that the predictor joins against team_season_stats.
+MLS_NAME_EXCLUSIONS = (
+    "next", "youth", "academy", "reserve", "u17", "u19", "u21", "u23",
+    "is back", "legends", "e-sports", "esports", "virtual",
+)
+
+# FotMob's status vocabulary mapped onto the lowercase football-data.org
+# tokens (SCHEDULED / IN_PLAY / PAUSED / FINISHED / AWARDED / CANCELED /
+# POSTPONED / ABANDONED), so a daily_matches row means the same thing
+# whichever source wrote it. Unrecognised values pass through lowercased.
+MLS_STATUS_ALIASES = {
+    "ns": "scheduled", "timed": "scheduled", "scheduled": "scheduled",
+    "not started": "scheduled", "not yet started": "scheduled",
+    "follow": "scheduled", "following": "scheduled", "upcoming": "scheduled",
+    "live": "in_play", "in play": "in_play", "ongoing": "in_play",
+    "1h": "in_play", "2h": "in_play", "et": "in_play", "extra time": "in_play",
+    "ht": "paused", "break": "paused", "halftime": "paused",
+    "ft": "finished", "finished": "finished", "match finished": "finished",
+    "aet": "finished", "pens": "finished", "penalty shootout": "finished",
+    "forfeit": "awarded", "awarded": "awarded", "walkover": "awarded",
+    "canc": "canceled", "canceled": "canceled", "cancelled": "canceled",
+    "postp": "postponed", "postponed": "postponed",
+    "int": "interrupted", "interrupted": "interrupted",
+    "abd": "abandoned", "abandoned": "abandoned",
 }
 
 # One deep-stats query per logical stat. Each entry lists request variants to
@@ -1547,6 +1609,242 @@ class _FotMobClient:
 
     def close(self) -> None:
         self.session.close()
+
+
+# ---------------------------------------------------------------------------
+# Fixtures for one UTC day (USA-MLS)
+# ---------------------------------------------------------------------------
+
+
+def _midnight_utc_ms(day: date) -> int:
+    """Epoch milliseconds of midnight UTC for ``day`` (FotMob's ``vts``)."""
+    return int(
+        datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        .timestamp() * 1000
+    )
+
+
+def _fixture_date(value) -> date | None:
+    """Parse the leading ``YYYY-MM-DD`` of a date or ISO timestamp."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _match_name(*values):
+    """A FotMob team name from a string field or a nested team object."""
+    for value in values:
+        if isinstance(value, str):
+            text = " ".join(value.split())
+            if text:
+                return text
+        elif isinstance(value, dict):
+            inner = _match_name(
+                value.get("name"), value.get("team"), value.get("text"),
+                value.get("rawName"),
+            )
+            if inner:
+                return inner
+    return None
+
+
+def _league_entry_name(entry: dict) -> str | None:
+    """League name of a ``leagues[]`` entry, nested or flat."""
+    for candidate in (entry.get("league"), entry):
+        if isinstance(candidate, dict):
+            name = _match_name(
+                candidate.get("name"), candidate.get("shortName"),
+                candidate.get("short"), candidate.get("label"),
+            )
+            if name:
+                return name
+    return None
+
+
+def _is_mls_league(name: str | None) -> bool:
+    """True only for the top-flight USA-MLS competition."""
+    if not name:
+        return False
+    text = name.casefold()
+    if not any(marker in text for marker in MLS_NAME_MARKERS):
+        return False
+    return not any(excluded in text for excluded in MLS_NAME_EXCLUSIONS)
+
+
+def _match_kickoff(match: dict) -> str | None:
+    """Kickoff as an ISO-8601 UTC string.
+
+    ``utcTime`` is the documented field; a bare epoch (seconds or
+    milliseconds) is accepted as a fallback because the late-UTC USA-MLS
+    spillover compares kickoff times, and a row without one is invisible to
+    that comparison.
+    """
+    for key in ("utcTime", "utcDate", "kickoffTime", "kickoff"):
+        value = match.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("start", "kickoffEpoch", "matchTime"):
+        value = match.get(key)
+        number = _safe(value)
+        if number is None:
+            continue
+        seconds = number / 1000.0 if abs(number) > 1e11 else number
+        try:
+            return (
+                datetime.fromtimestamp(seconds, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+        except (OverflowError, OSError, ValueError):
+            continue
+    return None
+
+
+def _looks_like_score(text: str) -> bool:
+    """True for "2 - 1" / "2:1" / "2" — a score, not a match status.
+
+    FotMob frequently puts the scoreline in ``status.statusStr`` for finished
+    and live matches, so a score-shaped token must never be stored as a
+    fixture's status.
+    """
+    if text.isdigit():
+        return True
+    flattened = text.replace("\u2013", "-").replace(":", "-")
+    parts = [part.strip() for part in flattened.split("-")]
+    return len(parts) == 2 and all(part.isdigit() for part in parts)
+
+
+def _match_status(match: dict) -> str | None:
+    """FotMob's match status as the lowercase token football-data.org uses."""
+    raw = match.get("status")
+    if isinstance(raw, dict):
+        # ``description`` and ``code`` come first: ``statusStr`` is often the
+        # scoreline rather than a state.
+        raw = (
+            raw.get("description") or raw.get("code") or raw.get("short")
+            or raw.get("statusStr") or raw.get("status")
+        )
+    if raw is None or raw == "":
+        raw = match.get("statusStr")
+    if raw is None or raw == "":
+        return None
+    token = " ".join(str(raw).split()).casefold()
+    if not token or _looks_like_score(token):
+        return None
+    return MLS_STATUS_ALIASES.get(token, token) or None
+
+
+def _matches_of_entry(entry: dict) -> list:
+    """The match rows of one ``leagues[]`` entry, nested or flat."""
+    rows = entry.get("matches")
+    if isinstance(rows, list):
+        return rows
+    nested = entry.get("league")
+    if isinstance(nested, dict) and isinstance(nested.get("matches"), list):
+        return nested["matches"]
+    return []
+
+
+def fetch_fixtures_for_date(target_date: str) -> list[dict]:
+    """Return USA-MLS fixtures kicking off on ``target_date`` (YYYY-MM-DD, UTC).
+
+    Queries FotMob's public date-based listing
+    (``GET {hub}/api/matches?vts={epoch ms of midnight UTC}``) and keeps the
+    MLS rows, so the day's other competitions are ignored and no other league
+    is served from this endpoint.
+
+    Returns a list of dicts in ``data.fixtures``' own fixture shape, ready for
+    ``compute_and_store_predictions``::
+
+        {"external_id": "5058691",
+         "match_date":  "2026-10-17",          # the kickoff's UTC date
+         "kickoff_time":"2026-10-17T23:30Z",
+         "home_team":   "Atlanta United",
+         "away_team":   "Inter Miami CF",
+         "league":      "USA-MLS",
+         "season":      "2026",                 # calendar-year league
+         "status":      "scheduled"}
+
+    Any failure is logged and answered with ``[]``: a day of missing MLS
+    fixtures must never break the football-data.org leagues.
+    """
+    day = _fixture_date(target_date)
+    if day is None:
+        print(f"[fotmob] WARNING: ignoring an unparsable fixture date "
+              f"{target_date!r}")
+        return []
+
+    target_date = day.isoformat()
+    # MLS is a calendar-year league and FotMob stores its seasons as "2026",
+    # so the season is the target day's year. derive_season()'s July-based
+    # "2025-2026" form is wrong here: no MLS row in team_season_stats
+    # carries it, and the lookup would silently miss every spring fixture.
+    season = str(day.year)
+
+    fixtures: list[dict] = []
+    client = _FotMobClient()
+    try:
+        payload = client._get(MATCHES_ENDPOINT, {"vts": _midnight_utc_ms(day)})
+        entries = payload.get("leagues")
+        if not isinstance(entries, list):
+            print(f"[fotmob] WARNING: FotMob {MATCHES_ENDPOINT} response for "
+                  f"{target_date} has no 'leagues' list "
+                  f"(keys: {list(payload)[:12]})")
+            return []
+
+        seen: set[str] = set()
+        skipped = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if not _is_mls_league(_league_entry_name(entry)):
+                continue
+            for match in _matches_of_entry(entry):
+                if not isinstance(match, dict):
+                    skipped += 1
+                    continue
+                home = _match_name(match.get("home"), match.get("homeTeam"),
+                                   match.get("homeTeamName"))
+                away = _match_name(match.get("away"), match.get("awayTeam"),
+                                   match.get("awayTeamName"))
+                external_id = match.get("id") or match.get("matchId")
+                if not home or not away or external_id in (None, ""):
+                    skipped += 1
+                    continue
+                external_id = str(external_id).strip()
+                if not external_id or external_id in seen:
+                    continue
+                seen.add(external_id)
+                kickoff = _match_kickoff(match)
+                match_day = _fixture_date(kickoff) if kickoff else None
+                fixtures.append({
+                    "external_id": external_id,
+                    # The kickoff's own UTC date, so a match that spills past
+                    # midnight lands on the day /fixtures/today will query.
+                    "match_date": (match_day or day).isoformat(),
+                    "kickoff_time": kickoff,
+                    "home_team": home,
+                    "away_team": away,
+                    "league": MLS_LEAGUE,
+                    "season": season,
+                    "status": _match_status(match),
+                })
+        if skipped:
+            print(f"[fotmob] Skipped {skipped} unusable FotMob MLS rows for "
+                  f"{target_date} (missing team, id or kickoff)")
+    except Exception as exc:
+        print(f"[fotmob] WARNING: USA-MLS fixture fetch for {target_date} "
+              f"failed: {exc}")
+        return []
+    finally:
+        client.close()
+
+    print(f"[fotmob] Found {len(fixtures)} USA-MLS fixtures for {target_date}")
+    return fixtures
 
 
 def _store_fotmob_name(db, fotmob_name: str, league: str) -> None:

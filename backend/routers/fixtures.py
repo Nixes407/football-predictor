@@ -20,6 +20,17 @@ from sqlalchemy import Column, Float, inspect, text
 from sqlalchemy.orm import Session
 
 from data.fixtures import fetch_fixtures
+
+# Imported the same defensive way data/fixtures.py does: the spillover pass
+# must keep working (without MLS) if the collector is unavailable.
+try:
+    from data.fotmob_collector import fetch_fixtures_for_date
+except Exception:  # pragma: no cover - optional dependency
+    try:
+        # A script run from backend/data/ lands here.
+        from fotmob_collector import fetch_fixtures_for_date
+    except Exception:
+        fetch_fixtures_for_date = None
 from database import DailyMatch, SessionLocal, TeamSeasonStats
 from routers.predict import (
     _away_corners,
@@ -1389,6 +1400,35 @@ def _row_to_dict(row: DailyMatch) -> dict:
     return data
 
 
+def _late_mls_fixtures(previous_date_str: str) -> list[dict]:
+    """Yesterday's USA-MLS fixtures, for the late-UTC spillover pass.
+
+    Asks FotMob for the MLS rows directly. The previous implementation called
+    ``fetch_fixtures`` here, which re-fetched every football-data.org
+    competition for that date just to keep the USA-MLS subset — one provider
+    request per league on every ``/fixtures/today`` call, and the 429s the
+    rate limiter in front of this endpoint could not absorb.
+    """
+    if fetch_fixtures_for_date is not None:
+        return fetch_fixtures_for_date(previous_date_str) or []
+
+    # FotMob collector unavailable: fall back to the full feed, filtered to
+    # MLS, so the spillover still works at its old (expensive) cost.
+    return [
+        fixture
+        for fixture in (fetch_fixtures(previous_date_str) or [])
+        if isinstance(fixture, dict) and fixture.get("league") == "USA-MLS"
+    ]
+
+
+# Dates whose late USA-MLS spillover has already been chased in this process.
+# A day with no MLS matches legitimately has no rows, so re-running the fetch
+# for it on every /fixtures/today call was pure wasted provider traffic; one
+# attempt per date per process is enough to pick up a transient failure on a
+# later day.
+_MLS_SPILLOVER_ATTEMPTED: set[str] = set()
+
+
 def _load_matches(
     target_date: str,
     db: Session,
@@ -1426,9 +1466,16 @@ def _load_matches(
             .filter(DailyMatch.league == "USA-MLS")
             .all()
         )
-        if not spillover and fetch_spillover:
+        if (
+            not spillover
+            and fetch_spillover
+            and previous_date_str not in _MLS_SPILLOVER_ATTEMPTED
+        ):
+            # Marked before fetching: a day that genuinely has no MLS
+            # fixtures must not re-cost a provider request on every call.
+            _MLS_SPILLOVER_ATTEMPTED.add(previous_date_str)
             try:
-                previous_fixtures = fetch_fixtures(previous_date_str)
+                previous_fixtures = _late_mls_fixtures(previous_date_str)
                 usa_mls_fixtures = [
                     {
                         **fixture,
