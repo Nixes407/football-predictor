@@ -36,7 +36,8 @@ FBREF_STAT_COLUMNS = [
     "clean_sheets", "pk_faced", "pk_saved",
 ]
 
-FBREF_COLUMNS = FBREF_KEY_COLUMNS + FBREF_STAT_COLUMNS
+# Collection metadata is loaded for the availability cutoff, never as a feature.
+FBREF_COLUMNS = FBREF_KEY_COLUMNS + FBREF_STAT_COLUMNS + ["updated_at"]
 
 # Canonical team names keyed by known variants. Team names in the matches
 # table (Football-Data.co.uk) differ from those in fbref_team_stats (FBref),
@@ -177,6 +178,87 @@ def load_fbref_stats() -> pd.DataFrame:
     df = pd.DataFrame(records, columns=FBREF_COLUMNS)
     print(f"[builder] Loaded {len(df)} FBref team-season rows from DB")
     return df
+
+
+def join_fbref_features(
+    features_df: pd.DataFrame,
+    fbref_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Left-join only FBref values known by each match date.
+
+    ``updated_at`` is the collector's ISO UTC collection timestamp, not a
+    model input. Missing/invalid/future timestamps fail closed to zero stats;
+    never drop a training row. Matches have date-only precision, so midnight
+    UTC is the conservative cutoff (not the end of the match day).
+
+    The source table overwrites one row per team/league/season. It cannot
+    reconstruct earlier snapshots: when the stored snapshot is too new, its
+    stats must be excluded, not backdated to a guessed season-end date.
+    """
+    result = features_df.copy()
+    all_stat_cols = [
+        f"{role}_fbref_{col}"
+        for role in ("home", "away")
+        for col in FBREF_STAT_COLUMNS
+    ]
+    # Always emit the trainer's full schema, even with no available FBref data.
+    result = result.drop(columns=all_stat_cols, errors="ignore")
+    if fbref_df.empty:
+        return result.assign(**{col: 0.0 for col in all_stat_cols})
+
+    stats = fbref_df.copy()
+    stats["team"] = stats["team"].apply(normalise_team_name)
+    # Parse individually: legacy ISO strings may mix offsets and precision.
+    # utc=True makes naive legacy values and timezone-aware values comparable.
+    timestamps = stats.get(
+        "updated_at", pd.Series(index=stats.index, dtype=object)
+    )
+    stats["updated_at"] = pd.to_datetime(
+        timestamps.map(lambda value: pd.to_datetime(value, errors="coerce", utc=True)),
+        errors="coerce", utc=True,
+    )
+    stats = stats.loc[stats["updated_at"].notna()].copy()
+    # Canonicalise BEFORE deduplication: provider aliases can collapse to one
+    # key. Keep the latest known snapshot, rather than arbitrary input order.
+    stats = stats.sort_values("updated_at", kind="stable").drop_duplicates(
+        subset=FBREF_KEY_COLUMNS, keep="last"
+    )
+    stats[FBREF_STAT_COLUMNS] = stats.reindex(columns=FBREF_STAT_COLUMNS).apply(
+        pd.to_numeric, errors="coerce"
+    )
+    match_dates = pd.to_datetime(
+        features_df["date"], errors="coerce", utc=True
+    ).reset_index(drop=True)
+
+    for role in ("home", "away"):
+        team_col = f"{role}_team"
+        collected_col = f"_{role}_fbref_updated_at"
+        stat_cols = [f"{role}_fbref_{col}" for col in FBREF_STAT_COLUMNS]
+        result[team_col] = result[team_col].apply(normalise_team_name)
+        team_stats = stats[FBREF_COLUMNS].rename(columns={
+            "team": team_col,
+            "updated_at": collected_col,
+            **{col: f"{role}_fbref_{col}" for col in FBREF_STAT_COLUMNS},
+        })
+        result = result.merge(
+            team_stats, on=[team_col, "league", "season"], how="left",
+            validate="many_to_one",
+        )
+        # A WHERE on the whole left-joined frame would drop historical matches.
+        # Mask only this side's stats: updated_at <= match_date is required.
+        available = (
+            result[collected_col].notna()
+            & match_dates.notna()
+            & (result[collected_col] <= match_dates)
+        )
+        result.loc[~available, stat_cols] = 0.0
+        result[stat_cols] = result[stat_cols].fillna(0.0)
+        result = result.drop(columns=[collected_col])
+
+    if len(result) != len(features_df):
+        raise ValueError(f"join changed row count {len(features_df)} -> {len(result)}")
+    result.index = features_df.index
+    return result
 
 
 def get_pre_match_elo(
@@ -549,68 +631,17 @@ def build_and_save_features(
     joblib.dump(le_season, enc_dir / "season_encoder.joblib")
     print(f"[builder] Encoders saved to {enc_dir}")
 
-    # Join FBref team season stats onto the feature matrix, once for the home
-    # team and once for the away team. Any failure keeps the existing features.
+    # Preserve every training row, but only expose a team's FBref snapshot
+    # when its collection timestamp is on or before that row's match date.
     fbref_df = load_fbref_stats()
-    if not fbref_df.empty:
-        try:
-            base_rows = len(features_df)
-            stat_cols = [c for c in FBREF_COLUMNS if c not in FBREF_KEY_COLUMNS]
-
-            fbref_df = fbref_df.drop_duplicates(subset=FBREF_KEY_COLUMNS, keep="last")
-
-            # Normalise team names so they match the names used in the matches
-            # table
-            fbref_df["team"] = fbref_df["team"].apply(normalise_team_name)
-
-            fbref_df[stat_cols] = fbref_df[stat_cols].apply(
-                pd.to_numeric, errors="coerce"
-            )
-
-            # Normalise team names in the feature matrix to match the
-            # canonical form
-            features_df = features_df.copy()
-            features_df["home_team"] = features_df["home_team"].apply(
-                normalise_team_name)
-            features_df["away_team"] = features_df["away_team"].apply(
-                normalise_team_name)
-
-            # Renaming the team key to home_team / away_team and prefixing the
-            # stats means each merge uses shared key names, so the merge brings
-            # in no duplicate team/league/season columns.
-            home_stats = fbref_df.rename(
-                columns={"team": "home_team",
-                         **{c: f"home_fbref_{c}" for c in stat_cols}}
-            )
-            away_stats = fbref_df.rename(
-                columns={"team": "away_team",
-                         **{c: f"away_fbref_{c}" for c in stat_cols}}
-            )
-
-            merged = features_df.merge(
-                home_stats, on=["home_team", "league", "season"], how="left"
-            )
-            merged = merged.merge(
-                away_stats, on=["away_team", "league", "season"], how="left"
-            )
-
-            if len(merged) != base_rows:
-                raise ValueError(
-                    f"join changed row count {base_rows} -> {len(merged)}"
-                )
-
-            new_cols = [c for c in merged.columns if c not in features_df.columns]
-            merged[new_cols] = merged[new_cols].fillna(0.0)
-
-            features_df = merged
-            print(f"[builder] Added {len(new_cols)} FBref features (home + away)")
-        except Exception as exc:
-            print(
-                "[builder] WARNING: FBref join failed, continuing without "
-                f"FBref features: {exc}"
-            )
-    else:
-        print("[builder] No FBref stats found — skipping FBref feature join")
+    try:
+        features_df = join_fbref_features(features_df, fbref_df)
+        print(f"[builder] Added {2 * len(FBREF_STAT_COLUMNS)} date-filtered "
+              "FBref features (home + away)")
+    except Exception as exc:
+        print(f"[builder] WARNING: FBref join failed, using zero FBref "
+              f"features: {exc}")
+        features_df = join_fbref_features(features_df, pd.DataFrame())
 
     # Save features CSV
     out_path = Path(output_path)
