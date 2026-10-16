@@ -423,6 +423,63 @@ def compute_elo_features(
     }
 
 
+def compute_btts_rolling(
+    df: pd.DataFrame,
+    team: str,
+    before_date: pd.Timestamp,
+    window: int = 5,
+    venue: str = "home",
+) -> dict:
+    """Rolling BTTS / clean-sheet / scored rates for a team before a date.
+
+    venue="home" -> matches where team played at home
+    venue="away" -> matches where team played away
+
+    Returns fractions over the last ``window`` such matches.
+    """
+    if venue == "home":
+        mask = (df["home_team"] == team) & (df["date"] < before_date)
+    else:
+        mask = (df["away_team"] == team) & (df["date"] < before_date)
+
+    recent = df[mask].tail(window)
+    n = len(recent)
+    if n == 0:
+        return {"btts_rate": 0.0, "cs_rate": 0.0, "scored_rate": 0.0}
+
+    # Support both home_goals (DB) and home_score (spec) column names
+    if "home_goals" in recent.columns:
+        hg = recent["home_goals"]
+    elif "home_score" in recent.columns:
+        hg = recent["home_score"]
+    else:
+        hg = pd.Series(0, index=recent.index)
+    if "away_goals" in recent.columns:
+        ag = recent["away_goals"]
+    elif "away_score" in recent.columns:
+        ag = recent["away_score"]
+    else:
+        ag = pd.Series(0, index=recent.index)
+
+    hg = pd.to_numeric(hg, errors="coerce").fillna(0)
+    ag = pd.to_numeric(ag, errors="coerce").fillna(0)
+
+    if venue == "home":
+        btts = int(((hg > 0) & (ag > 0)).sum())
+        cs = int((ag == 0).sum())
+        scored = int((hg > 0).sum())
+    else:
+        btts = int(((hg > 0) & (ag > 0)).sum())
+        cs = int((hg == 0).sum())
+        scored = int((ag > 0).sum())
+
+    return {
+        "btts_rate": float(btts) / n,
+        "cs_rate": float(cs) / n,
+        "scored_rate": float(scored) / n,
+    }
+
+
 def build_features(
     df: pd.DataFrame,
     elo_df: pd.DataFrame | None = None,
@@ -473,6 +530,10 @@ def build_features(
         h2h  = compute_h2h(df, home_team, away_team, date)
         elo  = compute_elo_features(
             elo_df, home_team, away_team, date)
+        home_btts = compute_btts_rolling(
+            df, home_team, date, window=5, venue="home")
+        away_btts = compute_btts_rolling(
+            df, away_team, date, window=5, venue="away")
 
         feat = {
             # Home form 5
@@ -544,6 +605,14 @@ def build_features(
             "away_elo":              elo["away_elo"],
             "elo_difference":        elo["elo_difference"],
 
+            # BTTS-specific rolling rates
+            "home_btts_rate_5":      home_btts["btts_rate"],
+            "away_btts_rate_5":      away_btts["btts_rate"],
+            "home_cs_rate_5":        home_btts["cs_rate"],
+            "away_cs_rate_5":        away_btts["cs_rate"],
+            "home_scored_rate_5":    home_btts["scored_rate"],
+            "away_scored_rate_5":    away_btts["scored_rate"],
+
             # H2H
             "h2h_home_wins_5":       h2h["home_wins"],
             "h2h_draws_5":           h2h["draws"],
@@ -557,6 +626,14 @@ def build_features(
             "target_away_goals":     row.get("away_goals"),
             "target_home_corners":   row.get("home_corners"),
             "target_away_corners":   row.get("away_corners"),
+            "target_btts": (
+                None if (pd.isna(row.get("home_goals", row.get("home_score")))
+                         or pd.isna(row.get("away_goals", row.get("away_score"))))
+                else (1 if (
+                    (row.get("home_goals", row.get("home_score", 0)) or 0) > 0
+                    and (row.get("away_goals", row.get("away_score", 0)) or 0) > 0
+                ) else 0)
+            ),
 
             # Meta (kept for chronological splitting later)
             "date":      date,
@@ -579,6 +656,14 @@ def build_features(
                          "home_elo", "away_elo"))
     ]
     out[feature_cols] = out[feature_cols].fillna(0)
+    btts_rate_cols = [
+        "home_btts_rate_5", "away_btts_rate_5",
+        "home_cs_rate_5", "away_cs_rate_5",
+        "home_scored_rate_5", "away_scored_rate_5",
+    ]
+    for c in btts_rate_cols:
+        if c in out.columns:
+            out[c] = out[c].fillna(0)
 
     print(
         f"[builder] Built {len(out)} feature rows, "
