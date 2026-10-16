@@ -152,6 +152,8 @@ Otherwise Vercel blocks deployment.
 
 - `POST /predict/admin/run-pipeline-fast?secret=X` — retrain models (~30-40 mins)
 
+- `GET /predict/admin/fix-bsa-label?secret=X` — one-off repair of stale `BEL-Jupiler Pro League` fixture labels; add `&dry_run=true` to preview. GET so it can be triggered from a phone browser
+
 ## Current Priorities (in order)
 
 ### PRIORITY 1 — COMPLETED ✅

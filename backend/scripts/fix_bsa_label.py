@@ -37,7 +37,7 @@ automatically (see ``backend/database.py``).  The script is idempotent: a second
 run reports ``updated 0``.
 
 The same repair is reachable over HTTP for a deployment that has no shell:
-``POST /predict/admin/fix-bsa-label?secret=...`` — see
+``GET /predict/admin/fix-bsa-label?secret=...`` — see
 ``backend/routers/predict.py``.
 """
 

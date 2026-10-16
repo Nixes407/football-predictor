@@ -11,7 +11,7 @@ name: One-off - fix stored BSA league labels
 # a second run reports "Updated 0 row(s)".
 #
 # GET /predict/admin/la-liga-check shows the same state read-only, and
-# POST /predict/admin/fix-bsa-label?secret=... applies the same repair to a
+# GET /predict/admin/fix-bsa-label?secret=... applies the same repair to a
 # deployment whose database is not reachable from CI.
 
 on:
