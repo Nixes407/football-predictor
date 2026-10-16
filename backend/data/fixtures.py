@@ -42,7 +42,7 @@ LEAGUE_MAP = {
     "FL1": "FRA-Ligue 1",
     "PPL": "POR-Primeira Liga",
     "DED": "NED-Eredivisie",
-    "BSA": "BEL-Jupiler Pro League",
+    "BSA": "BRA-Série A",
     "TR1": "TUR-Süper Lig",
     "NOR": "NOR-Eliteserien",
     "AUT": "AUT-Bundesliga",
@@ -106,6 +106,11 @@ TEAM_NAME_MAP = {
     "SD Eibar": "Eibar",
     "SD Huesca": "Huesca",
     "Real Valladolid CF": "Valladolid",
+    # Promoted clubs: football-data.org spellings -> the names the stats
+    # collectors store (FotMob/FBref spellings), so the fixture, the
+    # formula engine and the H2H history all agree on one name.
+    "RC Deportivo La Coruña": "Deportivo La Coruña",
+    "Levante UD": "Levante",
     # Bundesliga
     "FC Bayern München": "Bayern Munich",
     "Borussia Dortmund": "Dortmund",
