@@ -1,0 +1,102 @@
+name: One-off - fix stored BSA league labels
+
+# Applies backend/scripts/fix_bsa_label.py to the database behind
+# secrets.DATABASE_URL. Manual runs only: this is a data repair, not part of
+# the daily collection pipeline.
+#
+# Why it exists: Brazilian Série A fixtures fetched before football-data.org's
+# "BSA" competition code was added to LEAGUE_MAP are stored in daily_matches as
+# "BEL-Jupiler Pro League". Fixing the map only affects new fixtures, so the
+# already-stored rows need this one-time UPDATE. The script is idempotent -
+# a second run reports "Updated 0 row(s)".
+#
+# GET /predict/admin/la-liga-check shows the same state read-only, and
+# POST /predict/admin/fix-bsa-label?secret=... applies the same repair to a
+# deployment whose database is not reachable from CI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only report the rows that would change (write nothing)'
+        type: boolean
+        default: false
+
+jobs:
+  fix-bsa-label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      RENDER_BACKEND: ${{ secrets.RENDER_BACKEND }}
+      DRY_RUN: ${{ inputs.dry_run }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The repair script only needs the database layer: SQLAlchemy, a
+      # PostgreSQL driver and python-dotenv. No collectors, no models.
+      - name: Install database dependencies
+        run: |
+          pip install --upgrade pip
+          pip install "sqlalchemy>=2.0" psycopg2-binary python-dotenv
+
+      - name: Apply the daily_matches label repair
+        id: repair
+        working-directory: backend
+        run: |
+          set -o pipefail
+          if [ "$DRY_RUN" = "true" ]; then
+            FLAG="--dry-run"
+          else
+            FLAG=""
+          fi
+          echo "==> python scripts/fix_bsa_label.py $FLAG"
+          python scripts/fix_bsa_label.py $FLAG | tee /tmp/fix-bsa.log
+
+      - name: Check the deployed API agrees
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -z "$RENDER_BACKEND" ]; then
+            echo "RENDER_BACKEND is not configured; skipping the API check."
+            echo "(The endpoint only exists after this branch is deployed.)"
+            exit 0
+          fi
+          echo "==> GET ${RENDER_BACKEND}/predict/admin/la-liga-check"
+          curl -s --max-time 60 \
+            "${RENDER_BACKEND}/predict/admin/la-liga-check" \
+            | python3 -c "
+          import json, sys
+          try:
+              data = json.load(sys.stdin)
+          except Exception as exc:
+              print('could not parse the response:', exc)
+              raise SystemExit(0)
+          print('bsa_stored_row_count        :', data.get('bsa_stored_row_count'))
+          print('rows_needing_bsa_label_fix  :', data.get('rows_needing_bsa_label_fix'))
+          for row in (data.get('bsa_stored_rows') or [])[:20]:
+              print('  ', row.get('match_date'), row.get('league'),
+                    '-', row.get('home_team'), 'vs', row.get('away_team'))
+          for section in ('deportivo_stats', 'levante_stats'):
+              block = data.get(section) or {}
+              print(section, '->', block.get('team_name_variants_found'))
+          "
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          {
+            echo "## BSA league-label repair"
+            echo ""
+            echo '```'
+            cat /tmp/fix-bsa.log 2>/dev/null || echo "no output captured"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
