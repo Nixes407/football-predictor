@@ -146,6 +146,28 @@ OVER25_FEATURE_COLS = [
 
 TARGET_OVER25_COL = "target_over25"
 
+# Dedicated feature set for the Over 9.5 corners classifier. Deliberately
+# narrow: opponent-adjusted corner rates carry the signal, while the shared
+# 108-column vector dilutes it with goal/discipline noise.
+OVER95_CORNERS_FEATURE_COLS = [
+    # New corner-specific rolling rates (per game / fractions)
+    "home_corners_for_pg_5", "away_corners_for_pg_5",
+    "home_corners_against_pg_5", "away_corners_against_pg_5",
+    "home_over95_corners_rate_5", "away_over95_corners_rate_5",
+    # Existing venue-specific corners taken
+    "home_home_corners_5", "away_away_corners_5",
+    # Existing overall corners form
+    "home_form_corners_5", "away_form_corners_5",
+    # FBref attacking volume — the closest available corner drivers
+    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
+    "home_fbref_crosses", "away_fbref_crosses",
+    # Team strength and league context
+    "home_elo", "away_elo",
+    "league_encoded",
+]
+
+TARGET_OVER95_CORNERS_COL = "target_over95_corners"
+
 
 # --------------------------------------------------------------------------- #
 # Part A — Feature loading
@@ -874,9 +896,129 @@ def train_over25_model(
     return results
 
 
+def train_over95_corners_model(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    model_dir: str = "models",
+) -> dict:
+    """
+    Train and evaluate the dedicated Over 9.5 corners binary classifier.
+
+    Uses OVER95_CORNERS_FEATURE_COLS (6 new corner-specific rolling rates +
+    the existing corner form, FBref attacking volume, Elo and league columns)
+    and target_over95_corners. Same 65/15/20 chronological split.
+    Pipeline: SimpleImputer(median) -> StandardScaler -> LogisticRegression.
+    Saves to {model_dir}/over95_corners_model_v1.joblib
+    """
+    print("=" * 70)
+    print("[trainer] OVER 9.5 CORNERS MODEL — extracting features and targets")
+    print("=" * 70)
+    target_col = TARGET_OVER95_CORNERS_COL
+
+    def _extract_over95_corners_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+        if df is None or len(df) == 0:
+            return pd.DataFrame(columns=OVER95_CORNERS_FEATURE_COLS), pd.Series(dtype=float)
+        missing = [c for c in OVER95_CORNERS_FEATURE_COLS if c not in df.columns]
+        if missing:
+            print(f"[trainer] WARNING: missing Over 9.5 corners feature columns: {missing}")
+        usable = [c for c in OVER95_CORNERS_FEATURE_COLS if c in df.columns]
+        if target_col not in df.columns:
+            print(f"[trainer] WARNING: target '{target_col}' not found")
+            return df[usable].copy(), pd.Series(dtype=float)
+        y_raw = pd.to_numeric(df[target_col], errors="coerce")
+        mask = y_raw.notna()
+        dropped = int((~mask).sum())
+        if dropped:
+            print(f"[trainer] Dropped {dropped} rows with a null {target_col}")
+        X = df.loc[mask, usable].copy()
+        y = y_raw[mask].astype(int)
+        return X, y
+
+    def _evaluate_over95_corners(pipeline: Pipeline, X: pd.DataFrame, y: pd.Series, split_name: str) -> dict:
+        if len(X) == 0 or len(y) == 0:
+            print(f"[trainer] {split_name}: no rows to evaluate")
+            return {}
+        y_pred = pipeline.predict(X)
+        try:
+            y_proba = pipeline.predict_proba(X)[:, 1]
+        except Exception:
+            y_proba = y_pred.astype(float)
+        acc = float(accuracy_score(y, y_pred))
+        bal_acc = float(balanced_accuracy_score(y, y_pred))
+        f1 = float(f1_score(y, y_pred, average="binary", zero_division=0))
+        try:
+            auc = float(roc_auc_score(y, y_proba))
+        except Exception:
+            auc = float("nan")
+        print(f"[trainer] --- {split_name} metrics ({len(X)} rows) ---")
+        print(f"[trainer]   Accuracy          : {acc:.4f}")
+        print(f"[trainer]   Balanced accuracy : {bal_acc:.4f}")
+        print(f"[trainer]   F1 (binary)       : {f1:.4f}")
+        print(f"[trainer]   AUC-ROC           : {auc:.4f}")
+        return {
+            "rows": int(len(X)),
+            "accuracy": acc,
+            "balanced_accuracy": bal_acc,
+            "f1": f1,
+            "auc_roc": auc,
+        }
+
+    X_train, y_train = _extract_over95_corners_xy(train_df)
+    X_val, y_val = _extract_over95_corners_xy(val_df)
+    X_test, y_test = _extract_over95_corners_xy(test_df)
+    print(f"[trainer] Over 9.5 corners sizes -> train={len(X_train)} val={len(X_val)} test={len(X_test)}")
+    if len(X_train) == 0:
+        print("[trainer] ERROR: no Over 9.5 corners training rows, aborting")
+        return {}
+
+    print("[trainer] Fitting Over 9.5 corners pipeline on TRAIN...")
+    pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("model", LogisticRegression(solver="lbfgs", class_weight="balanced", max_iter=1000, random_state=42)),
+    ])
+    pipeline.fit(X_train, y_train)
+
+    print("[trainer] Evaluating Over 9.5 corners on VALIDATION...")
+    val_metrics = _evaluate_over95_corners(pipeline, X_val, y_val, "VALIDATION")
+
+    print("[trainer] Refitting Over 9.5 corners on TRAIN + VALIDATION...")
+    X_tv = pd.concat([X_train, X_val], axis=0)
+    y_tv = pd.concat([y_train, y_val], axis=0)
+    final_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("model", LogisticRegression(solver="lbfgs", class_weight="balanced", max_iter=1000, random_state=42)),
+    ])
+    final_pipeline.fit(X_tv, y_tv)
+
+    print("[trainer] Evaluating Over 9.5 corners ONCE on TEST...")
+    test_metrics = _evaluate_over95_corners(final_pipeline, X_test, y_test, "TEST")
+
+    model_path = Path(model_dir) / "over95_corners_model_v1.joblib"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(final_pipeline, model_path)
+    print(f"[trainer] Saved Over 9.5 corners pipeline -> {model_path}")
+
+    results = {
+        **test_metrics,
+        "val_accuracy": val_metrics.get("accuracy"),
+        "val_balanced_accuracy": val_metrics.get("balanced_accuracy"),
+        "val_f1": val_metrics.get("f1"),
+        "val_auc_roc": val_metrics.get("auc_roc"),
+        "model_path": str(model_path),
+        "n_features": len(OVER95_CORNERS_FEATURE_COLS),
+        "n_train": int(len(X_train)),
+        "n_val": int(len(X_val)),
+        "n_test": int(len(X_test)),
+    }
+    return results
+
+
 def upload_models_to_supabase(model_dir: str = "models") -> None:
     """
-    Push the five saved .joblib artifacts to the "models"
+    Push the saved model artifacts to the "models"
     bucket in Supabase Storage, overwriting existing copies.
 
     Credentials are read from the SUPABASE_URL and SUPABASE_KEY
@@ -906,6 +1048,10 @@ def upload_models_to_supabase(model_dir: str = "models") -> None:
         (Path(model_dir) / "away_corners_v1.joblib", "away_corners_v1.joblib"),
         (Path(model_dir) / "btts_model_v1.joblib", "btts_model_v1.joblib"),
         (Path(model_dir) / "over25_model_v1.joblib", "over25_model_v1.joblib"),
+        (
+            Path(model_dir) / "over95_corners_model_v1.joblib",
+            "over95_corners_model_v1.joblib",
+        ),
         (
             BACKEND_DIR / "data" / "league_encoder.joblib",
             "league_encoder.joblib",
@@ -956,6 +1102,7 @@ def train_all_models(
       5. Away corners Poisson
       6. BTTS binary classifier
       7. Over 2.5 binary classifier
+      8. Over 9.5 corners binary classifier
 
     Returns a summary dict of all model results.
     Validation controls all choices.
@@ -1003,6 +1150,11 @@ def train_all_models(
 
     print("\n--- OVER 2.5 MODEL ---")
     results["over25"] = train_over25_model(train_df, val_df, test_df, model_dir)
+
+    print("\n--- OVER 9.5 CORNERS MODEL ---")
+    results["over95_corners"] = train_over95_corners_model(
+        train_df, val_df, test_df, model_dir
+    )
 
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE — SUMMARY")
