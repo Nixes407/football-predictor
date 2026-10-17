@@ -536,6 +536,109 @@ def compute_over25_rolling(
     }
 
 
+# Corner column aliases. The matches table stores home_corners/away_corners
+# (see database.Match); the short variants are accepted so a frame built from
+# a differently-named extract still resolves instead of silently zeroing out.
+HOME_CORNERS_ALIASES = ("home_corners", "home_crs")
+AWAY_CORNERS_ALIASES = ("away_corners", "away_crs")
+
+# A match is "Over 9.5 corners" when it has at least this many corners total.
+OVER95_CORNERS_THRESHOLD = 10
+
+
+def _corner_values(
+    frame: pd.DataFrame,
+    aliases: tuple[str, ...],
+) -> pd.Series:
+    """Numeric corner column for one side of a slice of the matches table.
+
+    Missing column or unparseable values become 0.0: a match without corners
+    must never drop a training row.
+    """
+    for name in aliases:
+        if name in frame.columns:
+            return pd.to_numeric(frame[name], errors="coerce").fillna(0.0)
+    return pd.Series(0.0, index=frame.index, dtype=float)
+
+
+def _corner_value(row: pd.Series, aliases: tuple[str, ...]) -> float | None:
+    """Single match's corner count for one side, or None when unavailable."""
+    for name in aliases:
+        if name in row.index:
+            value = row.get(name)
+            if pd.isna(value):
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def compute_corners_rolling(
+    df: pd.DataFrame,
+    team: str,
+    before_date: pd.Timestamp,
+    window: int = 5,
+    venue: str = "home",
+) -> dict:
+    """Rolling corner rates for a team before a date.
+
+    venue="home" -> matches where team played at home
+    venue="away" -> matches where team played away
+
+    corners_for_pg     = corners taken per game over the last ``window`` games
+    corners_against_pg = corners conceded per game over those games
+    over95_rate        = fraction of those matches with >= 10 total corners
+
+    Both rates are per game, not sums, so a team with less than ``window``
+    matches of history is still on the same scale as a full-history team.
+    Every value is 0.0 when there is no prior match.
+    """
+    if venue == "home":
+        mask = (df["home_team"] == team) & (df["date"] < before_date)
+    else:
+        mask = (df["away_team"] == team) & (df["date"] < before_date)
+
+    recent = df[mask].tail(window)
+    n = len(recent)
+    if n == 0:
+        return {
+            "corners_for_pg": 0.0,
+            "corners_against_pg": 0.0,
+            "over95_rate": 0.0,
+        }
+
+    home_c = _corner_values(recent, HOME_CORNERS_ALIASES)
+    away_c = _corner_values(recent, AWAY_CORNERS_ALIASES)
+
+    # Corners conceded is the OTHER side of the same match: at home that is
+    # away_corners, away from home it is home_corners.
+    if venue == "home":
+        for_corners, against_corners = home_c, away_c
+    else:
+        for_corners, against_corners = away_c, home_c
+
+    over95 = int(((home_c + away_c) >= OVER95_CORNERS_THRESHOLD).sum())
+
+    return {
+        "corners_for_pg": float(for_corners.sum()) / n,
+        "corners_against_pg": float(against_corners.sum()) / n,
+        "over95_rate": float(over95) / n,
+    }
+
+
+def over95_corners_target(row: pd.Series) -> int | None:
+    """1 when the match had 10+ corners in total, 0 otherwise, None if a side
+    has no recorded corners. Same null handling as target_btts/target_over25.
+    """
+    home_c = _corner_value(row, HOME_CORNERS_ALIASES)
+    away_c = _corner_value(row, AWAY_CORNERS_ALIASES)
+    if home_c is None or away_c is None:
+        return None
+    return 1 if (home_c + away_c) >= OVER95_CORNERS_THRESHOLD else 0
+
+
 def build_features(
     df: pd.DataFrame,
     elo_df: pd.DataFrame | None = None,
@@ -593,6 +696,10 @@ def build_features(
         home_o25 = compute_over25_rolling(
             df, home_team, date, window=5, venue="home")
         away_o25 = compute_over25_rolling(
+            df, away_team, date, window=5, venue="away")
+        home_c5 = compute_corners_rolling(
+            df, home_team, date, window=5, venue="home")
+        away_c5 = compute_corners_rolling(
             df, away_team, date, window=5, venue="away")
 
         feat = {
@@ -679,6 +786,15 @@ def build_features(
             "home_high_scoring_rate_5":  home_o25["high_scoring_rate"],
             "away_high_scoring_rate_5":  away_o25["high_scoring_rate"],
 
+            # Corner-specific rolling rates (venue-aware), for the Over 9.5
+            # corners classifier only — deliberately NOT part of FEATURE_COLS.
+            "home_corners_for_pg_5":      home_c5["corners_for_pg"],
+            "away_corners_for_pg_5":      away_c5["corners_for_pg"],
+            "home_corners_against_pg_5":  home_c5["corners_against_pg"],
+            "away_corners_against_pg_5":  away_c5["corners_against_pg"],
+            "home_over95_corners_rate_5": home_c5["over95_rate"],
+            "away_over95_corners_rate_5": away_c5["over95_rate"],
+
             # H2H
             "h2h_home_wins_5":       h2h["home_wins"],
             "h2h_draws_5":           h2h["draws"],
@@ -708,6 +824,7 @@ def build_features(
                     + (row.get("away_goals", row.get("away_score", 0)) or 0) >= 3
                 ) else 0)
             ),
+            "target_over95_corners": over95_corners_target(row),
 
             # Meta (kept for chronological splitting later)
             "date":      date,
@@ -743,6 +860,14 @@ def build_features(
         "home_high_scoring_rate_5", "away_high_scoring_rate_5",
     ]
     for c in over25_rate_cols:
+        if c in out.columns:
+            out[c] = out[c].fillna(0)
+    corner_rate_cols = [
+        "home_corners_for_pg_5", "away_corners_for_pg_5",
+        "home_corners_against_pg_5", "away_corners_against_pg_5",
+        "home_over95_corners_rate_5", "away_over95_corners_rate_5",
+    ]
+    for c in corner_rate_cols:
         if c in out.columns:
             out[c] = out[c].fillna(0)
 

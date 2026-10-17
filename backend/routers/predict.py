@@ -62,6 +62,7 @@ _home_corners  = None
 _away_corners  = None
 _btts_model    = None
 _over25_model  = None
+_over95_corners_model = None
 _le_league     = None
 _le_season     = None
 _features_df   = None
@@ -169,11 +170,25 @@ OVER25_FEATURE_COLS = [
     "league_encoded",
 ]
 
+# Must stay identical to OVER95_CORNERS_FEATURE_COLS in models/trainer.py —
+# the classifier is scored on exactly the columns it was trained on, in order.
+OVER95_CORNERS_FEATURE_COLS = [
+    "home_corners_for_pg_5", "away_corners_for_pg_5",
+    "home_corners_against_pg_5", "away_corners_against_pg_5",
+    "home_over95_corners_rate_5", "away_over95_corners_rate_5",
+    "home_home_corners_5", "away_away_corners_5",
+    "home_form_corners_5", "away_form_corners_5",
+    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
+    "home_fbref_crosses", "away_fbref_crosses",
+    "home_elo", "away_elo",
+    "league_encoded",
+]
+
 
 def download_models_from_supabase() -> bool:
     """
-    Pull the five model .joblib files from the "models" bucket
-    in Supabase Storage into BACKEND_DIR / "models".
+    Pull the model .joblib files and the shared artifacts from the "models"
+    bucket in Supabase Storage into BACKEND_DIR / "models".
 
     Credentials come from SUPABASE_URL and SUPABASE_KEY. Returns
     True only when every file downloaded and wrote successfully —
@@ -240,6 +255,14 @@ def download_models_from_supabase() -> bool:
         ),
     ]
 
+    # (path inside the "models" bucket, where to save it locally) — best effort
+    optional_model_files = [
+        (
+            "over95_corners_model_v1.joblib",
+            models_dir / "over95_corners_model_v1.joblib",
+        ),
+    ]
+
     for file_name, save_path in model_files:
         try:
             data = client.storage.from_("models").download(file_name)
@@ -250,6 +273,21 @@ def download_models_from_supabase() -> bool:
             print(f"[predict] WARNING: could not download "
                   f"{file_name}: {exc}")
             return False
+
+    # Optional market models are fetched after the core set and never fail the
+    # download: a model added by a newer release is not in the bucket until
+    # the next training run uploads it, and treating that as a missing core
+    # artifact would force a full local rebuild on every such deploy. The
+    # router already degrades to the Poisson figure when the global is None.
+    for file_name, save_path in optional_model_files:
+        try:
+            data = client.storage.from_("models").download(file_name)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_bytes(data)
+            print(f"[predict] Downloaded from Supabase -> models/{file_name}")
+        except Exception as exc:
+            print(f"[predict] NOTE: optional {file_name} not in Supabase "
+                  f"bucket yet ({exc}) — falling back to Poisson")
 
     print("Models downloaded from Supabase Storage")
     return True
@@ -263,6 +301,7 @@ def load_artifacts() -> None:
     """
     global _result_model, _home_goals, _away_goals
     global _home_corners, _away_corners, _btts_model, _over25_model
+    global _over95_corners_model
     global _le_league, _le_season, _features_df
 
     models_dir = BACKEND_DIR / "models"
@@ -276,6 +315,9 @@ def load_artifacts() -> None:
         "_away_corners":  models_dir / "away_corners_v1.joblib",
         "_btts_model":    models_dir / "btts_model_v1.joblib",
         "_over25_model":  models_dir / "over25_model_v1.joblib",
+        "_over95_corners_model": (
+            models_dir / "over95_corners_model_v1.joblib"
+        ),
         "_le_league":     data_dir   / "league_encoder.joblib",
         "_le_season":     data_dir   / "season_encoder.joblib",
     }
@@ -796,6 +838,112 @@ def _get_over25_probability(
         return None
 
 
+# The 6 corner-specific rates the classifier cannot be scored without: an
+# older features.csv without them means the model was trained on different
+# inputs, so the caller must keep the Poisson value instead of guessing.
+OVER95_CORNERS_REQUIRED_COLS = [
+    "home_corners_for_pg_5", "away_corners_for_pg_5",
+    "home_corners_against_pg_5", "away_corners_against_pg_5",
+    "home_over95_corners_rate_5", "away_over95_corners_rate_5",
+]
+
+
+def _build_over95_corners_feature_vector(
+    home_team: str,
+    away_team: str,
+    league_encoded: int,
+    df: pd.DataFrame,
+) -> dict[str, float] | None:
+    """Build the 17-feature vector expected by the Over 9.5 corners model.
+
+    Returns None when the corner-specific rolling columns are not present or
+    when no history exists for either team.
+    """
+    if df is None or df.empty:
+        return None
+    missing = [
+        c for c in OVER95_CORNERS_FEATURE_COLS
+        if c not in df.columns and c != "league_encoded"
+    ]
+    # Only the 6 new corner rates are mandatory — FBref and form columns may
+    # legitimately be absent from a partial features run, and are then 0.0.
+    if any(c in missing for c in OVER95_CORNERS_REQUIRED_COLS):
+        print(f"[predict] WARNING: Over 9.5 corners features missing in CSV: "
+              f"{missing}")
+        return None
+    try:
+        home_rows = df[df["home_team"] == home_team]
+        away_rows = df[df["away_team"] == away_team]
+        if home_rows.empty and away_rows.empty:
+            return None
+        home_latest = home_rows.iloc[-1] if not home_rows.empty else None
+        away_latest = away_rows.iloc[-1] if not away_rows.empty else None
+    except Exception as exc:
+        print(f"[predict] WARNING: could not get Over 9.5 corners team rows: "
+              f"{exc}")
+        return None
+
+    vector: dict[str, float] = {}
+    for col in OVER95_CORNERS_FEATURE_COLS:
+        if col == "league_encoded":
+            vector[col] = float(league_encoded)
+            continue
+        if col.startswith("home_") and home_latest is not None \
+                and col in home_latest.index:
+            source = home_latest
+        elif col.startswith("away_") and away_latest is not None \
+                and col in away_latest.index:
+            source = away_latest
+        else:
+            vector[col] = 0.0
+            continue
+        try:
+            value = float(source.get(col, 0.0) or 0.0)
+        except Exception:
+            value = 0.0
+        # A NaN here would propagate through the scaler and make the model
+        # raise, so an unrecorded corner rate is scored as 0 — the same value
+        # builder.py gives a team with no prior matches.
+        vector[col] = value if np.isfinite(value) else 0.0
+    return vector
+
+
+def _get_over95_corners_probability(
+    home_team: str,
+    away_team: str,
+    league_encoded: int,
+    df: pd.DataFrame,
+) -> float | None:
+    """P(total corners >= 10) from the dedicated classifier, or None."""
+    global _over95_corners_model
+    if _over95_corners_model is None:
+        return None
+    if df is None or df.empty:
+        return None
+    if any(c not in df.columns for c in OVER95_CORNERS_REQUIRED_COLS):
+        return None
+    vector = _build_over95_corners_feature_vector(
+        home_team, away_team, league_encoded, df
+    )
+    if vector is None:
+        return None
+    # Ensure all expected columns are filled
+    for c in OVER95_CORNERS_FEATURE_COLS:
+        if c not in vector:
+            vector[c] = 0.0
+    try:
+        X = pd.DataFrame([vector])[OVER95_CORNERS_FEATURE_COLS]
+        proba = _over95_corners_model.predict_proba(X)
+        # proba shape (1, 2) for binary
+        if proba.shape[1] >= 2:
+            return float(proba[0][1])
+        else:
+            return float(proba[0][0])
+    except Exception as exc:
+        print(f"[predict] WARNING: Over 9.5 corners inference failed: {exc}")
+        return None
+
+
 @router.get("/leagues")
 def get_leagues() -> dict:
     """Return all known leagues from the league encoder."""
@@ -874,6 +1022,20 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
                                 print(f"[predict] Over 2.5 overridden by classifier: {over25_prob:.4f}")
                     except Exception as exc:
                         print(f"[predict] WARNING: Over 2.5 override failed (formula path): {exc}")
+                # Override Over 9.5 corners with the dedicated classifier when available
+                if _over95_corners_model is not None and _features_df is not None:
+                    try:
+                        league_enc_for_corners = _encode_label(_le_league, req.league)
+                        corners95_prob = _get_over95_corners_probability(
+                            req.home_team, req.away_team, league_enc_for_corners, _features_df
+                        )
+                        if corners95_prob is not None:
+                            # Replace only the corners over_9_5 field, keep everything else
+                            if "corners" in formula_result and isinstance(formula_result["corners"], dict):
+                                formula_result["corners"]["over_9_5"] = round(float(corners95_prob), 4)
+                                print(f"[predict] Over 9.5 corners overridden by classifier: {corners95_prob:.4f}")
+                    except Exception as exc:
+                        print(f"[predict] WARNING: Over 9.5 corners override failed (formula path): {exc}")
                 return formula_result
             else:
                 print("[predict] Formula engine "
@@ -971,7 +1133,16 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
 
     # Derived corner markets
     over_corners_8_5  = _poisson_over(exp_total_corners, 8.5)
+    over_corners_9_5  = _poisson_over(exp_total_corners, 9.5)
     over_corners_10_5 = _poisson_over(exp_total_corners, 10.5)
+    over_corners_11_5 = _poisson_over(exp_total_corners, 11.5)
+    # Override Over 9.5 corners with the dedicated classifier when available
+    over95_corners_classifier_prob = _get_over95_corners_probability(
+        req.home_team, req.away_team, league_enc, _features_df
+    )
+    if over95_corners_classifier_prob is not None:
+        over_corners_9_5 = float(over95_corners_classifier_prob)
+        print(f"[predict] Over 9.5 corners overridden by classifier (ML path): {over_corners_9_5:.4f}")
 
     return {
         "home_team": req.home_team,
@@ -994,8 +1165,15 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         "corners": {
             "expected_home":  round(exp_home_corners, 3),
             "expected_away":  round(exp_away_corners, 3),
+            # The frontend reads expected_total / over_9_5 / over_11_5 and the
+            # formula engine publishes all three; the ML path used to omit
+            # them, which left those rows blank for every non-formula
+            # prediction (and left no over_9_5 for fixtures.py to store).
+            "expected_total": round(exp_total_corners, 3),
             "over_8_5":       round(over_corners_8_5, 4),
+            "over_9_5":       round(over_corners_9_5, 4),
             "over_10_5":      round(over_corners_10_5, 4),
+            "over_11_5":      round(over_corners_11_5, 4),
         },
         "feature_vector_used": {
             k: round(v, 4) for k, v in vector.items()
@@ -1259,6 +1437,7 @@ def pipeline_status() -> dict:
         "away_corners":  _away_corners  is not None,
         "btts_model":    _btts_model    is not None,
         "over25_model":  _over25_model  is not None,
+        "over95_corners_model": _over95_corners_model is not None,
         "le_league":     _le_league     is not None,
         "le_season":     _le_season     is not None,
         "features_df":   _features_df   is not None,
