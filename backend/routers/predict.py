@@ -57,6 +57,8 @@ if str(BACKEND_DIR) not in sys.path:
 
 # Module-level artifact variables (all start as None)
 _result_model  = None
+_xgb_result_model = None
+_xgb_label_encoder = None
 _home_goals    = None
 _away_goals    = None
 _home_corners  = None
@@ -272,6 +274,14 @@ def download_models_from_supabase() -> bool:
             "over95_corners_model_v1.joblib",
             models_dir / "over95_corners_model_v1.joblib",
         ),
+        (
+            "result_model_xgb_v1.joblib",
+            models_dir / "result_model_xgb_v1.joblib",
+        ),
+        (
+            "result_model_xgb_v1_label_encoder.joblib",
+            models_dir / "result_model_xgb_v1_label_encoder.joblib",
+        ),
     ]
 
     for file_name, save_path in model_files:
@@ -310,7 +320,7 @@ def load_artifacts() -> None:
     once at module import time. Missing artifacts print
     a warning but never crash the import or the API.
     """
-    global _result_model, _home_goals, _away_goals
+    global _result_model, _xgb_result_model, _xgb_label_encoder, _home_goals, _away_goals
     global _home_corners, _away_corners, _btts_model, _over25_model
     global _over95_corners_model
     global _le_league, _le_season, _features_df
@@ -320,6 +330,8 @@ def load_artifacts() -> None:
 
     artifacts = {
         "_result_model":  models_dir / "result_model_v1.joblib",
+        "_xgb_result_model": models_dir / "result_model_xgb_v1.joblib",
+        "_xgb_label_encoder": models_dir / "result_model_xgb_v1_label_encoder.joblib",
         "_home_goals":    models_dir / "home_goals_v1.joblib",
         "_away_goals":    models_dir / "away_goals_v1.joblib",
         "_home_corners":  models_dir / "home_corners_v1.joblib",
@@ -368,24 +380,26 @@ def _get_runtime_feature_cols() -> list[str]:
     This guarantees predict.py always uses exactly
     the features the model was trained on.
     """
-    global _result_model
+    global _result_model, _xgb_result_model
 
-    if _result_model is None:
+    model = _xgb_result_model if _xgb_result_model is not None else _result_model
+
+    if model is None:
         return FEATURE_COLS
 
     try:
         # Pipeline: get the final estimator step
-        if hasattr(_result_model, 'steps'):
-            final_step = _result_model.steps[-1][1]
+        if hasattr(model, 'steps'):
+            final_step = model.steps[-1][1]
         else:
-            final_step = _result_model
+            final_step = model
 
         if hasattr(final_step, 'feature_names_in_'):
             return list(final_step.feature_names_in_)
 
         # Try the imputer step which sees raw features
-        if hasattr(_result_model, 'steps'):
-            imputer = _result_model.steps[0][1]
+        if hasattr(model, 'steps'):
+            imputer = model.steps[0][1]
             if hasattr(imputer, 'feature_names_in_'):
                 return list(imputer.feature_names_in_)
     except Exception as exc:
@@ -415,7 +429,7 @@ def auto_start_fast_pipeline() -> None:
         return
 
     if all([
-        _result_model  is not None,
+        (_result_model is not None or _xgb_result_model is not None),
         _home_goals    is not None,
         _away_goals    is not None,
         _home_corners  is not None,
@@ -955,6 +969,71 @@ def _get_over95_corners_probability(
         return None
 
 
+def _get_xgb_1x2_probabilities(
+    feature_vector: Any,
+) -> dict[str, float] | None:
+    """
+    Return {"H": prob, "D": prob, "A": prob} from XGBoost 1X2 model,
+    or None if the model or label encoder is not loaded.
+    Uses _xgb_label_encoder.classes_ to map predict_proba columns to H/D/A.
+    """
+    global _xgb_result_model, _xgb_label_encoder
+
+    if _xgb_result_model is None or _xgb_label_encoder is None:
+        return None
+
+    try:
+        runtime_cols = _get_runtime_feature_cols()
+
+        if isinstance(feature_vector, pd.DataFrame):
+            missing = [c for c in runtime_cols if c not in feature_vector.columns]
+            if missing:
+                df = feature_vector.copy()
+                for c in missing:
+                    df[c] = 0.0
+                X = df[runtime_cols]
+            else:
+                X = feature_vector[runtime_cols]
+        elif isinstance(feature_vector, pd.Series):
+            row = feature_vector.to_dict()
+            for c in runtime_cols:
+                if c not in row:
+                    row[c] = 0.0
+            X = pd.DataFrame([row])[runtime_cols]
+        elif isinstance(feature_vector, dict):
+            vec = dict(feature_vector)
+            for c in runtime_cols:
+                if c not in vec:
+                    vec[c] = 0.0
+            X = pd.DataFrame([vec])[runtime_cols]
+        elif isinstance(feature_vector, (list, np.ndarray)):
+            arr = np.asarray(feature_vector, dtype=float)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            if arr.shape[1] < len(runtime_cols):
+                padded = np.zeros((arr.shape[0], len(runtime_cols)), dtype=float)
+                padded[:, :arr.shape[1]] = arr
+                X = pd.DataFrame(padded, columns=runtime_cols)
+            else:
+                X = pd.DataFrame(arr[:, :len(runtime_cols)], columns=runtime_cols)
+        else:
+            print(f"[predict] WARNING: unexpected feature_vector type for XGBoost: {type(feature_vector)}")
+            return None
+
+        proba = _xgb_result_model.predict_proba(X)[0]
+        classes = list(_xgb_label_encoder.classes_)
+        result_map = dict(zip(classes, proba))
+
+        return {
+            "H": round(float(result_map.get("H", 0.0)), 4),
+            "D": round(float(result_map.get("D", 0.0)), 4),
+            "A": round(float(result_map.get("A", 0.0)), 4),
+        }
+    except Exception as exc:
+        print(f"[predict] WARNING: XGBoost 1X2 inference failed: {exc}")
+        return None
+
+
 @router.get("/leagues")
 def get_leagues() -> dict:
     """Return all known leagues from the league encoder."""
@@ -989,6 +1068,7 @@ def get_teams(league: str = "") -> dict:
 def _blend_predictions(
     formula_result: dict[str, Any],
     ml_result: dict[str, Any],
+    xgb_probs: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """
     Blend formula_v1 and ML prediction outputs using weighted averaging
@@ -1000,15 +1080,27 @@ def _blend_predictions(
     blended["goals"] = dict(formula_result.get("goals") or {})
     blended["corners"] = dict(formula_result.get("corners") or {})
 
+    # Determine 1X2 probabilities for ML side: XGBoost or Logistic fallback
+    if xgb_probs is not None:
+        ml_home = xgb_probs.get("H", 0.0)
+        ml_draw = xgb_probs.get("D", 0.0)
+        ml_away = xgb_probs.get("A", 0.0)
+        xgb_active = True
+    else:
+        xgb_active = bool(ml_result.get("xgb_1x2_active", False))
+        ml_home = ml_result.get("result", {}).get("home_win", 0.0)
+        ml_draw = ml_result.get("result", {}).get("draw", 0.0)
+        ml_away = ml_result.get("result", {}).get("away_win", 0.0)
+
     blended["result"]["home_win"] = round(
         formula_result["result"]["home_win"] * BLEND_FORMULA_1X2 +
-        ml_result["result"]["home_win"] * BLEND_ML_1X2, 4)
+        ml_home * BLEND_ML_1X2, 4)
     blended["result"]["draw"] = round(
         formula_result["result"]["draw"] * BLEND_FORMULA_1X2 +
-        ml_result["result"]["draw"] * BLEND_ML_1X2, 4)
+        ml_draw * BLEND_ML_1X2, 4)
     blended["result"]["away_win"] = round(
         formula_result["result"]["away_win"] * BLEND_FORMULA_1X2 +
-        ml_result["result"]["away_win"] * BLEND_ML_1X2, 4)
+        ml_away * BLEND_ML_1X2, 4)
 
     blended["goals"]["expected_home"] = round(
         formula_result["goals"]["expected_home"] * BLEND_FORMULA_GOALS +
@@ -1045,6 +1137,7 @@ def _blend_predictions(
     blended["corners"]["over_11_5"] = round(_poisson_over(exp_total_corners, 11.5), 4)
 
     blended["prediction_method"] = "blended"
+    blended["xgb_1x2_active"] = xgb_active
     return blended
 
 
@@ -1078,7 +1171,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
 
     # 2. Try ML -> store result as ml_result (or None if unavailable/error)
     models_ready = all([
-        _result_model is not None,
+        (_result_model is not None or _xgb_result_model is not None),
         _home_goals   is not None,
         _away_goals   is not None,
         _home_corners is not None,
@@ -1111,14 +1204,24 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
             # Convert to DataFrame with correct column order
             X = pd.DataFrame([vector])[runtime_cols]
 
-            # 1X2 result probabilities
-            result_proba = _result_model.predict_proba(X)[0]
-            classes      = list(_result_model.classes_)
-            result_map   = dict(zip(classes, result_proba))
+            # 1X2 result probabilities: XGBoost if loaded, else fallback to Logistic regression
+            xgb_probs = _get_xgb_1x2_probabilities(X)
+            xgb_active = xgb_probs is not None
 
-            home_win_prob = round(float(result_map.get("H", 0.0)), 4)
-            draw_prob     = round(float(result_map.get("D", 0.0)), 4)
-            away_win_prob = round(float(result_map.get("A", 0.0)), 4)
+            if xgb_active:
+                home_win_prob = xgb_probs["H"]
+                draw_prob     = xgb_probs["D"]
+                away_win_prob = xgb_probs["A"]
+            elif _result_model is not None:
+                result_proba = _result_model.predict_proba(X)[0]
+                classes      = list(_result_model.classes_)
+                result_map   = dict(zip(classes, result_proba))
+
+                home_win_prob = round(float(result_map.get("H", 0.0)), 4)
+                draw_prob     = round(float(result_map.get("D", 0.0)), 4)
+                away_win_prob = round(float(result_map.get("A", 0.0)), 4)
+            else:
+                home_win_prob = draw_prob = away_win_prob = 0.0
 
             # Expected goals
             exp_home_goals = float(max(_home_goals.predict(X)[0], 0.0))
@@ -1154,6 +1257,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
                     "draw":     draw_prob,
                     "away_win": away_win_prob,
                 },
+                "xgb_1x2_active": xgb_active,
                 "goals": {
                     "expected_home": round(exp_home_goals, 3),
                     "expected_away": round(exp_away_goals, 3),
@@ -1192,11 +1296,13 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
     elif formula_result is not None:
         final_result = formula_result
         final_result["prediction_method"] = "formula_only"
+        final_result["xgb_1x2_active"] = False
         print(f"[predict] Using formula_only: "
               f"{req.home_team} vs {req.away_team}")
     elif ml_result is not None:
         final_result = ml_result
         final_result["prediction_method"] = "ml_only"
+        final_result["xgb_1x2_active"] = ml_result.get("xgb_1x2_active", False)
         print(f"[predict] Using ml_only: "
               f"{req.home_team} vs {req.away_team}")
     else:
@@ -1266,6 +1372,11 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
                     print(f"[predict] Over 9.5 corners overridden by classifier: {corners95_prob:.4f}")
         except Exception as exc:
             print(f"[predict] WARNING: Over 9.5 corners override failed: {exc}")
+
+    if "xgb_1x2_active" not in final_result:
+        final_result["xgb_1x2_active"] = bool(
+            ml_result.get("xgb_1x2_active", False) if ml_result else False
+        )
 
     return final_result
 
@@ -1520,6 +1631,7 @@ def pipeline_status() -> dict:
         "pipeline_log":     _pipeline_log[-10:],
         "pipeline_error":   _pipeline_error,
         "result_model":  _result_model  is not None,
+        "xgb_result_model": _xgb_result_model is not None,
         "home_goals":    _home_goals    is not None,
         "away_goals":    _away_goals    is not None,
         "home_corners":  _home_corners  is not None,
@@ -1532,7 +1644,7 @@ def pipeline_status() -> dict:
         "features_df":   _features_df   is not None,
         "features_rows": len(_features_df) if _features_df is not None else 0,
         "ready": all([
-            _result_model is not None,
+            (_result_model is not None or _xgb_result_model is not None),
             _home_goals   is not None,
             _away_goals   is not None,
             _home_corners is not None,
