@@ -480,6 +480,62 @@ def compute_btts_rolling(
     }
 
 
+def compute_over25_rolling(
+    df: pd.DataFrame,
+    team: str,
+    before_date: pd.Timestamp,
+    window: int = 5,
+    venue: str = "home",
+) -> dict:
+    """Rolling over-2.5 / high-scoring rates for a team before a date.
+
+    venue="home" -> matches where team played at home
+    venue="away" -> matches where team played away
+
+    over25_rate       = fraction of those matches with 3+ total goals
+    high_scoring_rate = fraction where this team itself scored 2+ goals
+
+    Returns fractions over the last ``window`` such matches.
+    """
+    if venue == "home":
+        mask = (df["home_team"] == team) & (df["date"] < before_date)
+    else:
+        mask = (df["away_team"] == team) & (df["date"] < before_date)
+
+    recent = df[mask].tail(window)
+    n = len(recent)
+    if n == 0:
+        return {"over25_rate": 0.0, "high_scoring_rate": 0.0}
+
+    # Support both home_goals (DB) and home_score (spec) column names
+    if "home_goals" in recent.columns:
+        hg = recent["home_goals"]
+    elif "home_score" in recent.columns:
+        hg = recent["home_score"]
+    else:
+        hg = pd.Series(0, index=recent.index)
+    if "away_goals" in recent.columns:
+        ag = recent["away_goals"]
+    elif "away_score" in recent.columns:
+        ag = recent["away_score"]
+    else:
+        ag = pd.Series(0, index=recent.index)
+
+    hg = pd.to_numeric(hg, errors="coerce").fillna(0)
+    ag = pd.to_numeric(ag, errors="coerce").fillna(0)
+
+    over25 = int(((hg + ag) >= 3).sum())
+    if venue == "home":
+        high_scoring = int((hg >= 2).sum())
+    else:
+        high_scoring = int((ag >= 2).sum())
+
+    return {
+        "over25_rate": float(over25) / n,
+        "high_scoring_rate": float(high_scoring) / n,
+    }
+
+
 def build_features(
     df: pd.DataFrame,
     elo_df: pd.DataFrame | None = None,
@@ -533,6 +589,10 @@ def build_features(
         home_btts = compute_btts_rolling(
             df, home_team, date, window=5, venue="home")
         away_btts = compute_btts_rolling(
+            df, away_team, date, window=5, venue="away")
+        home_o25 = compute_over25_rolling(
+            df, home_team, date, window=5, venue="home")
+        away_o25 = compute_over25_rolling(
             df, away_team, date, window=5, venue="away")
 
         feat = {
@@ -613,6 +673,12 @@ def build_features(
             "home_scored_rate_5":    home_btts["scored_rate"],
             "away_scored_rate_5":    away_btts["scored_rate"],
 
+            # Over-2.5-specific rolling rates
+            "home_over25_rate_5":        home_o25["over25_rate"],
+            "away_over25_rate_5":        away_o25["over25_rate"],
+            "home_high_scoring_rate_5":  home_o25["high_scoring_rate"],
+            "away_high_scoring_rate_5":  away_o25["high_scoring_rate"],
+
             # H2H
             "h2h_home_wins_5":       h2h["home_wins"],
             "h2h_draws_5":           h2h["draws"],
@@ -632,6 +698,14 @@ def build_features(
                 else (1 if (
                     (row.get("home_goals", row.get("home_score", 0)) or 0) > 0
                     and (row.get("away_goals", row.get("away_score", 0)) or 0) > 0
+                ) else 0)
+            ),
+            "target_over25": (
+                None if (pd.isna(row.get("home_goals", row.get("home_score")))
+                         or pd.isna(row.get("away_goals", row.get("away_score"))))
+                else (1 if (
+                    (row.get("home_goals", row.get("home_score", 0)) or 0)
+                    + (row.get("away_goals", row.get("away_score", 0)) or 0) >= 3
                 ) else 0)
             ),
 
@@ -662,6 +736,13 @@ def build_features(
         "home_scored_rate_5", "away_scored_rate_5",
     ]
     for c in btts_rate_cols:
+        if c in out.columns:
+            out[c] = out[c].fillna(0)
+    over25_rate_cols = [
+        "home_over25_rate_5", "away_over25_rate_5",
+        "home_high_scoring_rate_5", "away_high_scoring_rate_5",
+    ]
+    for c in over25_rate_cols:
         if c in out.columns:
             out[c] = out[c].fillna(0)
 
