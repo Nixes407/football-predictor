@@ -61,6 +61,7 @@ _away_goals    = None
 _home_corners  = None
 _away_corners  = None
 _btts_model    = None
+_over25_model  = None
 _le_league     = None
 _le_season     = None
 _features_df   = None
@@ -155,6 +156,19 @@ BTTS_FEATURE_COLS = [
     "league_encoded",
 ]
 
+OVER25_FEATURE_COLS = [
+    "home_over25_rate_5", "away_over25_rate_5",
+    "home_high_scoring_rate_5", "away_high_scoring_rate_5",
+    "home_form_gf_5", "away_form_gf_5",
+    "home_form_ga_5", "away_form_ga_5",
+    "home_form_gf_10", "away_form_gf_10",
+    "home_fbref_goals_against", "away_fbref_goals_against",
+    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
+    "home_elo", "away_elo",
+    "elo_difference",
+    "league_encoded",
+]
+
 
 def download_models_from_supabase() -> bool:
     """
@@ -209,6 +223,10 @@ def download_models_from_supabase() -> bool:
             models_dir / "btts_model_v1.joblib",
         ),
         (
+            "over25_model_v1.joblib",
+            models_dir / "over25_model_v1.joblib",
+        ),
+        (
             "league_encoder.joblib",
             BACKEND_DIR / "data" / "league_encoder.joblib",
         ),
@@ -244,7 +262,7 @@ def load_artifacts() -> None:
     a warning but never crash the import or the API.
     """
     global _result_model, _home_goals, _away_goals
-    global _home_corners, _away_corners, _btts_model
+    global _home_corners, _away_corners, _btts_model, _over25_model
     global _le_league, _le_season, _features_df
 
     models_dir = BACKEND_DIR / "models"
@@ -257,6 +275,7 @@ def load_artifacts() -> None:
         "_home_corners":  models_dir / "home_corners_v1.joblib",
         "_away_corners":  models_dir / "away_corners_v1.joblib",
         "_btts_model":    models_dir / "btts_model_v1.joblib",
+        "_over25_model":  models_dir / "over25_model_v1.joblib",
         "_le_league":     data_dir   / "league_encoder.joblib",
         "_le_season":     data_dir   / "season_encoder.joblib",
     }
@@ -673,6 +692,110 @@ def _get_btts_probability(
         return None
 
 
+def _build_over25_feature_vector(
+    home_team: str,
+    away_team: str,
+    league_encoded: int,
+    df: pd.DataFrame,
+) -> dict[str, float] | None:
+    """Build the 18-feature vector expected by the Over 2.5 classifier.
+
+    Returns None when the required columns are not present or
+    when no history exists for the teams.
+    """
+    if df is None or df.empty:
+        return None
+    # Check all 18 columns exist in the CSV
+    missing = [c for c in OVER25_FEATURE_COLS if c not in df.columns and c != "league_encoded"]
+    # league_encoded is supplied, but also may exist in CSV; ignore it from missing check
+    if missing:
+        # If any Over-2.5-specific rolling columns are missing, cannot build
+        # but allow partial if only some FBref columns missing – fill with 0
+        # We only fail if the 4 new rate cols are missing
+        over25_new = ["home_over25_rate_5", "away_over25_rate_5",
+                      "home_high_scoring_rate_5", "away_high_scoring_rate_5"]
+        if any(c in missing for c in over25_new):
+            print(f"[predict] WARNING: Over 2.5 features missing in CSV: {missing}")
+            return None
+    # Most recent rows per role
+    try:
+        home_rows = df[df["home_team"] == home_team]
+        away_rows = df[df["away_team"] == away_team]
+        if home_rows.empty and away_rows.empty:
+            return None
+        home_latest = home_rows.iloc[-1] if not home_rows.empty else None
+        away_latest = away_rows.iloc[-1] if not away_rows.empty else None
+    except Exception as exc:
+        print(f"[predict] WARNING: could not get Over 2.5 team rows: {exc}")
+        return None
+
+    vector: dict[str, float] = {}
+    for col in OVER25_FEATURE_COLS:
+        if col == "league_encoded":
+            vector[col] = float(league_encoded)
+        elif col == "elo_difference":
+            # Derived: always the home perspective Elo gap, never a raw column
+            vector[col] = (
+                vector.get("home_elo", 0.0) - vector.get("away_elo", 0.0)
+            )
+        elif col.startswith("home_"):
+            if home_latest is not None and col in home_latest.index:
+                try:
+                    vector[col] = float(home_latest.get(col, 0.0) or 0.0)
+                except Exception:
+                    vector[col] = 0.0
+            else:
+                vector[col] = 0.0
+        elif col.startswith("away_"):
+            if away_latest is not None and col in away_latest.index:
+                try:
+                    vector[col] = float(away_latest.get(col, 0.0) or 0.0)
+                except Exception:
+                    vector[col] = 0.0
+            else:
+                vector[col] = 0.0
+        else:
+            vector[col] = 0.0
+    return vector
+
+
+def _get_over25_probability(
+    home_team: str,
+    away_team: str,
+    league_encoded: int,
+    df: pd.DataFrame,
+) -> float | None:
+    """Return Over 2.5 probability from the dedicated classifier, or None."""
+    global _over25_model
+    if _over25_model is None:
+        return None
+    # Quick check: are the 4 new Over 2.5 rate cols present?
+    if df is None or df.empty:
+        return None
+    required_new = ["home_over25_rate_5", "away_over25_rate_5",
+                    "home_high_scoring_rate_5", "away_high_scoring_rate_5"]
+    if any(c not in df.columns for c in required_new):
+        return None
+    vector = _build_over25_feature_vector(home_team, away_team, league_encoded, df)
+    if vector is None:
+        return None
+    # Ensure all expected columns are filled
+    for c in OVER25_FEATURE_COLS:
+        if c not in vector:
+            vector[c] = 0.0
+    try:
+        X = pd.DataFrame([vector])[OVER25_FEATURE_COLS]
+        proba = _over25_model.predict_proba(X)
+        # proba shape (1, 2) for binary
+        if proba.shape[1] >= 2:
+            return float(proba[0][1])
+        else:
+            return float(proba[0][0])
+    except Exception as exc:
+        print(f"[predict] WARNING: Over 2.5 inference failed: {exc}")
+        return None
+
+
 @router.get("/leagues")
 def get_leagues() -> dict:
     """Return all known leagues from the league encoder."""
@@ -737,6 +860,20 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
                                 print(f"[predict] BTTS overridden by classifier: {btts_prob:.4f}")
                     except Exception as exc:
                         print(f"[predict] WARNING: BTTS override failed (formula path): {exc}")
+                # Override Over 2.5 with dedicated classifier when available
+                if _over25_model is not None and _features_df is not None:
+                    try:
+                        league_enc_for_over25 = _encode_label(_le_league, req.league)
+                        over25_prob = _get_over25_probability(
+                            req.home_team, req.away_team, league_enc_for_over25, _features_df
+                        )
+                        if over25_prob is not None:
+                            # Replace only the over_2_5 field, keep everything else
+                            if "goals" in formula_result and isinstance(formula_result["goals"], dict):
+                                formula_result["goals"]["over_2_5"] = round(float(over25_prob), 4)
+                                print(f"[predict] Over 2.5 overridden by classifier: {over25_prob:.4f}")
+                    except Exception as exc:
+                        print(f"[predict] WARNING: Over 2.5 override failed (formula path): {exc}")
                 return formula_result
             else:
                 print("[predict] Formula engine "
@@ -814,6 +951,13 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         exp_home_goals + exp_away_goals, 1.5)
     over_2_5 = _poisson_over(
         exp_home_goals + exp_away_goals, 2.5)
+    # Override with dedicated Over 2.5 classifier when available
+    over25_classifier_prob = _get_over25_probability(
+        req.home_team, req.away_team, league_enc, _features_df
+    )
+    if over25_classifier_prob is not None:
+        over_2_5 = round(float(over25_classifier_prob), 4)
+        print(f"[predict] Over 2.5 overridden by classifier (ML path): {over_2_5:.4f}")
     over_3_5 = _poisson_over(
         exp_home_goals + exp_away_goals, 3.5)
     btts = _poisson_btts(exp_home_goals, exp_away_goals)
@@ -1114,6 +1258,7 @@ def pipeline_status() -> dict:
         "home_corners":  _home_corners  is not None,
         "away_corners":  _away_corners  is not None,
         "btts_model":    _btts_model    is not None,
+        "over25_model":  _over25_model  is not None,
         "le_league":     _le_league     is not None,
         "le_season":     _le_season     is not None,
         "features_df":   _features_df   is not None,

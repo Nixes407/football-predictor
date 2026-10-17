@@ -131,6 +131,21 @@ BTTS_FEATURE_COLS = [
 
 TARGET_BTTS_COL = "target_btts"
 
+OVER25_FEATURE_COLS = [
+    "home_over25_rate_5", "away_over25_rate_5",
+    "home_high_scoring_rate_5", "away_high_scoring_rate_5",
+    "home_form_gf_5", "away_form_gf_5",
+    "home_form_ga_5", "away_form_ga_5",
+    "home_form_gf_10", "away_form_gf_10",
+    "home_fbref_goals_against", "away_fbref_goals_against",
+    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
+    "home_elo", "away_elo",
+    "elo_difference",
+    "league_encoded",
+]
+
+TARGET_OVER25_COL = "target_over25"
+
 
 # --------------------------------------------------------------------------- #
 # Part A — Feature loading
@@ -740,6 +755,125 @@ def train_btts_model(
     return results
 
 
+def train_over25_model(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    model_dir: str = "models",
+) -> dict:
+    """
+    Train and evaluate the dedicated Over 2.5 binary classifier.
+
+    Uses OVER25_FEATURE_COLS (4 new rolling rates + selected existing
+    features) and target_over25. Same 65/15/20 chronological split.
+    Pipeline: SimpleImputer(median) -> StandardScaler -> LogisticRegression.
+    Saves to {model_dir}/over25_model_v1.joblib
+    """
+    print("=" * 70)
+    print("[trainer] OVER2.5 MODEL — extracting features and targets")
+    print("=" * 70)
+    target_col = TARGET_OVER25_COL
+
+    def _extract_over25_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+        if df is None or len(df) == 0:
+            return pd.DataFrame(columns=OVER25_FEATURE_COLS), pd.Series(dtype=float)
+        missing = [c for c in OVER25_FEATURE_COLS if c not in df.columns]
+        if missing:
+            print(f"[trainer] WARNING: missing Over 2.5 feature columns: {missing}")
+        usable = [c for c in OVER25_FEATURE_COLS if c in df.columns]
+        if target_col not in df.columns:
+            print(f"[trainer] WARNING: target '{target_col}' not found")
+            return df[usable].copy(), pd.Series(dtype=float)
+        y_raw = pd.to_numeric(df[target_col], errors="coerce")
+        mask = y_raw.notna()
+        dropped = int((~mask).sum())
+        if dropped:
+            print(f"[trainer] Dropped {dropped} rows with a null {target_col}")
+        X = df.loc[mask, usable].copy()
+        y = y_raw[mask].astype(int)
+        return X, y
+
+    def _evaluate_over25(pipeline: Pipeline, X: pd.DataFrame, y: pd.Series, split_name: str) -> dict:
+        if len(X) == 0 or len(y) == 0:
+            print(f"[trainer] {split_name}: no rows to evaluate")
+            return {}
+        y_pred = pipeline.predict(X)
+        try:
+            y_proba = pipeline.predict_proba(X)[:, 1]
+        except Exception:
+            y_proba = y_pred.astype(float)
+        acc = float(accuracy_score(y, y_pred))
+        bal_acc = float(balanced_accuracy_score(y, y_pred))
+        f1 = float(f1_score(y, y_pred, average="binary", zero_division=0))
+        try:
+            auc = float(roc_auc_score(y, y_proba))
+        except Exception:
+            auc = float("nan")
+        print(f"[trainer] --- {split_name} metrics ({len(X)} rows) ---")
+        print(f"[trainer]   Accuracy          : {acc:.4f}")
+        print(f"[trainer]   Balanced accuracy : {bal_acc:.4f}")
+        print(f"[trainer]   F1 (binary)       : {f1:.4f}")
+        print(f"[trainer]   AUC-ROC           : {auc:.4f}")
+        return {
+            "rows": int(len(X)),
+            "accuracy": acc,
+            "balanced_accuracy": bal_acc,
+            "f1": f1,
+            "auc_roc": auc,
+        }
+
+    X_train, y_train = _extract_over25_xy(train_df)
+    X_val, y_val = _extract_over25_xy(val_df)
+    X_test, y_test = _extract_over25_xy(test_df)
+    print(f"[trainer] Over 2.5 sizes -> train={len(X_train)} val={len(X_val)} test={len(X_test)}")
+    if len(X_train) == 0:
+        print("[trainer] ERROR: no Over 2.5 training rows, aborting")
+        return {}
+
+    print("[trainer] Fitting Over 2.5 pipeline on TRAIN...")
+    pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("model", LogisticRegression(solver="lbfgs", class_weight="balanced", max_iter=1000, random_state=42)),
+    ])
+    pipeline.fit(X_train, y_train)
+
+    print("[trainer] Evaluating Over 2.5 on VALIDATION...")
+    val_metrics = _evaluate_over25(pipeline, X_val, y_val, "VALIDATION")
+
+    print("[trainer] Refitting Over 2.5 on TRAIN + VALIDATION...")
+    X_tv = pd.concat([X_train, X_val], axis=0)
+    y_tv = pd.concat([y_train, y_val], axis=0)
+    final_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("model", LogisticRegression(solver="lbfgs", class_weight="balanced", max_iter=1000, random_state=42)),
+    ])
+    final_pipeline.fit(X_tv, y_tv)
+
+    print("[trainer] Evaluating Over 2.5 ONCE on TEST...")
+    test_metrics = _evaluate_over25(final_pipeline, X_test, y_test, "TEST")
+
+    model_path = Path(model_dir) / "over25_model_v1.joblib"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(final_pipeline, model_path)
+    print(f"[trainer] Saved Over 2.5 pipeline -> {model_path}")
+
+    results = {
+        **test_metrics,
+        "val_accuracy": val_metrics.get("accuracy"),
+        "val_balanced_accuracy": val_metrics.get("balanced_accuracy"),
+        "val_f1": val_metrics.get("f1"),
+        "val_auc_roc": val_metrics.get("auc_roc"),
+        "model_path": str(model_path),
+        "n_features": len(OVER25_FEATURE_COLS),
+        "n_train": int(len(X_train)),
+        "n_val": int(len(X_val)),
+        "n_test": int(len(X_test)),
+    }
+    return results
+
+
 def upload_models_to_supabase(model_dir: str = "models") -> None:
     """
     Push the five saved .joblib artifacts to the "models"
@@ -771,6 +905,7 @@ def upload_models_to_supabase(model_dir: str = "models") -> None:
         (Path(model_dir) / "home_corners_v1.joblib", "home_corners_v1.joblib"),
         (Path(model_dir) / "away_corners_v1.joblib", "away_corners_v1.joblib"),
         (Path(model_dir) / "btts_model_v1.joblib", "btts_model_v1.joblib"),
+        (Path(model_dir) / "over25_model_v1.joblib", "over25_model_v1.joblib"),
         (
             BACKEND_DIR / "data" / "league_encoder.joblib",
             "league_encoder.joblib",
@@ -820,6 +955,7 @@ def train_all_models(
       4. Home corners Poisson
       5. Away corners Poisson
       6. BTTS binary classifier
+      7. Over 2.5 binary classifier
 
     Returns a summary dict of all model results.
     Validation controls all choices.
@@ -864,6 +1000,9 @@ def train_all_models(
 
     print("\n--- BTTS MODEL ---")
     results["btts"] = train_btts_model(train_df, val_df, test_df, model_dir)
+
+    print("\n--- OVER 2.5 MODEL ---")
+    results["over25"] = train_over25_model(train_df, val_df, test_df, model_dir)
 
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE — SUMMARY")
