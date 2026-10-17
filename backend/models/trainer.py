@@ -31,10 +31,12 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from supabase import create_client
+from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 
 
 # --------------------------------------------------------------------------- #
@@ -517,6 +519,258 @@ def train_result_model(
         "n_test": int(len(X_test)),
     }
     return results
+
+
+def _evaluate_1x2_metrics(
+    y_true_str: pd.Series | np.ndarray,
+    y_pred_str: np.ndarray,
+    proba: np.ndarray,
+    classes: list[str],
+) -> dict:
+    """Compute accuracy, balanced accuracy, macro F1, AUC, log loss, and per-class recall."""
+    if len(y_true_str) == 0:
+        return {}
+
+    acc = float(accuracy_score(y_true_str, y_pred_str))
+    bal_acc = float(balanced_accuracy_score(y_true_str, y_pred_str))
+    macro_f1 = float(f1_score(y_true_str, y_pred_str, average="macro", zero_division=0))
+
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    y_true_int = np.array([class_to_idx[c] for c in y_true_str])
+
+    try:
+        auc = float(
+            roc_auc_score(
+                y_true_int,
+                proba,
+                multi_class="ovr",
+                average="macro",
+                labels=list(range(len(classes))),
+            )
+        )
+    except Exception:
+        auc = float("nan")
+
+    try:
+        loss = float(log_loss(y_true_int, proba, labels=list(range(len(classes)))))
+    except Exception:
+        loss = float("nan")
+
+    recalls = _per_class_recall(y_true_str, y_pred_str, ["H", "D", "A"])
+
+    return {
+        "accuracy": acc,
+        "balanced_accuracy": bal_acc,
+        "macro_f1": macro_f1,
+        "auc_macro_ovr": auc,
+        "log_loss": loss,
+        "recall_H": float(recalls.get("H", 0.0)),
+        "recall_D": float(recalls.get("D", 0.0)),
+        "recall_A": float(recalls.get("A", 0.0)),
+    }
+
+
+def _build_xgb_result_pipeline() -> Pipeline:
+    """
+    Build the XGBoost 1X2 classifier pipeline:
+    SimpleImputer(median) -> XGBClassifier.
+    XGBoost handles feature scaling internally; StandardScaler is omitted.
+    """
+    params = dict(
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        use_label_encoder=False,
+        eval_metric="mlogloss",
+        random_state=42,
+        n_jobs=-1,
+    )
+    return Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("model", XGBClassifier(**params)),
+        ]
+    )
+
+
+def train_xgb_result_model(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    model_dir: str = "models",
+) -> dict:
+    """
+    Train and evaluate the XGBoost 1X2 match result classifier, and compare
+    side-by-side against the logistic regression model on the identical test split.
+    """
+    print("=" * 70)
+    print("[trainer] XGBOOST 1X2 MODEL — STEP 1/6: extracting features and targets")
+    print("=" * 70)
+    X_train, y_train = _extract_xy(train_df)
+    X_val, y_val = _extract_xy(val_df)
+    X_test, y_test = _extract_xy(test_df)
+    print(
+        f"[trainer] train={len(X_train)}  val={len(X_val)}  test={len(X_test)} "
+        f"| {len(FEATURE_COLS)} feature columns"
+    )
+
+    if len(X_train) == 0:
+        print("[trainer] ERROR: no training rows available for XGBoost, aborting")
+        return {}
+
+    # Label encode target_result strings ("H", "D", "A") to integers 0, 1, 2
+    le = LabelEncoder()
+    unique_targets = sorted(list(set(y_train) | set(y_val) | set(y_test) | {"A", "D", "H"}))
+    le.fit(unique_targets)
+    classes = list(le.classes_)
+    print(f"[trainer] Label encoder classes: {classes}")
+
+    y_train_enc = le.transform(y_train)
+    y_val_enc = le.transform(y_val)
+    y_test_enc = le.transform(y_test)
+
+    print("=" * 70)
+    print("[trainer] XGBOOST 1X2 MODEL — STEP 2/6: fitting pipeline on TRAIN")
+    print("=" * 70)
+    pipeline = _build_xgb_result_pipeline()
+    pipeline.fit(X_train, y_train_enc)
+    print(f"[trainer] Fitted XGBoost on {len(X_train)} rows")
+
+    print("=" * 70)
+    print("[trainer] XGBOOST 1X2 MODEL — STEP 3/6: validating")
+    print("=" * 70)
+    val_pred_enc = pipeline.predict(X_val)
+    val_pred_str = le.inverse_transform(val_pred_enc)
+    val_proba = pipeline.predict_proba(X_val)
+    val_metrics = _evaluate_1x2_metrics(y_val, val_pred_str, val_proba, classes)
+    print(f"[trainer] --- VALIDATION metrics ({len(X_val)} rows) ---")
+    print(f"[trainer]   Accuracy          : {val_metrics['accuracy']:.4f}")
+    print(f"[trainer]   Balanced accuracy : {val_metrics['balanced_accuracy']:.4f}")
+    print(f"[trainer]   Macro F1          : {val_metrics['macro_f1']:.4f}")
+    print(f"[trainer]   AUC (macro OvR)   : {val_metrics['auc_macro_ovr']:.4f}")
+    print(f"[trainer]   Log loss          : {val_metrics['log_loss']:.4f}")
+
+    print("=" * 70)
+    print("[trainer] XGBOOST 1X2 MODEL — STEP 4/6: refitting on TRAIN + VALIDATION")
+    print("=" * 70)
+    X_trainval = pd.concat([X_train, X_val], axis=0)
+    y_trainval_enc = np.concatenate([y_train_enc, y_val_enc])
+    y_trainval = pd.concat([y_train, y_val], axis=0)
+    final_xgb_pipeline = _build_xgb_result_pipeline()
+    final_xgb_pipeline.fit(X_trainval, y_trainval_enc)
+    print(f"[trainer] Refitted XGBoost on {len(X_trainval)} rows")
+
+    print("=" * 70)
+    print("[trainer] XGBOOST 1X2 MODEL — STEP 5/6: evaluating ONCE on TEST")
+    print("=" * 70)
+    xgb_test_pred_enc = final_xgb_pipeline.predict(X_test)
+    xgb_test_pred_str = le.inverse_transform(xgb_test_pred_enc)
+    xgb_test_proba = final_xgb_pipeline.predict_proba(X_test)
+    xgb_metrics = _evaluate_1x2_metrics(y_test, xgb_test_pred_str, xgb_test_proba, classes)
+
+    # Re-evaluate logistic regression model on the identical test split
+    logistic_path = Path(model_dir) / "result_model_v1.joblib"
+    if logistic_path.exists():
+        try:
+            logistic_pipeline = joblib.load(logistic_path)
+        except Exception as exc:
+            print(f"[trainer] WARNING: could not load {logistic_path}: {exc}, refitting logistic")
+            logistic_pipeline = _build_result_pipeline()
+            logistic_pipeline.fit(X_trainval, y_trainval)
+    else:
+        logistic_pipeline = _build_result_pipeline()
+        logistic_pipeline.fit(X_trainval, y_trainval)
+
+    log_pred_str = logistic_pipeline.predict(X_test)
+    raw_log_proba = logistic_pipeline.predict_proba(X_test)
+    pipe_classes = list(logistic_pipeline.classes_)
+    log_proba = np.zeros((len(X_test), len(classes)), dtype=float)
+    for idx, cls_name in enumerate(classes):
+        if cls_name in pipe_classes:
+            col_idx = pipe_classes.index(cls_name)
+            log_proba[:, idx] = raw_log_proba[:, col_idx]
+
+    logistic_metrics = _evaluate_1x2_metrics(y_test, log_pred_str, log_proba, classes)
+
+    # Side-by-side metric comparison logging
+    print("\n" + "=" * 70)
+    print("1X2 MODEL COMPARISON: LOGISTIC REGRESSION vs XGBOOST (TEST SET)")
+    print("=" * 70)
+    print(f"| {'Metric':<17} | {'Logistic':<10} | {'XGBoost':<10} |")
+    print(f"|{'-' * 19}|{'-' * 12}|{'-' * 12}|")
+    table_rows = [
+        ("Accuracy", f"{logistic_metrics['accuracy']:.4f}", f"{xgb_metrics['accuracy']:.4f}"),
+        ("Balanced Acc", f"{logistic_metrics['balanced_accuracy']:.4f}", f"{xgb_metrics['balanced_accuracy']:.4f}"),
+        ("Macro F1", f"{logistic_metrics['macro_f1']:.4f}", f"{xgb_metrics['macro_f1']:.4f}"),
+        ("AUC (macro OvR)", f"{logistic_metrics['auc_macro_ovr']:.4f}", f"{xgb_metrics['auc_macro_ovr']:.4f}"),
+        ("Log Loss", f"{logistic_metrics['log_loss']:.4f}", f"{xgb_metrics['log_loss']:.4f}"),
+        ("Recall H", f"{logistic_metrics['recall_H']:.4f}", f"{xgb_metrics['recall_H']:.4f}"),
+        ("Recall D", f"{logistic_metrics['recall_D']:.4f}", f"{xgb_metrics['recall_D']:.4f}"),
+        ("Recall A", f"{logistic_metrics['recall_A']:.4f}", f"{xgb_metrics['recall_A']:.4f}"),
+    ]
+    for m, l, x in table_rows:
+        print(f"| {m:<17} | {l:<10} | {x:<10} |")
+    print("=" * 70)
+
+    # Compare AUC and F1 to identify the superior model
+    xgb_auc = xgb_metrics.get("auc_macro_ovr", 0.0)
+    log_auc = logistic_metrics.get("auc_macro_ovr", 0.0)
+    xgb_f1 = xgb_metrics.get("macro_f1", 0.0)
+    log_f1 = logistic_metrics.get("macro_f1", 0.0)
+
+    if (xgb_auc >= log_auc and xgb_f1 >= log_f1) and (xgb_auc > log_auc or xgb_f1 > log_f1):
+        winner = "XGBoost (higher AUC and Macro F1)"
+    elif xgb_auc > log_auc and xgb_f1 < log_f1:
+        winner = "XGBoost on AUC, Logistic on Macro F1 (XGBoost selected for calibration/ranking)"
+    elif xgb_auc < log_auc and xgb_f1 > log_f1:
+        winner = "Logistic on AUC, XGBoost on Macro F1"
+    elif xgb_auc > log_auc:
+        winner = "XGBoost (higher AUC)"
+    elif xgb_f1 > log_f1:
+        winner = "XGBoost (higher Macro F1)"
+    else:
+        winner = "Logistic Regression"
+    print(f"[trainer] Performance summary: {winner}")
+
+    print("=" * 70)
+    print("[trainer] XGBOOST 1X2 MODEL — STEP 6/6: saving artifacts")
+    print("=" * 70)
+    model_path = Path(model_dir) / "result_model_xgb_v1.joblib"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(final_xgb_pipeline, model_path)
+    print(f"[trainer] Saved XGBoost pipeline -> {model_path}")
+
+    encoder_path = Path(model_dir) / "result_model_xgb_v1_label_encoder.joblib"
+    encoder_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(le, encoder_path)
+    print(f"[trainer] Saved label encoder -> {encoder_path}")
+
+    return {
+        "rows": int(len(X_test)),
+        "accuracy": float(xgb_metrics["accuracy"]),
+        "balanced_accuracy": float(xgb_metrics["balanced_accuracy"]),
+        "macro_f1": float(xgb_metrics["macro_f1"]),
+        "auc_macro_ovr": float(xgb_metrics["auc_macro_ovr"]),
+        "log_loss": float(xgb_metrics["log_loss"]),
+        "recall_H": float(xgb_metrics["recall_H"]),
+        "recall_D": float(xgb_metrics["recall_D"]),
+        "recall_A": float(xgb_metrics["recall_A"]),
+        "val_accuracy": val_metrics.get("accuracy"),
+        "val_balanced_accuracy": val_metrics.get("balanced_accuracy"),
+        "val_macro_f1": val_metrics.get("macro_f1"),
+        "val_auc_macro_ovr": val_metrics.get("auc_macro_ovr"),
+        "val_log_loss": val_metrics.get("log_loss"),
+        "logistic_test_metrics": logistic_metrics,
+        "winner": winner,
+        "model_path": str(model_path),
+        "encoder_path": str(encoder_path),
+        "n_features": len(FEATURE_COLS),
+        "n_train": int(len(X_train)),
+        "n_val": int(len(X_val)),
+        "n_test": int(len(X_test)),
+    }
 
 
 def train_count_model(
@@ -1042,6 +1296,14 @@ def upload_models_to_supabase(model_dir: str = "models") -> None:
     # (local path, path inside the "models" bucket)
     model_files = [
         (Path(model_dir) / "result_model_v1.joblib", "result_model_v1.joblib"),
+        (
+            Path(model_dir) / "result_model_xgb_v1.joblib",
+            "result_model_xgb_v1.joblib",
+        ),
+        (
+            Path(model_dir) / "result_model_xgb_v1_label_encoder.joblib",
+            "result_model_xgb_v1_label_encoder.joblib",
+        ),
         (Path(model_dir) / "home_goals_v1.joblib", "home_goals_v1.joblib"),
         (Path(model_dir) / "away_goals_v1.joblib", "away_goals_v1.joblib"),
         (Path(model_dir) / "home_corners_v1.joblib", "home_corners_v1.joblib"),
@@ -1128,8 +1390,12 @@ def train_all_models(
 
     results = {}
 
-    print("\n--- 1X2 RESULT MODEL ---")
+    print("\n--- 1X2 RESULT MODEL (LOGISTIC) ---")
     results["result"] = train_result_model(
+        train_df, val_df, test_df, model_dir)
+
+    print("\n--- 1X2 RESULT MODEL (XGBOOST) ---")
+    results["result_xgb"] = train_xgb_result_model(
         train_df, val_df, test_df, model_dir)
 
     count_targets = [
