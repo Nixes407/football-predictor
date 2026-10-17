@@ -35,6 +35,7 @@ from database import DailyMatch, SessionLocal, TeamSeasonStats
 from routers.predict import (
     _away_corners,
     _away_goals,
+    _blend_predictions,
     _build_feature_vector,
     _encode_label,
     _features_df,
@@ -1008,6 +1009,28 @@ def _find_fotmob_name(
     return name
 
 
+def _fixture_values_to_nested(values: dict) -> dict:
+    """Convert flat pred_* fixture values into the nested shape expected by _blend_predictions."""
+    return {
+        "result": {
+            "home_win": values["pred_home_win"],
+            "draw": values["pred_draw"],
+            "away_win": values["pred_away_win"],
+        },
+        "goals": {
+            "expected_home": values["pred_home_goals"],
+            "expected_away": values["pred_away_goals"],
+            "over_2_5": values.get("pred_over_2_5"),
+            "btts": values.get("pred_btts"),
+        },
+        "corners": {
+            "expected_home": values["pred_home_corners"],
+            "expected_away": values["pred_away_corners"],
+            "over_9_5": values.get("pred_corners_over_9_5"),
+        },
+    }
+
+
 def _predict_fixture_values(
     home_team: str,
     away_team: str,
@@ -1021,8 +1044,8 @@ def _predict_fixture_values(
     A UCL fixture also gets each club resolved in its own domestic league:
     the home one is the baseline the engine predicts from, the away one is
     where the away club's own stats, squad and key players are read from.
-    ML is only a fallback when both teams occur in the training history;
-    otherwise return no prediction rather than a default-valued forecast.
+    When both formula and ML predictions are available, blends them with
+    _blend_predictions; otherwise returns whichever engine succeeded.
     """
     # Preserve the tournament before replacing it with each team's
     # domestic league for team-name resolution and domestic stats.
@@ -1053,9 +1076,8 @@ def _predict_fixture_values(
         formula_result = _predict_with_formula(
             home_team, away_team, league, season
         )
-    if formula_result:
-        return formula_result
 
+    ml_result = None
     # Use current predictor state: model artifacts may load after this module.
     features_df = _current_predictor_value("_features_df", _features_df)
     if (
@@ -1072,15 +1094,46 @@ def _predict_fixture_values(
             | (features_df["away_team"] == away_team)
         ).any())
         if home_known and away_known:
-            print(f"[fixtures] ML fallback: {home_team} vs {away_team}")
             try:
-                return _compute_prediction_values(
+                ml_result = _compute_prediction_values(
                     home_team, away_team, league, season or DEFAULT_SEASON
                 )
             except Exception as exc:
                 print(f"[fixtures] WARNING: prediction failed for "
                       f"{home_team} vs {away_team}: {exc}")
                 traceback.print_exc()
+
+    if formula_result and ml_result:
+        try:
+            blended = _blend_predictions(
+                _fixture_values_to_nested(formula_result),
+                _fixture_values_to_nested(ml_result),
+            )
+            blended_values = {
+                "pred_home_win": blended["result"]["home_win"],
+                "pred_draw": blended["result"]["draw"],
+                "pred_away_win": blended["result"]["away_win"],
+                "pred_home_goals": blended["goals"]["expected_home"],
+                "pred_away_goals": blended["goals"]["expected_away"],
+                "pred_home_corners": blended["corners"]["expected_home"],
+                "pred_away_corners": blended["corners"]["expected_away"],
+                "pred_over_2_5": blended["goals"]["over_2_5"],
+                "pred_btts": blended["goals"]["btts"],
+                "pred_corners_over_9_5": blended["corners"]["over_9_5"],
+            }
+            print(f"[fixtures] Blended formula + ML: {home_team} vs {away_team}")
+            return _with_derived_markets(blended_values)
+        except Exception as exc:
+            print(f"[fixtures] WARNING: blend failed for "
+                  f"{home_team} vs {away_team}: {exc} — using formula")
+            return formula_result
+
+    if formula_result:
+        return formula_result
+
+    if ml_result:
+        print(f"[fixtures] ML fallback: {home_team} vs {away_team}")
+        return ml_result
 
     print(f"[fixtures] No data: {home_team} vs {away_team}")
     return {}

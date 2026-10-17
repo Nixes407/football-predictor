@@ -12,6 +12,7 @@ pipeline has been run.
 
 from __future__ import annotations
 
+import copy
 import os
 import warnings
 from pathlib import Path
@@ -183,6 +184,16 @@ OVER95_CORNERS_FEATURE_COLS = [
     "home_elo", "away_elo",
     "league_encoded",
 ]
+
+# ── Blend weights: formula_v1 vs ML ──────────────────────────────────────────
+BLEND_FORMULA_1X2   = 0.60   # formula weight for home/draw/away win probs
+BLEND_ML_1X2        = 0.40   # ML weight for home/draw/away win probs
+BLEND_FORMULA_GOALS = 0.70   # formula weight for expected home/away goals
+BLEND_ML_GOALS      = 0.30   # ML weight for expected home/away goals
+BLEND_FORMULA_CRNRS = 0.70   # formula weight for expected home/away corners
+BLEND_ML_CRNRS      = 0.30   # ML weight for expected home/away corners
+# Specialized classifiers (BTTS, Over 2.5, Over 9.5) always use 100% classifier
+# regardless of formula availability — those overrides live in PRs #72/#73/#74
 
 
 def download_models_from_supabase() -> bool:
@@ -975,13 +986,76 @@ def get_teams(league: str = "") -> dict:
     return {"teams": all_teams}
 
 
+def _blend_predictions(
+    formula_result: dict[str, Any],
+    ml_result: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Blend formula_v1 and ML prediction outputs using weighted averaging
+    per market, using formula_result as the base for all other fields,
+    and re-derive Poisson-based markets from blended expected goals/corners.
+    """
+    blended = copy.deepcopy(formula_result)
+    blended["result"] = dict(formula_result.get("result") or {})
+    blended["goals"] = dict(formula_result.get("goals") or {})
+    blended["corners"] = dict(formula_result.get("corners") or {})
+
+    blended["result"]["home_win"] = round(
+        formula_result["result"]["home_win"] * BLEND_FORMULA_1X2 +
+        ml_result["result"]["home_win"] * BLEND_ML_1X2, 4)
+    blended["result"]["draw"] = round(
+        formula_result["result"]["draw"] * BLEND_FORMULA_1X2 +
+        ml_result["result"]["draw"] * BLEND_ML_1X2, 4)
+    blended["result"]["away_win"] = round(
+        formula_result["result"]["away_win"] * BLEND_FORMULA_1X2 +
+        ml_result["result"]["away_win"] * BLEND_ML_1X2, 4)
+
+    blended["goals"]["expected_home"] = round(
+        formula_result["goals"]["expected_home"] * BLEND_FORMULA_GOALS +
+        ml_result["goals"]["expected_home"] * BLEND_ML_GOALS, 4)
+    blended["goals"]["expected_away"] = round(
+        formula_result["goals"]["expected_away"] * BLEND_FORMULA_GOALS +
+        ml_result["goals"]["expected_away"] * BLEND_ML_GOALS, 4)
+
+    blended["corners"]["expected_home"] = round(
+        formula_result["corners"]["expected_home"] * BLEND_FORMULA_CRNRS +
+        ml_result["corners"]["expected_home"] * BLEND_ML_CRNRS, 4)
+    blended["corners"]["expected_away"] = round(
+        formula_result["corners"]["expected_away"] * BLEND_FORMULA_CRNRS +
+        ml_result["corners"]["expected_away"] * BLEND_ML_CRNRS, 4)
+
+    # Re-derive Poisson-based markets from blended expected goals/corners
+    exp_home_goals = blended["goals"]["expected_home"]
+    exp_away_goals = blended["goals"]["expected_away"]
+    exp_total_goals = exp_home_goals + exp_away_goals
+
+    blended["goals"]["over_1_5"] = round(_poisson_over(exp_total_goals, 1.5), 4)
+    blended["goals"]["over_2_5"] = round(_poisson_over(exp_total_goals, 2.5), 4)
+    blended["goals"]["over_3_5"] = round(_poisson_over(exp_total_goals, 3.5), 4)
+    blended["goals"]["btts"] = round(_poisson_btts(exp_home_goals, exp_away_goals), 4)
+
+    exp_home_corners = blended["corners"]["expected_home"]
+    exp_away_corners = blended["corners"]["expected_away"]
+    exp_total_corners = round(exp_home_corners + exp_away_corners, 4)
+
+    blended["corners"]["expected_total"] = exp_total_corners
+    blended["corners"]["over_8_5"] = round(_poisson_over(exp_total_corners, 8.5), 4)
+    blended["corners"]["over_9_5"] = round(_poisson_over(exp_total_corners, 9.5), 4)
+    blended["corners"]["over_10_5"] = round(_poisson_over(exp_total_corners, 10.5), 4)
+    blended["corners"]["over_11_5"] = round(_poisson_over(exp_total_corners, 11.5), 4)
+
+    blended["prediction_method"] = "blended"
+    return blended
+
+
 @router.post("/match")
 def predict_match(req: MatchRequest) -> dict[str, Any]:
     """
     Run all prediction models for a given fixture
     and return full market probabilities.
     """
-    # Try formula engine first
+    # 1. Try formula_v1 -> store result as formula_result (or None if unavailable/error)
+    formula_result = None
     if _formula_engine_available and formula_predict:
         try:
             formula_result = formula_predict(
@@ -994,57 +1068,15 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
                 print(f"[predict] Formula engine: "
                       f"{req.home_team} vs "
                       f"{req.away_team}")
-                # Override BTTS with dedicated classifier when available
-                if _btts_model is not None and _features_df is not None:
-                    try:
-                        league_enc_for_btts = _encode_label(_le_league, req.league)
-                        btts_prob = _get_btts_probability(
-                            req.home_team, req.away_team, league_enc_for_btts, _features_df
-                        )
-                        if btts_prob is not None:
-                            # Replace only the btts field, keep everything else
-                            if "goals" in formula_result and isinstance(formula_result["goals"], dict):
-                                formula_result["goals"]["btts"] = round(float(btts_prob), 4)
-                                print(f"[predict] BTTS overridden by classifier: {btts_prob:.4f}")
-                    except Exception as exc:
-                        print(f"[predict] WARNING: BTTS override failed (formula path): {exc}")
-                # Override Over 2.5 with dedicated classifier when available
-                if _over25_model is not None and _features_df is not None:
-                    try:
-                        league_enc_for_over25 = _encode_label(_le_league, req.league)
-                        over25_prob = _get_over25_probability(
-                            req.home_team, req.away_team, league_enc_for_over25, _features_df
-                        )
-                        if over25_prob is not None:
-                            # Replace only the over_2_5 field, keep everything else
-                            if "goals" in formula_result and isinstance(formula_result["goals"], dict):
-                                formula_result["goals"]["over_2_5"] = round(float(over25_prob), 4)
-                                print(f"[predict] Over 2.5 overridden by classifier: {over25_prob:.4f}")
-                    except Exception as exc:
-                        print(f"[predict] WARNING: Over 2.5 override failed (formula path): {exc}")
-                # Override Over 9.5 corners with the dedicated classifier when available
-                if _over95_corners_model is not None and _features_df is not None:
-                    try:
-                        league_enc_for_corners = _encode_label(_le_league, req.league)
-                        corners95_prob = _get_over95_corners_probability(
-                            req.home_team, req.away_team, league_enc_for_corners, _features_df
-                        )
-                        if corners95_prob is not None:
-                            # Replace only the corners over_9_5 field, keep everything else
-                            if "corners" in formula_result and isinstance(formula_result["corners"], dict):
-                                formula_result["corners"]["over_9_5"] = round(float(corners95_prob), 4)
-                                print(f"[predict] Over 9.5 corners overridden by classifier: {corners95_prob:.4f}")
-                    except Exception as exc:
-                        print(f"[predict] WARNING: Over 9.5 corners override failed (formula path): {exc}")
-                return formula_result
             else:
                 print("[predict] Formula engine "
-                      "returned None — using ML")
+                      "returned None")
         except Exception as exc:
             print(f"[predict] Formula engine "
-                  f"error: {exc} — using ML")
+                  f"error: {exc}")
+            formula_result = None
 
-    # Check models are loaded
+    # 2. Try ML -> store result as ml_result (or None if unavailable/error)
     models_ready = all([
         _result_model is not None,
         _home_goals   is not None,
@@ -1052,133 +1084,181 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         _home_corners is not None,
         _away_corners is not None,
     ])
-    if not models_ready:
+
+    ml_result = None
+    if models_ready and _features_df is not None:
+        try:
+            # Encode league and season (unseen -> fallback 0)
+            league_enc = _encode_label(_le_league, req.league)
+            season_enc = _encode_label(_le_season, req.season)
+
+            # Build feature vector
+            runtime_cols = _get_runtime_feature_cols()
+            vector = _build_feature_vector(
+                req.home_team,
+                req.away_team,
+                league_enc,
+                season_enc,
+                _features_df,
+                runtime_cols,
+            )
+
+            # Fill any missing columns with 0
+            for col in runtime_cols:
+                if col not in vector:
+                    vector[col] = 0.0
+
+            # Convert to DataFrame with correct column order
+            X = pd.DataFrame([vector])[runtime_cols]
+
+            # 1X2 result probabilities
+            result_proba = _result_model.predict_proba(X)[0]
+            classes      = list(_result_model.classes_)
+            result_map   = dict(zip(classes, result_proba))
+
+            home_win_prob = round(float(result_map.get("H", 0.0)), 4)
+            draw_prob     = round(float(result_map.get("D", 0.0)), 4)
+            away_win_prob = round(float(result_map.get("A", 0.0)), 4)
+
+            # Expected goals
+            exp_home_goals = float(max(_home_goals.predict(X)[0], 0.0))
+            exp_away_goals = float(max(_away_goals.predict(X)[0], 0.0))
+
+            # Expected corners
+            exp_home_corners = float(max(_home_corners.predict(X)[0], 0.0))
+            exp_away_corners = float(max(_away_corners.predict(X)[0], 0.0))
+            exp_total_corners = exp_home_corners + exp_away_corners
+
+            # Derived goal markets
+            over_1_5 = _poisson_over(
+                exp_home_goals + exp_away_goals, 1.5)
+            over_2_5 = _poisson_over(
+                exp_home_goals + exp_away_goals, 2.5)
+            over_3_5 = _poisson_over(
+                exp_home_goals + exp_away_goals, 3.5)
+            btts = _poisson_btts(exp_home_goals, exp_away_goals)
+
+            # Derived corner markets
+            over_corners_8_5  = _poisson_over(exp_total_corners, 8.5)
+            over_corners_9_5  = _poisson_over(exp_total_corners, 9.5)
+            over_corners_10_5 = _poisson_over(exp_total_corners, 10.5)
+            over_corners_11_5 = _poisson_over(exp_total_corners, 11.5)
+
+            ml_result = {
+                "home_team": req.home_team,
+                "away_team": req.away_team,
+                "league":    req.league,
+                "season":    req.season,
+                "result": {
+                    "home_win": home_win_prob,
+                    "draw":     draw_prob,
+                    "away_win": away_win_prob,
+                },
+                "goals": {
+                    "expected_home": round(exp_home_goals, 3),
+                    "expected_away": round(exp_away_goals, 3),
+                    "over_1_5":      round(over_1_5, 4),
+                    "over_2_5":      round(over_2_5, 4),
+                    "over_3_5":      round(over_3_5, 4),
+                    "btts":          round(btts, 4),
+                },
+                "corners": {
+                    "expected_home":  round(exp_home_corners, 3),
+                    "expected_away":  round(exp_away_corners, 3),
+                    # The frontend reads expected_total / over_9_5 / over_11_5 and the
+                    # formula engine publishes all three; the ML path used to omit
+                    # them, which left those rows blank for every non-formula
+                    # prediction (and left no over_9_5 for fixtures.py to store).
+                    "expected_total": round(exp_total_corners, 3),
+                    "over_8_5":       round(over_corners_8_5, 4),
+                    "over_9_5":       round(over_corners_9_5, 4),
+                    "over_10_5":      round(over_corners_10_5, 4),
+                    "over_11_5":      round(over_corners_11_5, 4),
+                },
+                "feature_vector_used": {
+                    k: round(v, 4) for k, v in vector.items()
+                },
+            }
+        except Exception as exc:
+            print(f"[predict] ML prediction error: {exc}")
+            ml_result = None
+
+    # 3-6. Combine or select available engine output
+    if formula_result is not None and ml_result is not None:
+        final_result = _blend_predictions(formula_result, ml_result)
+        final_result["prediction_method"] = "blended"
+        print(f"[predict] Blended formula_v1 + ML: "
+              f"{req.home_team} vs {req.away_team}")
+    elif formula_result is not None:
+        final_result = formula_result
+        final_result["prediction_method"] = "formula_only"
+        print(f"[predict] Using formula_only: "
+              f"{req.home_team} vs {req.away_team}")
+    elif ml_result is not None:
+        final_result = ml_result
+        final_result["prediction_method"] = "ml_only"
+        print(f"[predict] Using ml_only: "
+              f"{req.home_team} vs {req.away_team}")
+    else:
+        if not models_ready:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Models not loaded. Run collector.py, "
+                    "builder.py and trainer.py first."
+                ),
+            )
+        if _features_df is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Features data not loaded.",
+            )
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Models not loaded. Run collector.py, "
-                "builder.py and trainer.py first."
-            ),
+            detail="Neither formula engine nor ML models could produce a prediction.",
         )
 
-    if _features_df is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Features data not loaded.",
-        )
+    # Specialized classifiers override their specific fields AFTER blend
+    if _btts_model is not None and _features_df is not None:
+        try:
+            league_enc_for_btts = _encode_label(_le_league, req.league)
+            btts_prob = _get_btts_probability(
+                req.home_team, req.away_team, league_enc_for_btts, _features_df
+            )
+            if btts_prob is not None:
+                if "goals" in final_result and isinstance(final_result["goals"], dict):
+                    final_result["goals"]["btts"] = round(float(btts_prob), 4)
+                    print(f"[predict] BTTS overridden by classifier: {btts_prob:.4f}")
+        except Exception as exc:
+            print(f"[predict] WARNING: BTTS override failed: {exc}")
 
-    # Encode league and season (unseen -> fallback 0)
-    league_enc = _encode_label(_le_league, req.league)
-    season_enc = _encode_label(_le_season, req.season)
+    if _over25_model is not None and _features_df is not None:
+        try:
+            league_enc_for_over25 = _encode_label(_le_league, req.league)
+            over25_prob = _get_over25_probability(
+                req.home_team, req.away_team, league_enc_for_over25, _features_df
+            )
+            if over25_prob is not None:
+                if "goals" in final_result and isinstance(final_result["goals"], dict):
+                    final_result["goals"]["over_2_5"] = round(float(over25_prob), 4)
+                    print(f"[predict] Over 2.5 overridden by classifier: {over25_prob:.4f}")
+        except Exception as exc:
+            print(f"[predict] WARNING: Over 2.5 override failed: {exc}")
 
-    # Build feature vector
-    runtime_cols = _get_runtime_feature_cols()
-    vector = _build_feature_vector(
-        req.home_team,
-        req.away_team,
-        league_enc,
-        season_enc,
-        _features_df,
-        runtime_cols,
-    )
+    if _over95_corners_model is not None and _features_df is not None:
+        try:
+            league_enc_for_corners = _encode_label(_le_league, req.league)
+            corners95_prob = _get_over95_corners_probability(
+                req.home_team, req.away_team, league_enc_for_corners, _features_df
+            )
+            if corners95_prob is not None:
+                if "corners" in final_result and isinstance(final_result["corners"], dict):
+                    final_result["corners"]["over_9_5"] = round(float(corners95_prob), 4)
+                    print(f"[predict] Over 9.5 corners overridden by classifier: {corners95_prob:.4f}")
+        except Exception as exc:
+            print(f"[predict] WARNING: Over 9.5 corners override failed: {exc}")
 
-    # Fill any missing columns with 0
-    for col in runtime_cols:
-        if col not in vector:
-            vector[col] = 0.0
-
-    # Convert to DataFrame with correct column order
-    X = pd.DataFrame([vector])[runtime_cols]
-
-    # 1X2 result probabilities
-    result_proba = _result_model.predict_proba(X)[0]
-    classes      = list(_result_model.classes_)
-    result_map   = dict(zip(classes, result_proba))
-
-    home_win_prob = round(float(result_map.get("H", 0.0)), 4)
-    draw_prob     = round(float(result_map.get("D", 0.0)), 4)
-    away_win_prob = round(float(result_map.get("A", 0.0)), 4)
-
-    # Expected goals
-    exp_home_goals = float(max(_home_goals.predict(X)[0], 0.0))
-    exp_away_goals = float(max(_away_goals.predict(X)[0], 0.0))
-
-    # Expected corners
-    exp_home_corners = float(max(_home_corners.predict(X)[0], 0.0))
-    exp_away_corners = float(max(_away_corners.predict(X)[0], 0.0))
-    exp_total_corners = exp_home_corners + exp_away_corners
-
-    # Derived goal markets
-    over_1_5 = _poisson_over(
-        exp_home_goals + exp_away_goals, 1.5)
-    over_2_5 = _poisson_over(
-        exp_home_goals + exp_away_goals, 2.5)
-    # Override with dedicated Over 2.5 classifier when available
-    over25_classifier_prob = _get_over25_probability(
-        req.home_team, req.away_team, league_enc, _features_df
-    )
-    if over25_classifier_prob is not None:
-        over_2_5 = round(float(over25_classifier_prob), 4)
-        print(f"[predict] Over 2.5 overridden by classifier (ML path): {over_2_5:.4f}")
-    over_3_5 = _poisson_over(
-        exp_home_goals + exp_away_goals, 3.5)
-    btts = _poisson_btts(exp_home_goals, exp_away_goals)
-    # Override with dedicated BTTS classifier when available
-    btts_classifier_prob = _get_btts_probability(
-        req.home_team, req.away_team, league_enc, _features_df
-    )
-    if btts_classifier_prob is not None:
-        btts = round(float(btts_classifier_prob), 4)
-        print(f"[predict] BTTS overridden by classifier (ML path): {btts:.4f}")
-
-    # Derived corner markets
-    over_corners_8_5  = _poisson_over(exp_total_corners, 8.5)
-    over_corners_9_5  = _poisson_over(exp_total_corners, 9.5)
-    over_corners_10_5 = _poisson_over(exp_total_corners, 10.5)
-    over_corners_11_5 = _poisson_over(exp_total_corners, 11.5)
-    # Override Over 9.5 corners with the dedicated classifier when available
-    over95_corners_classifier_prob = _get_over95_corners_probability(
-        req.home_team, req.away_team, league_enc, _features_df
-    )
-    if over95_corners_classifier_prob is not None:
-        over_corners_9_5 = float(over95_corners_classifier_prob)
-        print(f"[predict] Over 9.5 corners overridden by classifier (ML path): {over_corners_9_5:.4f}")
-
-    return {
-        "home_team": req.home_team,
-        "away_team": req.away_team,
-        "league":    req.league,
-        "season":    req.season,
-        "result": {
-            "home_win": home_win_prob,
-            "draw":     draw_prob,
-            "away_win": away_win_prob,
-        },
-        "goals": {
-            "expected_home": round(exp_home_goals, 3),
-            "expected_away": round(exp_away_goals, 3),
-            "over_1_5":      round(over_1_5, 4),
-            "over_2_5":      round(over_2_5, 4),
-            "over_3_5":      round(over_3_5, 4),
-            "btts":          round(btts, 4),
-        },
-        "corners": {
-            "expected_home":  round(exp_home_corners, 3),
-            "expected_away":  round(exp_away_corners, 3),
-            # The frontend reads expected_total / over_9_5 / over_11_5 and the
-            # formula engine publishes all three; the ML path used to omit
-            # them, which left those rows blank for every non-formula
-            # prediction (and left no over_9_5 for fixtures.py to store).
-            "expected_total": round(exp_total_corners, 3),
-            "over_8_5":       round(over_corners_8_5, 4),
-            "over_9_5":       round(over_corners_9_5, 4),
-            "over_10_5":      round(over_corners_10_5, 4),
-            "over_11_5":      round(over_corners_11_5, 4),
-        },
-        "feature_vector_used": {
-            k: round(v, 4) for k, v in vector.items()
-        },
-    }
+    return final_result
 
 
 @router.get("/admin/diagnostics")
@@ -1449,6 +1529,14 @@ def pipeline_status() -> dict:
             _home_corners is not None,
             _away_corners is not None,
         ]),
+        "blend_weights": {
+            "1x2": {"formula": BLEND_FORMULA_1X2, "ml": BLEND_ML_1X2},
+            "goals": {"formula": BLEND_FORMULA_GOALS, "ml": BLEND_ML_GOALS},
+            "corners": {"formula": BLEND_FORMULA_CRNRS, "ml": BLEND_ML_CRNRS},
+            "btts": "classifier_100pct",
+            "over25": "classifier_100pct",
+            "over95_corners": "classifier_100pct",
+        },
     }
 
 
