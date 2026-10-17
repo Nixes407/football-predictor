@@ -1218,6 +1218,15 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
             detail="Neither formula engine nor ML models could produce a prediction.",
         )
 
+    # The formula output carries its own engine name, but after blending (or
+    # falling back to ML) this response field must identify the method that
+    # produced the final prediction.
+    final_result["engine"] = {
+        "blended": "blended",
+        "formula_only": "formula_v1",
+        "ml_only": "ml",
+    }[final_result["prediction_method"]]
+
     # Specialized classifiers override their specific fields AFTER blend
     if _btts_model is not None and _features_df is not None:
         try:
