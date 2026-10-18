@@ -109,6 +109,22 @@ class FilterTrainingLeaguesTests(unittest.TestCase):
         self.assertTrue(trainer.filter_training_leagues(
             pd.DataFrame()).empty)
 
+    def test_all_seasons_are_kept(self):
+        # The trainer must train on every COMPLETED match in the DB: the only
+        # filter is by league, never by season/date. Rows from finished and
+        # in-progress seasons all survive.
+        rows = []
+        for season in ("2021-2022", "2024-2025", "2025-2026", "2026-2027"):
+            for league in ("ENG-Premier League", "NOR-Eliteserien"):
+                rows.append({"league": league, "season": season})
+        df = pd.DataFrame(rows)
+        out = trainer.filter_training_leagues(df)
+        self.assertEqual(len(out), len(df))
+        self.assertEqual(
+            sorted(out["season"].unique()),
+            ["2021-2022", "2024-2025", "2025-2026", "2026-2027"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

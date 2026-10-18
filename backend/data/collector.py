@@ -148,12 +148,42 @@ EXTRA_CSV_HEADERS = {
 #: Process-local cache: all-time CSV code -> downloaded frame (None = failed).
 _EXTRA_CSV_CACHE: dict[str, Any] = {}
 
-SEASONS: list[str] = [
-    "2021-2022",
-    "2022-2023",
-    "2023-2024",
-    "2024-2025",
-]
+#: First season of the training window. The list itself is generated
+#: dynamically up to the CURRENT season (see ``current_season``), so a
+#: collector run in e.g. October 2026 also ingests 2025-2026 (finished)
+#: and 2026-2027 (in progress) instead of silently stopping at a
+#: hard-coded year. football-data.co.uk files for an in-progress season
+#: grow daily, and soccerdata re-downloads incomplete seasons
+#: (``_is_complete``) rather than serving stale cache.
+FIRST_TRAINING_SEASON: int = 2021
+
+
+def current_season(today: date | None = None) -> str:
+    """
+    Return the "YYYY-YYYY" label of the European season that ``today`` falls
+    in: the season starting in July of the current year when the month is
+    July or later, otherwise the season that started last July.
+    """
+    today = today or date.today()
+    start = today.year if today.month >= 7 else today.year - 1
+    return f"{start}-{start + 1}"
+
+
+def season_range(
+    first_year: int = FIRST_TRAINING_SEASON,
+    today: date | None = None,
+) -> list[str]:
+    """
+    All season labels from ``first_year`` up to and including the current one.
+
+    "2021-2022" ... current_season(today). Built from one shared rule so the
+    collector, the FBref collectors and the ops scripts never drift apart.
+    """
+    last_year = int(current_season(today)[:4])
+    return [f"{y}-{y + 1}" for y in range(first_year, last_year + 1)]
+
+
+SEASONS: list[str] = season_range()
 
 # football-data.co.uk column -> matches table column. The scraped frame keeps
 # the raw codes (FTHG, FTAG, ...), so they are mapped explicitly here.

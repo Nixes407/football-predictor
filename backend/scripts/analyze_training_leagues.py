@@ -5,7 +5,8 @@ Answers the two questions that must be checked before (re)training on the
 wider league set:
 
 1. How many COMPLETED matches does the ``matches`` table hold per league and
-   season (default: 2021-2022 .. 2024-2025) for every league in the trainer's
+   season (default: first training season .. current season, i.e. 2021-2022
+   onward including the in-progress one) for every league in the trainer's
    ``TRAINING_LEAGUES``?
 2. Does ``fbref_team_stats`` contain rows for those leagues?  Missing FBref
    coverage is NOT fatal: the feature builder zero-fills the FBref columns,
@@ -43,7 +44,25 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-DEFAULT_SEASONS = ["2021-2022", "2022-2023", "2023-2024", "2024-2025"]
+def _default_seasons() -> list[str]:
+    """First training season .. current season, matching data/collector.py.
+
+    Falls back to the same rule computed locally when the collector module
+    cannot be imported (e.g. its optional dependencies are missing).
+    """
+    try:
+        from data.collector import season_range
+
+        return season_range()
+    except Exception:
+        from datetime import date
+
+        today = date.today()
+        start = today.year if today.month >= 7 else today.year - 1
+        return [f"{y}-{y + 1}" for y in range(2021, start + 1)]
+
+
+DEFAULT_SEASONS = _default_seasons()
 
 #: Fallback if backend/models/trainer.py cannot be imported (its xgboost /
 #: supabase dependencies are optional for this report). Keep in sync with

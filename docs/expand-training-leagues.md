@@ -98,6 +98,43 @@ Bundesliga 1,224 · Eredivisie 1,224 · Austria 779 · Türkiye 338 · Norway 0
 (then 0 in this snapshot; after a production collection run: ~960 for
 2021-2024 + whatever 2024-25 rounds exist).
 
+## Season coverage (follow-up fix, 2026-10-18)
+
+The first pass still carried the collector's hard-coded window
+`2021-2022 … 2024-2025`. As of October 2026 that misses the finished
+**2025-2026** season and the in-progress **2026-2027** season. Fixed by making
+the window dynamic:
+
+* `data/collector.py` now exposes `current_season()` (July-boundary rule:
+  month ≥ 7 → `YYYY-(YYYY+1)`, else `(YYYY-1)-YYYY`) and `season_range()`,
+  which generates every season from `FIRST_TRAINING_SEASON = 2021`
+  through the current one; `SEASONS = season_range()`. football-data's
+  in-progress files re-download on every run (soccerdata `_is_complete`), so
+  the 2026-2027 rows grow as the matchdays are played.
+* `data/fbref_collector.py` derives its `SEASONS` from the same helper
+  (with a self-contained fallback), keeping `fbref_team_stats` aligned with
+  the matches table for the new seasons — soccerdata caches finished seasons,
+  so the daily cron pays no extra FBref requests for them.
+* `scripts/analyze_training_leagues.py` defaults to the same dynamic range.
+* **Trainer check (verified):** `models/trainer.py` has no season or date
+  filter at all — it trains on every row the builder emitted, and the builder
+  keeps every row in `matches` that has a result (`dropna` on date/result),
+  i.e. all *completed* matches. `filter_training_leagues()` filters by league
+  only; a regression test asserts rows from finished and in-progress seasons
+  all survive.
+
+Validation replay on the same openfootball replica extended to 6 seasons
+(16,435 completed matches incl. 1,993 dated 2026):
+
+| run | features_rows | XGB acc (test) | XGB log loss (test) | test split window |
+| --- | --- | --- | --- | --- |
+| expanded, seasons 21-22…24-25 | 12,929 | 0.4925 | 1.0224 | → 2025-05 |
+| expanded, seasons 21-22…26-27 | **16,435** | **0.4936** | **1.0158** | 2025-08 → 2026-09 |
+
+The extra 3,506 rows (+27%) again improve both headline metrics; the test
+split is now dominated by the newest seasons, which is the desired state for
+deployment-time calibration.
+
 ## Production retrain runbook
 
 ```bash

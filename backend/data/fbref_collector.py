@@ -41,7 +41,24 @@ LEAGUES = [
     "FRA-Ligue 1",
 ]
 
-SEASONS = ["2021-2022", "2022-2023", "2023-2024", "2024-2025"]
+# Seasons follow data.collector's dynamic range (first training season ..
+# current season), so a daily update also refreshes 2025-2026 once the
+# calendar turns and keeps FBref features aligned with the matches table.
+# soccerdata caches finished seasons, so re-listing them costs one local
+# file read per table, not one HTTP request.
+try:
+    from data.collector import season_range as _season_range
+
+    SEASONS = _season_range()
+except Exception:  # pragma: no cover - standalone/fallback path
+    from datetime import date as _date
+
+    def _fallback_seasons() -> list[str]:
+        _today = _date.today()
+        _start = _today.year if _today.month >= 7 else _today.year - 1
+        return [f"{y}-{y + 1}" for y in range(2021, _start + 1)]
+
+    SEASONS = _fallback_seasons()
 
 # Model attribute -> FBref column name, per source table.
 SHOOTING_FIELDS = {
