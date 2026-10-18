@@ -5,8 +5,11 @@ Two collectors, both built on `soccerdata <https://soccerdata.readthedocs.io>`_:
 
 ``collect_match_history()``
     Pulls match results, shots, corners, cards, fouls and closing bookmaker odds
-    from football-data.co.uk (via ``soccerdata.MatchHistory``) for the big five
-    European leagues and stores them in the ``matches`` table.
+    from football-data.co.uk (via ``soccerdata.MatchHistory``) for the Big Five
+    plus the ENG-Championship, POR-Primeira Liga, NED-Eredivisie and
+    TUR-Süper Lig division files, and for NOR-Eliteserien / AUT-Bundesliga from
+    football-data.co.uk's all-time "extra leagues" CSVs (goals and odds only).
+    All of it is stored in the ``matches`` table.
 
 ``collect_elo_ratings()``
     Pulls the full ClubElo rating history for every team found in ``matches``
@@ -51,6 +54,14 @@ if str(_BACKEND_DIR) not in sys.path:
 _MISSING_DEPENDENCIES: list[str] = []
 
 try:
+    import io
+
+    import requests
+except ImportError:  # pragma: no cover - depends on the environment
+    requests = None  # type: ignore[assignment]
+    _MISSING_DEPENDENCIES.append("requests")
+
+try:
     import pandas as pd
 except ImportError:  # pragma: no cover - depends on the environment
     pd = None  # type: ignore[assignment]
@@ -82,7 +93,60 @@ LEAGUES: list[str] = [
     "GER-Bundesliga",
     "ITA-Serie A",
     "FRA-Ligue 1",
+    "ENG-Championship",
+    "POR-Primeira Liga",
+    "NED-Eredivisie",
+    "TUR-Süper Lig",
+    "NOR-Eliteserien",
+    "AUT-Bundesliga",
 ]
+
+# ---------------------------------------------------------------------------
+# League support beyond soccerdata's built-in list
+# ---------------------------------------------------------------------------
+#
+# BUG FIX (league name mismatch / silent collection failure):
+# soccerdata's ``MatchHistory`` only accepts the leagues present in
+# ``soccerdata._config.LEAGUE_DICT`` (currently the Big Five + a few
+# international tournaments). Constructing it with e.g.
+# leagues="ENG-Championship" raises ``ValueError: Invalid league`` and — in
+# this collector — every one of those failures was previously swallowed into
+# the per-league-season "failed" counter, so simply adding a league to
+# ``LEAGUES`` below would ingest ZERO rows for it.
+#
+# The leagues football-data.co.uk still publishes as regular per-season
+# division files (``mmz4281/{season}/{code}.csv``) are registered into the
+# soccerdata config at import time, which makes ``MatchHistory`` accept them.
+EXTRA_MATCH_HISTORY_CODES: dict[str, str] = {
+    "ENG-Championship": "E1",     # England Division 1 / Championship
+    "POR-Primeira Liga": "P1",    # Liga Portugal
+    "NED-Eredivisie": "N1",       # Eredivisie
+    "TUR-Süper Lig": "T1",        # Süper Lig
+}
+
+# Leagues football-data.co.uk only publishes as ONE all-time CSV under
+# ``https://www.football-data.co.uk/new/{code}.csv`` (columns: Country,
+# League, Season, Date, Time, Home, Away, HG, AG, Res, ...). These carry
+# goals and odds only — no shots, corners or cards — so those stat columns
+# are stored as NULL and the feature builder falls back to its zero
+# defaults. MatchHistory cannot read these files at all, hence the
+# dedicated downloader below. Note: unknown codes under /new/ silently
+# REDIRECT to another file, so every download is guarded by a Country check.
+EXTRA_CSV_LEAGUES: dict[str, dict[str, Any]] = {
+    "NOR-Eliteserien": {"code": "NOR", "country": "Norway", "calendar_year": True},
+    "AUT-Bundesliga": {"code": "AUT", "country": "Austria", "calendar_year": False},
+}
+
+EXTRA_CSV_BASE_URL = "https://www.football-data.co.uk/new/{code}.csv"
+EXTRA_CSV_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+}
+
+#: Process-local cache: all-time CSV code -> downloaded frame (None = failed).
+_EXTRA_CSV_CACHE: dict[str, Any] = {}
 
 SEASONS: list[str] = [
     "2021-2022",
@@ -265,6 +329,150 @@ def _scrape_matches(league: str, season: str):
     return frame
 
 
+def _register_extra_leagues_with_soccerdata() -> None:
+    """
+    Add the leagues from :data:`EXTRA_MATCH_HISTORY_CODES` to soccerdata's
+    league config so ``MatchHistory`` accepts them.
+
+    ``soccerdata._common`` imports the ``LEAGUE_DICT`` object once and looks
+    leagues up in that same dict, so mutating it in place here is enough —
+    no monkey-patching of class internals is required.
+    """
+    if MatchHistory is None or pd is None:  # pragma: no cover - env-dependent
+        return
+    try:
+        from soccerdata import _config as soccerdata_config
+    except Exception as exc:  # noqa: BLE001
+        print(f"[matches] WARNING: cannot import soccerdata config: {exc}")
+        return
+    league_dict = getattr(soccerdata_config, "LEAGUE_DICT", None)
+    if not isinstance(league_dict, dict):
+        print("[matches] WARNING: soccerdata LEAGUE_DICT is not a plain dict; "
+              "extra leagues may be rejected by MatchHistory")
+        return
+    for name, code in EXTRA_MATCH_HISTORY_CODES.items():
+        existing = league_dict.get(name)
+        if isinstance(existing, dict) and existing.get("MatchHistory"):
+            continue
+        league_dict[name] = {
+            "MatchHistory": code,
+            "season_start": "Aug",
+            "season_end": "May",
+        }
+        print(f"[matches] Registered '{name}' (football-data.co.uk code "
+              f"{code!r}) with soccerdata's league config")
+
+
+def _season_start_year(season_label: object) -> int | None:
+    """Return the starting year of a season label ("2021-2022" -> 2021)."""
+    text = str(season_label).strip()
+    head = text.split("-")[0].split("/")[0].strip()
+    try:
+        year = int(head)
+    except ValueError:
+        return None
+    return year if 1900 < year < 2100 else None
+
+
+def _download_extra_league_csv(code: str, expected_country: str):
+    """
+    Download one football-data.co.uk ``/new/{code}.csv`` all-time file.
+
+    Cached per code for the lifetime of the process. Returns None (and caches
+    the failure) on network, parse or country-guard errors. The guard exists
+    because unknown codes under /new/ silently redirect to a different
+    country's file — loading those rows would poison the table.
+    """
+    if code in _EXTRA_CSV_CACHE:
+        return _EXTRA_CSV_CACHE[code]
+    frame = None
+    try:
+        if requests is None:
+            raise RuntimeError("requests is not installed")
+        response = requests.get(
+            EXTRA_CSV_BASE_URL.format(code=code),
+            headers=EXTRA_CSV_HEADERS,
+            timeout=60,
+            allow_redirects=False,
+        )
+        response.raise_for_status()
+        try:
+            text = response.content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = response.content.decode("latin-1")
+        frame = pd.read_csv(io.StringIO(text), on_bad_lines="warn")
+        frame.columns = [str(c).strip() for c in frame.columns]
+        if "Country" in frame.columns:
+            got = {str(c).strip() for c in frame["Country"].dropna().unique()}
+            if got and got != {expected_country}:
+                print(f"[matches] WARNING: {code}.csv serves Country={sorted(got)} "
+                      f"(expected {expected_country!r}) — suspecting a redirect; "
+                      f"skipping the file")
+                frame = None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[matches] WARNING: could not download {code}.csv: {exc}")
+        frame = None
+    _EXTRA_CSV_CACHE[code] = frame
+    return frame
+
+
+def _load_extra_matches(league: str, config: dict, season: str):
+    """
+    Return one league/season frame for an EXTRA_CSV_LEAGUES entry, shaped
+    like a MatchHistory download so ``_build_match_rows`` can consume it.
+
+    football-data's all-time CSVs use Home/Away/HG/AG/Res column names and a
+    "Season" column; goals and odds only (no shots/corners/cards).
+    """
+    frame = _download_extra_league_csv(config["code"], config["country"])
+    if frame is None or len(frame) == 0:
+        print(f"[matches] WARNING: no rows available for {league} (all-time CSV)")
+        return None
+
+    out = frame.rename(columns={
+        "Home": "home_team",
+        "Away": "away_team",
+        "HG": "FTHG",
+        "AG": "FTAG",
+        "Res": "FTR",
+    })
+
+    # dd/mm/yyyy in these files; dayfirst parsing keeps ambiguous dates sane.
+    if "Date" in out.columns:
+        out["date"] = pd.to_datetime(
+            out["Date"], dayfirst=True, errors="coerce"
+        )
+    if "date" not in out.columns:
+        print(f"[matches] WARNING: {league} all-time CSV has no Date column")
+        return None
+
+    target_year = _season_start_year(season)
+    if target_year is None:
+        print(f"[matches] WARNING: unparseable season label {season!r}")
+        return None
+
+    def _season_year_from_dates(dates) -> "pd.Series":
+        if config.get("calendar_year"):
+            return dates.dt.year
+        # European Aug-May seasons: Jan-Jun dates belong to the previous label.
+        return dates.dt.year - (dates.dt.month < 7).astype(int)
+
+    if "Season" in out.columns:
+        season_year = out["Season"].map(_season_start_year)
+        # Rows with an unparsable/absent Season label fall back to the date.
+        season_year = season_year.fillna(_season_year_from_dates(out["date"]))
+    else:
+        season_year = _season_year_from_dates(out["date"])
+    out = out[season_year == target_year]
+
+    out = out.dropna(subset=["date"])
+    if len(out) == 0:
+        print(f"[matches] WARNING: {league} {season}: no rows in the all-time CSV")
+        return None
+    return out
+
+
+
 def _build_match_rows(frame, league: str, season: str) -> list[dict[str, Any]]:
     """Convert a scraped frame into a list of ``matches`` row dicts."""
     flat = frame.reset_index()
@@ -369,8 +577,14 @@ def collect_match_history() -> dict[str, int]:
     print(f"[matches] Seasons: {', '.join(SEASONS)}")
     print("=" * 70)
 
+    _register_extra_leagues_with_soccerdata()
+
     for league, season in itertools.product(LEAGUES, SEASONS):
-        frame = _scrape_matches(league, season)
+        extra_cfg = EXTRA_CSV_LEAGUES.get(league)
+        if extra_cfg is not None:
+            frame = _load_extra_matches(league, extra_cfg, season)
+        else:
+            frame = _scrape_matches(league, season)
         if frame is None:
             totals["failed"] += 1
             continue

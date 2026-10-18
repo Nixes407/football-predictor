@@ -12,7 +12,9 @@ Run from backend/ directory:
 from __future__ import annotations
 
 import os
+import unicodedata
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 
 import joblib
@@ -118,6 +120,149 @@ FEATURE_COLS = [
 
 # The 1X2 target column produced by builder.py.
 TARGET_COL = "target_result"
+
+
+# --------------------------------------------------------------------------- #
+# Training leagues
+# --------------------------------------------------------------------------- #
+
+#: Leagues whose rows are used to train every model. ``features.csv`` can
+#: contain more (or fewer) rows than this list describes: ``train_all_models``
+#: filters to exactly these competitions before the chronological split.
+#: The Big Five plus the six leagues added when the training dataset was
+#: expanded (see backend/data/collector.py, which ingests them).
+TRAINING_LEAGUES: list[str] = [
+    "ENG-Premier League",
+    "ESP-La Liga",
+    "GER-Bundesliga",
+    "ITA-Serie A",
+    "FRA-Ligue 1",
+    "ENG-Championship",
+    "POR-Primeira Liga",
+    "NED-Eredivisie",
+    "TUR-Süper Lig",
+    "NOR-Eliteserien",
+    "AUT-Bundesliga",
+]
+
+#: Canonical spelling per known alias/variant of the league names above.
+#: The database stores league strings written by different collectors and
+#: sources, so the match against TRAINING_LEAGUES is done after normalising
+#: (casefold, whitespace collapsed, diacritics stripped) — which subsumes
+#: the case/accent variants — while genuinely different spellings are listed
+#: here explicitly.
+LEAGUE_ALIASES: dict[str, str] = {
+    "tur-super lig":      "TUR-Süper Lig",
+    "tur-superlig":       "TUR-Süper Lig",
+    "tur-spor toto super lig": "TUR-Süper Lig",
+    "turkiye-super lig":  "TUR-Süper Lig",
+    "eng-championship":   "ENG-Championship",
+    "eng-league championship": "ENG-Championship",
+    "eng-d2":             "ENG-Championship",
+    "england-championship": "ENG-Championship",
+    "por-primeira liga":  "POR-Primeira Liga",
+    "por-liga portugal":  "POR-Primeira Liga",
+    "por-liga betclic":   "POR-Primeira Liga",
+    "ned-eredivisie":     "NED-Eredivisie",
+    "ned-holland eredivisie": "NED-Eredivisie",
+    "nor-eliteserien":    "NOR-Eliteserien",
+    "nor-obos-ligaen":    "NOR-Eliteserien",
+    "nor-telenor-ligaen": "NOR-Eliteserien",
+    "nor-norway eliteserien": "NOR-Eliteserien",
+    "aut-bundesliga":     "AUT-Bundesliga",
+    "aut-austrian bundesliga": "AUT-Bundesliga",
+    "aut-admiral bundesliga": "AUT-Bundesliga",
+    "aut-osterreich bundesliga": "AUT-Bundesliga",
+    "ger-bundesliga":     "GER-Bundesliga",
+    "ger-1 bundesliga":   "GER-Bundesliga",
+    "ger-bundesliga 1":    "GER-Bundesliga",
+}
+
+
+def _normalise_league_name(name: object) -> str:
+    """Lowercase, strip diacritics and collapse whitespace for alias lookup."""
+    text = str(name).strip()
+    decomposed = unicodedata.normalize("NFKD", text)
+    ascii_only = "".join(
+        ch for ch in decomposed if not unicodedata.combining(ch)
+    )
+    return " ".join(ascii_only.casefold().split())
+
+
+def canonical_league(name: object) -> str | None:
+    """
+    Map a stored league string to the canonical TRAINING_LEAGUES spelling.
+
+    Returns ``None`` when the name is not one of the training leagues
+    (after normalisation and alias lookup), so callers can decide whether
+    an unrecognised league is a mismatch to fix or a league to ignore.
+    """
+    if name is None:
+        return None
+    normalised = _normalise_league_name(name)
+    if not normalised:
+        return None
+    aliased = LEAGUE_ALIASES.get(normalised)
+    if aliased is not None:
+        return aliased
+    canonical_normalised = {
+        _normalise_league_name(c): c for c in TRAINING_LEAGUES
+    }
+    return canonical_normalised.get(normalised)
+
+
+def filter_training_leagues(
+    df: pd.DataFrame,
+    leagues: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Keep only rows whose ``league`` belongs to the training leagues.
+
+    ``leagues`` defaults to :data:`TRAINING_LEAGUES`. Matching is
+    accent/case-insensitive and alias-aware (:func:`canonical_league`), so
+    e.g. "TUR-Super Lig" and "NOR-OBOS-ligaen" match their canonical names.
+    Prints a per-league row count of the kept data, warns about leagues
+    configured but missing from the frame, and about unrecognised leagues
+    that are dropped. Rows without a ``league`` column at all are kept
+    unchanged (with a warning) so a schema regression cannot silently
+    train on nothing.
+    """
+    wanted = list(TRAINING_LEAGUES if leagues is None else leagues)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if "league" not in df.columns:
+        print("[trainer] WARNING: features frame has no 'league' column — "
+              "skipping league filtering")
+        return df
+
+    canon_to_wanted = {canonical_league(c): c for c in wanted}
+    canon_to_wanted.pop(None, None)
+
+    canonical = df["league"].map(canonical_league)
+    keep = canonical.isin(set(canon_to_wanted))
+
+    counts = df.loc[keep, "league"].value_counts()
+    renamed = counts.copy()
+    renamed.index = [canon_to_wanted.get(c, c) for c in renamed.index]
+    print(f"[trainer] League filter: keeping {int(keep.sum())} of {len(df)} "
+          f"rows across {len(renamed)} leagues")
+    for name, n in renamed.items():
+        print(f"[trainer]   {name:<22} {n:5} rows")
+
+    seen_canon = set(canonical.dropna().unique())
+    missing = [c for c in wanted if c not in seen_canon]
+    if missing:
+        print(f"[trainer] WARNING: leagues configured for training but with "
+              f"0 rows in features: {missing}")
+
+    unknown = df.loc[~keep & canonical.isna(), "league"].value_counts()
+    if len(unknown):
+        print(f"[trainer] NOTE: dropped {int((~keep & canonical.isna()).sum())} "
+              f"rows from leagues outside the training set:")
+        for name, n in unknown.items():
+            print(f"[trainer]   {str(name):<28} {n:5} rows")
+
+    return df.loc[keep].reset_index(drop=True)
 
 BTTS_FEATURE_COLS = [
     "home_btts_rate_5", "away_btts_rate_5",
@@ -1354,6 +1499,7 @@ def upload_models_to_supabase(model_dir: str = "models") -> None:
 def train_all_models(
     features_path: str = "data/processed/features.csv",
     model_dir: str = "models",
+    leagues: Sequence[str] | None = None,
 ) -> dict:
     """
     Full training pipeline. Trains all models in order:
@@ -1369,6 +1515,12 @@ def train_all_models(
     Returns a summary dict of all model results.
     Validation controls all choices.
     Test is evaluated exactly once per model.
+
+    ``leagues`` restricts training to the given competitions
+    (default: :data:`TRAINING_LEAGUES` — the Big Five plus the six
+    expanded-coverage leagues). Filtering happens before the
+    chronological split, so every split and metric below describes
+    exactly the selected leagues.
     """
     print("=" * 60)
     print("FOOTBALL PREDICTOR — MODEL TRAINING")
@@ -1386,9 +1538,28 @@ def train_all_models(
         print(f"[trainer] ERROR: missing feature columns: {missing}")
         return {}
 
+    rows_before_filter = len(df)
+    df = filter_training_leagues(df, leagues)
+    if df.empty:
+        print("[trainer] ERROR: league filtering removed every row — check "
+              "that the features CSV uses the expected league names.")
+        return {}
+    features_rows = len(df)
+    print(f"[trainer] features_rows for this training run: {features_rows} "
+          f"(of {rows_before_filter} loaded)")
+
     train_df, val_df, test_df = chronological_split(df)
 
-    results = {}
+    results = {
+        "_dataset": {
+            "features_rows": features_rows,
+            "features_rows_all_leagues": rows_before_filter,
+            "leagues": list(TRAINING_LEAGUES if leagues is None else leagues),
+            "n_train": int(len(train_df)),
+            "n_val": int(len(val_df)),
+            "n_test": int(len(test_df)),
+        },
+    }
 
     print("\n--- 1X2 RESULT MODEL (LOGISTIC) ---")
     results["result"] = train_result_model(
