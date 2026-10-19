@@ -357,10 +357,14 @@ def load_artifacts() -> None:
         "_le_season":     data_dir   / "season_encoder.joblib",
     }
 
+    # Decode everything first, then publish the globals in one dict update.
+    # A reload therefore swaps the whole artifact set at once instead of
+    # exposing a half-new/half-old set while joblib.load works through the
+    # files (and a file that fails to decode keeps its previous object).
+    loaded: dict[str, Any] = {}
     for var_name, path in artifact_paths.items():
         try:
-            obj = joblib.load(path)
-            globals()[var_name] = obj
+            loaded[var_name] = joblib.load(path)
             print(f"[predict] Loaded {path.name}")
         except FileNotFoundError:
             print(f"[predict] WARNING: {path.name} not found "
@@ -374,7 +378,7 @@ def load_artifacts() -> None:
         df = pd.read_csv(features_path)
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.sort_values("date").reset_index(drop=True)
-        _features_df = df
+        loaded["_features_df"] = df
         print(f"[predict] Loaded features.csv "
               f"({len(df)} rows)")
     except FileNotFoundError:
@@ -382,6 +386,8 @@ def load_artifacts() -> None:
     except Exception as exc:
         print(f"[predict] WARNING: could not load "
               f"features.csv: {exc}")
+
+    globals().update(loaded)
 
 
 def _get_runtime_feature_cols() -> list[str]:
@@ -501,13 +507,25 @@ def reload_models_from_supabase() -> dict[str, Any]:
         load_artifacts()
 
         models_loaded = _loaded_model_names()
-        if not _models_ready():
+        # Every *required* object must have decoded in this run — but the
+        # globals may still hold yesterday's object if a file was unreadable,
+        # so also check the encoders/features explicitly.
+        required_globals = [
+            _ARTIFACT_GLOBALS[name]
+            for name in artifacts.REQUIRED_DOWNLOAD_OBJECTS
+            if name in _ARTIFACT_GLOBALS
+        ]
+        missing = [
+            global_name
+            for global_name in required_globals + ["_le_league", "_le_season"]
+            if globals().get(global_name) is None
+        ]
+        if missing or _features_df is None:
             raise RuntimeError(
-                "reload incomplete: core models missing after download "
-                f"(loaded: {models_loaded or 'none'})"
+                "reload incomplete: "
+                f"{', '.join(missing) or 'features.csv'} missing after "
+                f"download (loaded: {models_loaded or 'none'})"
             )
-        if _features_df is None:
-            raise RuntimeError("reload incomplete: features.csv could not be loaded")
 
         elapsed = time.monotonic() - started
         _pipeline_status = "complete"
