@@ -5,17 +5,32 @@ Trains all prediction models from the features CSV
 produced by builder.py. Uses strict chronological
 splitting. Never tunes on the test set.
 
+Runs in GitHub Actions (7 GB ubuntu-latest runner), NOT on the Render API:
+the 15,000+ row training set no longer fits in Render's 512 MB tier. The
+workflow calls this module with ``--strict-upload`` so a partial training or
+upload fails the job instead of silently publishing stale artifacts. Render
+then only downloads the results (POST /predict/admin/reload-models).
+
 Run from backend/ directory:
-    python models/trainer.py
+    python models/trainer.py                       # train + best-effort upload
+    python models/trainer.py --strict-upload       # CI: fail if anything is missing
+    python models/trainer.py --no-upload           # local experiments
 """
 
 from __future__ import annotations
 
-import os
+import argparse
+import sys
 import unicodedata
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
+
+# Make ``database``/``model_artifacts`` importable when this file is run as
+# ``python models/trainer.py`` (sys.path[0] would otherwise be backend/models).
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
 
 import joblib
 import numpy as np
@@ -36,6 +51,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from supabase import create_client
 from xgboost import XGBClassifier
+
+import model_artifacts as artifacts
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
@@ -1415,91 +1432,135 @@ def train_over95_corners_model(
     return results
 
 
-def upload_models_to_supabase(model_dir: str = "models") -> None:
-    """
-    Push the saved model artifacts to the "models"
-    bucket in Supabase Storage, overwriting existing copies.
+def _artifacts_to_upload(model_dir: str) -> list[tuple[Path, str]]:
+    """Return ``(local path, object name in the bucket)`` for every artifact.
 
-    Credentials are read from the SUPABASE_URL and SUPABASE_KEY
-    environment variables. This step is best-effort: a missing
-    credential or a failed upload prints a message and returns,
-    it never interrupts a training run.
+    Model files live in ``model_dir`` (``backend/models`` by default); the
+    encoders and features.csv are written by builder.py into ``backend/data``.
+    The object names come from ``model_artifacts`` so the API downloads exactly
+    what the trainer uploads.
     """
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_KEY")
+    model_root = Path(model_dir)
+    entries: list[tuple[Path, str]] = [
+        (model_root / name, name) for name in artifacts.MODEL_OBJECTS
+    ]
+    entries += [
+        (artifacts.BACKEND_DIR / "data" / name, name)
+        for name in artifacts.ENCODER_OBJECTS
+    ]
+    entries.append(
+        (
+            artifacts.BACKEND_DIR / "data" / "processed" / artifacts.FEATURES_OBJECT,
+            artifacts.FEATURES_OBJECT,
+        )
+    )
+    return entries
+
+
+def verify_artifacts(model_dir: str = "models") -> list[str]:
+    """Return the object names that are missing from disk."""
+    return [
+        object_name
+        for local_path, object_name in _artifacts_to_upload(model_dir)
+        if not local_path.exists()
+    ]
+
+
+def upload_models_to_supabase(
+    model_dir: str = "models",
+    strict: bool = False,
+) -> dict[str, list[str]]:
+    """Push the saved model artifacts to the "models" Supabase Storage bucket.
+
+    Credentials come from ``SUPABASE_URL`` plus ``SUPABASE_SERVICE_ROLE_KEY``
+    (``SUPABASE_KEY`` is accepted as a legacy fallback). Existing objects are
+    overwritten.
+
+    ``strict=False`` (the historical behaviour) is best-effort: a missing file
+    or a failed upload prints a warning and the run continues, which is fine
+    for a local experiment. ``strict=True`` — what the GitHub Actions training
+    step uses — raises ``RuntimeError`` instead, so a partial training run can
+    never be followed by a "reload models" call that publishes a mixed set of
+    old and new artifacts.
+
+    Returns ``{"uploaded": [...], "missing": [...], "failed": [...]}``.
+    """
+    report: dict[str, list[str]] = {"uploaded": [], "missing": [], "failed": []}
+
+    url, key = artifacts.supabase_credentials()
+    entries = _artifacts_to_upload(model_dir)
+    report["missing"] = [
+        object_name
+        for local_path, object_name in entries
+        if not local_path.exists()
+    ]
 
     if not url or not key:
-        print(
-            "[trainer] WARNING: SUPABASE_URL and/or SUPABASE_KEY is not set, "
-            "skipping upload to Supabase"
+        message = (
+            f"{artifacts.missing_credentials_message()} — skipping upload to "
+            f"Supabase (bucket {artifacts.MODEL_BUCKET!r})"
         )
-        return
+        print(f"[trainer] WARNING: {message}")
+        if strict:
+            raise RuntimeError(message)
+        return report
 
-    # backend/ root — one level above this models/ package.
-    BACKEND_DIR = Path(__file__).resolve().parent.parent
-
-    # (local path, path inside the "models" bucket)
-    model_files = [
-        (Path(model_dir) / "result_model_v1.joblib", "result_model_v1.joblib"),
-        (
-            Path(model_dir) / "result_model_xgb_v1.joblib",
-            "result_model_xgb_v1.joblib",
-        ),
-        (
-            Path(model_dir) / "result_model_xgb_v1_label_encoder.joblib",
-            "result_model_xgb_v1_label_encoder.joblib",
-        ),
-        (Path(model_dir) / "home_goals_v1.joblib", "home_goals_v1.joblib"),
-        (Path(model_dir) / "away_goals_v1.joblib", "away_goals_v1.joblib"),
-        (Path(model_dir) / "home_corners_v1.joblib", "home_corners_v1.joblib"),
-        (Path(model_dir) / "away_corners_v1.joblib", "away_corners_v1.joblib"),
-        (Path(model_dir) / "btts_model_v1.joblib", "btts_model_v1.joblib"),
-        (Path(model_dir) / "over25_model_v1.joblib", "over25_model_v1.joblib"),
-        (
-            Path(model_dir) / "over95_corners_model_v1.joblib",
-            "over95_corners_model_v1.joblib",
-        ),
-        (
-            BACKEND_DIR / "data" / "league_encoder.joblib",
-            "league_encoder.joblib",
-        ),
-        (
-            BACKEND_DIR / "data" / "season_encoder.joblib",
-            "season_encoder.joblib",
-        ),
-        (
-            BACKEND_DIR / "data" / "processed" / "features.csv",
-            "features.csv",
-        ),
-    ]
+    if report["missing"]:
+        message = (
+            "[trainer] missing local artifacts: "
+            f"{', '.join(report['missing'])}"
+        )
+        print(f"[trainer] WARNING: {message}")
+        if strict:
+            raise RuntimeError(message)
 
     try:
         client = create_client(url, key)
     except Exception as exc:
-        print(f"[trainer] WARNING: Supabase client creation failed: {exc}")
-        return
+        message = f"Supabase client creation failed: {exc}"
+        print(f"[trainer] WARNING: {message}")
+        if strict:
+            raise RuntimeError(message) from exc
+        return report
 
-    for model_path, file_name in model_files:
+    for local_path, object_name in entries:
+        if not local_path.exists():
+            continue
         try:
-            data = model_path.read_bytes()
-            client.storage.from_("models").upload(
-                path=file_name,
+            data = local_path.read_bytes()
+            client.storage.from_(artifacts.MODEL_BUCKET).upload(
+                path=object_name,
                 file=data,
                 file_options={
                     "content-type": "application/octet-stream",
                     "x-upsert": "true",
                 },
             )
-            print(f"[trainer] Uploaded to Supabase -> models/{file_name}")
+            report["uploaded"].append(object_name)
+            print(f"[trainer] Uploaded to Supabase -> "
+                  f"{artifacts.MODEL_BUCKET}/{object_name} "
+                  f"({len(data) / 1024:.0f} KiB)")
         except Exception as exc:
-            print(f"[trainer] WARNING: upload failed for {file_name}: {exc}")
-            continue
+            report["failed"].append(object_name)
+            print(f"[trainer] WARNING: upload failed for {object_name}: {exc}")
+
+    if strict and report["failed"]:
+        raise RuntimeError(
+            "upload failed for: " + ", ".join(report["failed"])
+        )
+
+    print(f"[trainer] Supabase upload: {len(report['uploaded'])} object(s) "
+          f"uploaded, {len(report['failed'])} failed, "
+          f"{len(report['missing'])} missing")
+    return report
 
 
 def train_all_models(
     features_path: str = "data/processed/features.csv",
     model_dir: str = "models",
     leagues: Sequence[str] | None = None,
+    upload: bool = True,
+    strict_upload: bool = False,
 ) -> dict:
     """
     Full training pipeline. Trains all models in order:
@@ -1521,6 +1582,11 @@ def train_all_models(
     expanded-coverage leagues). Filtering happens before the
     chronological split, so every split and metric below describes
     exactly the selected leagues.
+
+    ``upload`` publishes the artifacts to Supabase Storage when training
+    finishes; ``strict_upload`` turns a missing file or a failed upload into a
+    ``RuntimeError`` (used by GitHub Actions). Returns a summary dict — an
+    empty dict means training could not start (no features / missing columns).
     """
     print("=" * 60)
     print("FOOTBALL PREDICTOR — MODEL TRAINING")
@@ -1604,10 +1670,61 @@ def train_all_models(
             if k != "model_path":
                 print(f"  {k}: {v}")
 
-    upload_models_to_supabase(model_dir)
+    if upload:
+        upload_models_to_supabase(model_dir, strict=strict_upload)
 
     return results
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point. Returns a process exit code.
+
+    GitHub Actions runs ``python models/trainer.py --strict-upload``: any
+    training or upload problem exits non-zero, so the workflow stops before it
+    tells Render to reload a partial set of artifacts.
+    """
+    parser = argparse.ArgumentParser(
+        description="Train every Football Predictor model and upload the "
+                    "artifacts to Supabase Storage.",
+    )
+    parser.add_argument("--features", default="data/processed/features.csv",
+                        help="features CSV produced by features/builder.py")
+    parser.add_argument("--model-dir", default="models",
+                        help="directory that receives the .joblib files")
+    parser.add_argument("--leagues", default="",
+                        help="optional comma-separated league allowlist")
+    parser.add_argument("--strict-upload", action="store_true",
+                        help="fail the run if any artifact is missing or any "
+                             "upload fails (CI mode)")
+    parser.add_argument("--no-upload", action="store_true",
+                        help="train only, do not touch Supabase Storage")
+    args = parser.parse_args(argv)
+
+    leagues = [part.strip() for part in args.leagues.split(",") if part.strip()]
+
+    results = train_all_models(
+        features_path=args.features,
+        model_dir=args.model_dir,
+        leagues=leagues or None,
+        upload=not args.no_upload,
+        strict_upload=args.strict_upload,
+    )
+
+    if not results:
+        print("[trainer] ERROR: training produced no models — exiting 1")
+        return 1
+
+    missing = verify_artifacts(args.model_dir)
+    if missing:
+        print("[trainer] ERROR: these artifacts were not written: "
+              f"{', '.join(missing)}")
+        return 1
+
+    print(f"[trainer] All {len(artifacts.MODEL_OBJECTS)} model artifacts, "
+          f"{len(artifacts.ENCODER_OBJECTS)} encoders and "
+          f"{artifacts.FEATURES_OBJECT} are present")
+    return 0
+
+
 if __name__ == "__main__":
-    train_all_models()
+    sys.exit(main())

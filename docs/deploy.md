@@ -26,7 +26,9 @@ browser ──► Vercel (frontend/)                 next.config.js: no /api rew
 | `ALLOWED_ORIGINS`      | yes      | `https://your-frontend.vercel.app`                                     | Comma-separated CORS allowlist of frontend origins           |
 | `FRONTEND_URL`         | optional | `https://your-frontend.vercel.app`                                     | Single-origin shortcut, merged into `ALLOWED_ORIGINS`        |
 | `ALLOWED_ORIGIN_REGEX` | optional | `https://.*\.vercel\.app`                                              | Regex for hosts you cannot enumerate (Vercel previews)       |
-| `PIPELINE_SECRET`      | optional | `python -c "import secrets;print(secrets.token_urlsafe(32))"`           | Secret for `POST /predict/admin/run-pipeline`; empty = 403   |
+| `SUPABASE_URL`         | yes      | `https://<project>.supabase.co`                                        | Supabase project URL (model bucket download)                 |
+| `SUPABASE_SERVICE_ROLE_KEY` | yes | `eyJ...` (service_role JWT)                                           | Storage key for the `models` bucket. `SUPABASE_KEY` is accepted as a legacy fallback |
+| `PIPELINE_SECRET`      | optional | `python -c "import secrets;print(secrets.token_urlsafe(32))"`           | Secret for `POST /predict/admin/reload-models`; empty = 403  |
 
 CORS notes:
 
@@ -38,18 +40,42 @@ CORS notes:
   If `"*"` appears in the allowlist, `main.py` downgrades to anonymous CORS
   rather than breaking the preflight.
 
-### Run the data pipeline once
+### Where the data pipeline runs
 
-The prediction endpoints answer `503` until the trained artifacts exist:
+**Not on Render.** Since the training set passed ~15,000 rows, builder.py and
+trainer.py no longer fit in the 512 MB free tier (the service was OOM-killed
+mid-pipeline). All collection and training runs in the daily GitHub Actions
+workflow (`.github/workflows/daily_fbref_update.yml`, 7 GB runner):
+
+```
+collectors -> fbref -> builder.py -> trainer.py -> Supabase Storage "models"
+                                                        |
+                          Render: POST /predict/admin/reload-models
+```
+
+The API answers `503` for predictions until that reload has loaded a full set
+of artifacts. It does this automatically at startup (background thread); to
+refresh on demand:
+
+```bash
+curl -X POST "https://your-backend.onrender.com/predict/admin/reload-models?secret=$PIPELINE_SECRET"
+# {"status":"reloaded","features_rows":15000,"models_loaded":[...]}
+
+curl "https://your-backend.onrender.com/predict/admin/status"
+```
+
+The legacy `POST /predict/admin/run-pipeline` and
+`POST /predict/admin/run-pipeline-fast` endpoints now return **410 Gone** — they
+are stubs so nothing can restart training on Render by accident.
+
+To train locally instead, run from `backend/` (then upload manually with the
+trainer, which does it by default):
 
 ```bash
 python data/collector.py
 python features/builder.py
 python models/trainer.py
 ```
-
-Or trigger it remotely with `POST /predict/admin/run-pipeline?secret=$PIPELINE_SECRET`
-and poll `GET /predict/admin/status`.
 
 ### Smoke test
 
