@@ -45,6 +45,12 @@ except Exception as exc:
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
+PIPELINE_STEP_TIMEOUT_SECONDS = 7200
+# Increased from 7200 to 21600 seconds (2h -> 6h) for ~15k-18k matches
+# after league expansion PR #78/#80, versus ~7k previously. Apply to every
+# builder entry point; collectors and trainer retain their existing limits.
+BUILDER_TIMEOUT_SECONDS = 21600
+
 # The admin endpoints below import the database layer (and the one-off repair
 # script) from inside the request handler, i.e. by top-level module name.
 # ``database`` and ``scripts.fix_bsa_label`` only resolve while backend/ is on
@@ -467,7 +473,8 @@ def auto_start_fast_pipeline() -> None:
                     cwd=backend_dir,
                     capture_output=True,
                     text=True,
-                    timeout=7200,
+                    timeout=(BUILDER_TIMEOUT_SECONDS if name == "builder"
+                             else PIPELINE_STEP_TIMEOUT_SECONDS),
                 )
                 if proc.stdout:
                     print(proc.stdout[-3000:])
@@ -1473,7 +1480,8 @@ def run_pipeline(secret: str = "") -> dict:
                     cwd=backend_dir,
                     capture_output=True,
                     text=True,
-                    timeout=7200,
+                    timeout=(BUILDER_TIMEOUT_SECONDS if name == "builder"
+                             else PIPELINE_STEP_TIMEOUT_SECONDS),
                 )
                 if proc.stdout:
                     print(proc.stdout[-3000:])
@@ -1526,10 +1534,10 @@ def run_pipeline(secret: str = "") -> dict:
 @router.post("/admin/run-pipeline-fast")
 def run_pipeline_fast(secret: str = "") -> dict:
     """
-    Run only builder and trainer — skips collector.
+    Run FBref collector, builder and trainer — skips match collector.
     Use this when data is already in the database
     and you just need to regenerate the model files.
-    Takes ~30-40 minutes instead of 2+ hours.
+    Builder runtime depends on dataset size; it has a six-hour limit.
     """
     import os
     global _pipeline_running, _pipeline_status, _pipeline_log
@@ -1570,7 +1578,8 @@ def run_pipeline_fast(secret: str = "") -> dict:
                     cwd=backend_dir,
                     capture_output=True,
                     text=True,
-                    timeout=7200,
+                    timeout=(BUILDER_TIMEOUT_SECONDS if name == "builder"
+                             else PIPELINE_STEP_TIMEOUT_SECONDS),
                 )
                 if proc.stdout:
                     print(proc.stdout[-3000:])
@@ -1615,7 +1624,7 @@ def run_pipeline_fast(secret: str = "") -> dict:
 
     return {
         "status": "started",
-        "message": "Fast pipeline started (builder + trainer only). "
+        "message": "Fast pipeline started (FBref collector + builder + trainer). "
                    "Poll /predict/admin/status to monitor progress."
     }
 
