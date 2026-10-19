@@ -17,6 +17,10 @@ jobs:
       PIPELINE_SECRET:   ${{ secrets.PIPELINE_SECRET }}
       RENDER_BACKEND:    ${{ secrets.RENDER_BACKEND }}
       API_FOOTBALL_KEY:  ${{ secrets.API_FOOTBALL_KEY }}
+      # soccerdata's download cache (football-data.co.uk CSVs, FBref pages).
+      # Pointed at runner.temp so it is cached between runs without ever
+      # touching the checked-out working tree.
+      SOCCERDATA_DIR:    ${{ runner.temp }}/soccerdata
 
     steps:
       - name: Checkout repository
@@ -35,10 +39,49 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Cache the raw football-data.co.uk / FBref files soccerdata downloads.
+      # `collector.py` skips league-seasons already stored in `matches`, so the
+      # cache mostly saves re-fetching the in-progress season after a retry.
+      - name: Cache soccerdata downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/soccerdata
+          key: soccerdata-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            soccerdata-${{ runner.os }}-
+
+      # ---------------------------------------------------------------------
+      # football-data.co.uk match results -> `matches` table.
+      #
+      # This step did not exist before: `backend/data/collector.py` was never
+      # invoked by any workflow, so `matches` stopped changing after the manual
+      # initial population and the six leagues added in PR #78 (ELC, PPL, DED,
+      # TR1, NOR, AUT) had no historical data for the trainer to use.
+      #
+      # * Runs first, so builder/trainer (triggered further down via
+      #   /predict/admin/run-pipeline-fast) read an up-to-date `matches` table.
+      # * `continue-on-error` — a source outage must not block the rest of the
+      #   daily run; training simply proceeds on the data already stored.
+      # * Incremental — `collect_match_history()` skips league-seasons that are
+      #   already stored and re-fetches only the in-progress season, so a daily
+      #   run downloads ~11 files, not all 11 leagues x 6 seasons.
+      # * Covers every league in `TRAINING_LEAGUES` (the 11) over the dynamic
+      #   `SEASONS` range (2021-2022 .. current season) from collector.py.
+      # ---------------------------------------------------------------------
+      - name: Run Match Collector
+        id: match_collector
+        continue-on-error: true
+        timeout-minutes: 60
+        working-directory: backend
+        run: |
+          echo "==> [1/6] Collecting football-data.co.uk match history (incremental)..."
+          python data/collector.py
+          echo "==> Match collection complete"
+
       - name: Run StatsBomb collector
         working-directory: backend
         run: |
-          echo "==> [1/4] Downloading StatsBomb open data..."
+          echo "==> [2/6] Downloading StatsBomb open data..."
           python data/statsbomb_collector.py
           if [ $? -ne 0 ]; then
             echo "FATAL: StatsBomb collector failed."
@@ -53,7 +96,7 @@ jobs:
         working-directory: backend
         run: |
           set +e
-          echo "==> [2/4] Collecting FotMob stats (primary)..."
+          echo "==> [3/6] Collecting FotMob stats (primary)..."
           python data/fotmob_collector.py
           if [ $? -ne 0 ]; then
             echo "WARNING: FotMob collector failed."
@@ -85,19 +128,23 @@ jobs:
         working-directory: backend
         continue-on-error: true
         run: |
-          echo "==> [3/4] Collecting API-Football data..."
+          echo "==> [5/6] Collecting API-Football data..."
           python data/api_football_collector.py
           if [ $? -ne 0 ]; then
-            echo "FATAL: API-Football collector failed."
-            echo "Pipeline will NOT be triggered."
-            echo "No data has been updated."
+            # continue-on-error keeps the job alive; the message used to claim
+            # the pipeline would not be triggered, which was no longer true.
+            echo "WARNING: API-Football collector failed."
+            echo "Continuing — the pipeline triggers on the stored data."
             exit 1
           fi
           echo "==> API-Football collection complete"
 
-      - name: All collectors succeeded — trigger pipeline
+      # fbref_collector, builder and trainer do NOT run on this runner: this
+      # call makes the Render web service run them as subprocesses. See
+      # docs/match-collector-pipeline.md for the full picture.
+      - name: Trigger FBref + builder + trainer pipeline
         run: |
-          echo "==> [4/4] All 4 collectors completed"
+          echo "==> [6/6] Collector phase finished"
           echo "==> Triggering Render fast pipeline..."
           HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
             -X POST \

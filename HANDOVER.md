@@ -68,6 +68,10 @@ FotMob stats + fixtures for all:
 
 ## Key Files
 
+- `backend/data/collector.py` — football-data.co.uk match history + ClubElo
+
+- `docs/match-collector-pipeline.md` — which script runs where (Actions runner vs Render)
+
 - `backend/models/formula_engine.py` — prediction engine
 
 - `backend/data/fotmob_collector.py` — FotMob stats
@@ -91,6 +95,8 @@ FotMob stats + fixtures for all:
 | FotMob (direct HTTP) | Primary team stats | ✅ Working |
 
 | football-data.org | Daily fixtures | ✅ Working |
+
+| football-data.co.uk (via `data/collector.py`) | Historical match results + odds for the 11 training leagues | ✅ Runs daily (new step in `daily_fbref_update.yml`) |
 
 | StatsBomb Open Data | H2H historical xG | ✅ Working |
 

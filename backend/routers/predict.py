@@ -1526,10 +1526,17 @@ def run_pipeline(secret: str = "") -> dict:
 @router.post("/admin/run-pipeline-fast")
 def run_pipeline_fast(secret: str = "") -> dict:
     """
-    Run only builder and trainer — skips collector.
-    Use this when data is already in the database
-    and you just need to regenerate the model files.
-    Takes ~30-40 minutes instead of 2+ hours.
+    Run only FBref collector, builder and trainer — skips data/collector.py.
+
+    Use this when data is already in the database and you just need to
+    regenerate the model files. Takes ~30-40 minutes instead of 2+ hours.
+
+    The daily GitHub Actions workflow (``daily_fbref_update.yml``) calls this
+    endpoint *after* running ``python data/collector.py`` on the runner, so the
+    ``matches`` table (all 11 training leagues) is refreshed before these steps.
+    Calling this endpoint by hand does not refresh match results — use
+    ``POST /predict/admin/run-pipeline`` (or run the collector there/CI) if you
+    need that.
     """
     import os
     global _pipeline_running, _pipeline_status, _pipeline_log

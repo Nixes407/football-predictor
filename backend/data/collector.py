@@ -21,9 +21,16 @@ no ``pandas.DataFrame.to_sql()``. Writes are chunked upserts:
 * ``matches``      -> ``INSERT ... ON CONFLICT (match_id) DO NOTHING`` (skip if seen)
 * ``elo_ratings``  -> ``INSERT ... ON CONFLICT (team, date) DO UPDATE`` (refresh)
 
+Collection is **incremental**: a league-season already present in ``matches``
+is not downloaded again, except the in-progress season (its file grows as
+matchdays are played). That keeps the daily GitHub Actions run to the eleven
+current-season files plus whatever is genuinely missing.
+
 Run it from the ``backend/`` directory::
 
-    python data/collector.py
+    python data/collector.py                # incremental, matches + ClubElo
+    python data/collector.py --matches-only # skip ClubElo
+    python data/collector.py --force        # re-download every league-season
 
 Team names are read from football-data.co.uk. ClubElo does not know every one of
 them, and mismatches are skipped with a warning rather than aborting the run.
@@ -219,6 +226,43 @@ CHUNK_SIZE = 500
 
 
 # --------------------------------------------------------------------------- #
+# Incremental collection
+# --------------------------------------------------------------------------- #
+#
+# ``collect_match_history()`` used to re-download every league-season on every
+# run (11 leagues x 6 seasons = 66 CSV downloads, most of them unchanged). It is
+# now incremental: a league-season is skipped when the ``matches`` table already
+# holds a complete-looking slice of it, and only missing league-seasons plus the
+# in-progress season (whose file still grows matchday by matchday) are fetched.
+#
+# "Complete-looking" needs a reference size: the typical number of matches in
+# one league-season of each competition. League sizes change over time (Ligue 1
+# went 20 -> 18 clubs in 2023-24, Süper Lig 21 -> 20 -> 19), so the threshold is
+# deliberately loose: ``COMPLETE_SEASON_RATIO`` of the reference. A season that
+# falls short is simply re-fetched (cheap and idempotent), never left half-full.
+
+EXPECTED_MATCHES_PER_SEASON: dict[str, int] = {
+    "ENG-Premier League": 380,   # 20 clubs
+    "ESP-La Liga": 380,          # 20 clubs
+    "GER-Bundesliga": 306,       # 18 clubs
+    "ITA-Serie A": 380,          # 20 clubs
+    "FRA-Ligue 1": 380,          # 20 clubs until 2022-23, 306 afterwards
+    "ENG-Championship": 552,     # 24 clubs (+ play-offs)
+    "POR-Primeira Liga": 306,    # 18 clubs
+    "NED-Eredivisie": 306,       # 18 clubs
+    "TUR-Süper Lig": 380,        # 20/21 clubs
+    "NOR-Eliteserien": 240,      # 16 clubs, calendar-year season
+    "AUT-Bundesliga": 192,       # 12 clubs, split
+}
+
+#: Share of ``EXPECTED_MATCHES_PER_SEASON`` that counts as "already stored".
+COMPLETE_SEASON_RATIO: float = 0.75
+
+#: Floor used when a league has no entry in ``EXPECTED_MATCHES_PER_SEASON``.
+MIN_COMPLETE_SEASON_ROWS: int = 100
+
+
+# --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
 
@@ -340,6 +384,69 @@ def _derive_result(home_goals: int | None, away_goals: int | None) -> str | None
 
 
 # --------------------------------------------------------------------------- #
+# Incremental collection helpers
+# --------------------------------------------------------------------------- #
+
+
+def stored_match_counts() -> dict[tuple[str, str], int]:
+    """
+    Return ``{(league, season): stored_matches}`` for the leagues we collect.
+
+    One grouped query against ``matches``; never raises. An unreachable
+    database (or a missing SQLAlchemy layer) yields ``{}``, which makes the
+    collector fall back to fetching everything rather than wrongly skipping.
+    """
+    if _MISSING_DEPENDENCIES:
+        return {}
+
+    counts: dict[tuple[str, str], int] = {}
+    try:
+        with session_scope() as session:
+            rows = session.execute(
+                select(Match.league, Match.season, func.count())
+                .where(Match.league.in_(LEAGUES))
+                .group_by(Match.league, Match.season)
+            )
+            for league, season, stored in rows:
+                if _is_missing(league) or _is_missing(season):
+                    continue
+                counts[(str(league).strip(), str(season).strip())] = int(stored or 0)
+    except Exception as exc:  # noqa: BLE001 - never block collection on this
+        print(f"[matches] WARNING: could not read stored match counts "
+              f"({exc}); every league-season will be fetched")
+        return {}
+    return counts
+
+
+def required_matches(league: str) -> int:
+    """Return how many stored matches make ``league`` look already complete."""
+    expected = EXPECTED_MATCHES_PER_SEASON.get(league)
+    if not expected:
+        return MIN_COMPLETE_SEASON_ROWS
+    return max(1, int(expected * COMPLETE_SEASON_RATIO))
+
+
+def league_season_is_stored(
+    league: str,
+    season: str,
+    counts: dict[tuple[str, str], int],
+    current: str | None = None,
+) -> bool:
+    """
+    True when ``league``/``season`` can be skipped because it is already stored.
+
+    The in-progress season is never skipped: its football-data.co.uk file keeps
+    growing, and skipping it would drop the newest results. Seasons absent from
+    ``counts`` — or only partially stored — are fetched again.
+    """
+    current = current or current_season()
+    if season == current:
+        return False
+    stored = counts.get((league, season), 0)
+    return stored >= required_matches(league)
+
+
+# --------------------------------------------------------------------------- #
 # Match history
 # --------------------------------------------------------------------------- #
 
@@ -364,9 +471,16 @@ def _register_extra_leagues_with_soccerdata() -> None:
     Add the leagues from :data:`EXTRA_MATCH_HISTORY_CODES` to soccerdata's
     league config so ``MatchHistory`` accepts them.
 
-    ``soccerdata._common`` imports the ``LEAGUE_DICT`` object once and looks
-    leagues up in that same dict, so mutating it in place here is enough —
-    no monkey-patching of class internals is required.
+    BUG FIX (registration silently ignored): soccerdata >= 1.7 caches the
+    derived ``{canonical: source}`` map on the reader class itself
+    (``BaseReader._all_leagues_dict``) the first time
+    ``available_leagues()``/``_all_leagues()`` is called. Mutating
+    ``LEAGUE_DICT`` afterwards therefore has no effect: constructing
+    ``MatchHistory(leagues="ENG-Championship")`` still raises
+    ``ValueError: Invalid league`` and the four extra football-data.co.uk
+    division leagues silently ingest zero rows — exactly the failure this
+    registration was meant to prevent. Dropping the cached map makes the
+    freshly registered leagues visible whatever ran before.
     """
     if MatchHistory is None or pd is None:  # pragma: no cover - env-dependent
         return
@@ -391,6 +505,23 @@ def _register_extra_leagues_with_soccerdata() -> None:
         }
         print(f"[matches] Registered '{name}' (football-data.co.uk code "
               f"{code!r}) with soccerdata's league config")
+
+    # Drop soccerdata's memoised league map so the new entries are picked up.
+    # It normally lives on the concrete reader class; BaseReader is cleared too
+    # in case a sibling reader populated the base class attribute.
+    candidate_classes = [MatchHistory]
+    try:
+        from soccerdata._common import BaseReader
+
+        candidate_classes.append(BaseReader)
+    except Exception:  # noqa: BLE001 - private API moved; MatchHistory is enough
+        pass
+    for reader_class in candidate_classes:
+        if "_all_leagues_dict" in vars(reader_class):
+            try:
+                delattr(reader_class, "_all_leagues_dict")
+            except AttributeError:  # pragma: no cover - set by another thread
+                pass
 
 
 def _season_start_year(season_label: object) -> int | None:
@@ -591,13 +722,30 @@ def _upsert_matches(rows: Iterable[dict[str, Any]]) -> tuple[int, int]:
     return inserted, len(all_rows) - inserted
 
 
-def collect_match_history() -> dict[str, int]:
+def collect_match_history(
+    force: bool = False,
+    only_missing: bool = True,
+) -> dict[str, int]:
     """
-    Collect every league/season combination into the ``matches`` table.
+    Collect match results into the ``matches`` table.
 
-    Returns a dict with the ``inserted``, ``skipped`` and ``failed`` counters.
+    Incremental by default: a league-season already stored in the database is
+    skipped (see :func:`league_season_is_stored`), except the in-progress
+    season, which is re-fetched so that new results keep arriving. Pass
+    ``force=True`` to re-download and re-upsert everything, or
+    ``only_missing=False`` for the same effect.
+
+    Returns a dict with the ``inserted``, ``skipped`` (rows already stored),
+    ``failed``, ``fetched`` and ``skipped_seasons`` (league-seasons not
+    downloaded) counters.
     """
-    totals = {"inserted": 0, "skipped": 0, "failed": 0}
+    totals = {
+        "inserted": 0,
+        "skipped": 0,
+        "failed": 0,
+        "fetched": 0,
+        "skipped_seasons": 0,
+    }
     if not _check_dependencies():
         return totals
 
@@ -605,11 +753,34 @@ def collect_match_history() -> dict[str, int]:
     print("[matches] Collecting match history from football-data.co.uk")
     print(f"[matches] Leagues: {', '.join(LEAGUES)}")
     print(f"[matches] Seasons: {', '.join(SEASONS)}")
+    if force or not only_missing:
+        print("[matches] Mode: full re-download (incremental skipping disabled)")
+    else:
+        print("[matches] Mode: incremental (stored league-seasons are skipped)")
     print("=" * 70)
 
     _register_extra_leagues_with_soccerdata()
 
+    current = current_season()
+    counts: dict[tuple[str, str], int] = {}
+    if not force and only_missing:
+        counts = stored_match_counts()
+        print(f"[matches] {len(counts)} league-season(s) already in the database")
+
     for league, season in itertools.product(LEAGUES, SEASONS):
+        if (
+            only_missing
+            and not force
+            and league_season_is_stored(league, season, counts, current)
+        ):
+            totals["skipped_seasons"] += 1
+            print(
+                f"[matches] {league} {season}: already stored "
+                f"({counts.get((league, season), 0)} matches) -- skipping download"
+            )
+            continue
+
+        totals["fetched"] += 1
         extra_cfg = EXTRA_CSV_LEAGUES.get(league)
         if extra_cfg is not None:
             frame = _load_extra_matches(league, extra_cfg, season)
@@ -642,7 +813,9 @@ def collect_match_history() -> dict[str, int]:
 
     print(
         f"[matches] Done: {totals['inserted']} inserted, "
-        f"{totals['skipped']} skipped, {totals['failed']} league-seasons failed"
+        f"{totals['skipped']} skipped (already stored), "
+        f"{totals['failed']} league-seasons failed, "
+        f"{totals['skipped_seasons']} league-seasons not downloaded"
     )
     return totals
 
@@ -836,24 +1009,75 @@ def _print_summary() -> None:
     print("=" * 70)
 
 
-def run_collection() -> None:
-    """Run the full data collection pipeline and print a final summary."""
+def run_collection(
+    force: bool = False,
+    matches_only: bool = False,
+) -> dict[str, int]:
+    """
+    Run the data collection pipeline and print a final summary.
+
+    ``force`` re-downloads every league-season; ``matches_only`` skips the
+    ClubElo step. Returns the ``collect_match_history()`` counters.
+    """
+    totals = {"inserted": 0, "skipped": 0, "failed": 0,
+              "fetched": 0, "skipped_seasons": 0}
     if not _check_dependencies():
-        return
+        return totals
 
     print()
     print("#" * 70)
     print("# Football Predictor -- data collection")
     print("#" * 70)
 
-    collect_match_history()
-    collect_elo_ratings()
+    totals = collect_match_history(force=force)
+    if not matches_only:
+        collect_elo_ratings()
 
     _print_summary()
+    return totals
 
 
-if __name__ == "__main__":
+def main(argv: Sequence[str] | None = None) -> int:
+    """
+    Command-line entry point. Returns a process exit code.
+
+    ``--force``        re-download every league-season (ignore stored data)
+    ``--matches-only`` collect match results only, skip ClubElo
+
+    Exits non-zero when a dependency is missing or when nothing at all could be
+    collected, so CI marks the step as failed instead of silently succeeding.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Collect football-data.co.uk match history + ClubElo ratings.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="re-download every league-season instead of only missing ones",
+    )
+    parser.add_argument(
+        "--matches-only",
+        action="store_true",
+        help="skip ClubElo rating collection",
+    )
+    args = parser.parse_args(argv)
+
+    if not _check_dependencies():
+        return 1
+
     from database import init_db
 
     init_db()
-    run_collection()
+    totals = run_collection(force=args.force, matches_only=args.matches_only)
+
+    if totals["fetched"] == 0 and totals["skipped_seasons"] == 0:
+        print("[collector] ERROR: no league-season could be read; "
+              "treating the run as failed")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
