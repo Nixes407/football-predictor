@@ -1,8 +1,10 @@
 """
 Football Match Predictor API — FastAPI application entry point.
 
-Phase 1 scaffold only: the app boots, answers a status check at "/", and mounts
-the (currently route-less) prediction router. No prediction logic yet.
+This service only *serves* predictions. Data collection and model training run
+in the daily GitHub Actions workflow
+(`.github/workflows/daily_fbref_update.yml`) on a 7 GB ubuntu-latest runner;
+here we just reload the pre-built artifacts from Supabase Storage on startup.
 
 Run locally from the `backend/` directory:
 
@@ -68,7 +70,14 @@ ALLOW_CREDENTIALS = "*" not in ALLOWED_ORIGINS
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Print a startup confirmation once the app is ready to serve requests."""
+    """Start serving predictions; never train models on this host.
+
+    This service runs on Render's 512 MB free tier. Since PRs #78/#80/#81 the
+    training set (15,000+ rows) no longer fits in that budget, so builder.py
+    and trainer.py were moved to GitHub Actions (7 GB runners). Startup only
+    downloads the pre-built artifacts from Supabase Storage — a lightweight,
+    non-blocking reload that cannot OOM the instance.
+    """
     print("=" * 60)
     print("Football Predictor API is starting up...")
     print(f"  Environment file loaded : {os.getenv('DATABASE_URL') is not None}")
@@ -77,14 +86,16 @@ async def lifespan(app: FastAPI):
         print(f"  CORS origin regex       : {ALLOWED_ORIGIN_REGEX}")
     if not ALLOW_CREDENTIALS:
         print("  CORS credentials        : disabled (wildcard origin)")
+    print("  Training pipeline       : GitHub Actions (not this service)")
     print("  Docs available at       : /docs")
     print("=" * 60)
 
     from database import init_db
-    from routers.predict import auto_start_fast_pipeline
+    from routers.predict import startup_reload_models
 
     init_db()
-    auto_start_fast_pipeline()
+    # Background thread: downloads model artifacts only, then loads them.
+    startup_reload_models()
 
     yield
     print("Football Predictor API is shutting down...")
@@ -130,10 +141,18 @@ app.include_router(
 
 
 def scheduled_daily_fetch():
+    """Fetch fixtures and store their predictions (the API's own job).
+
+    The weekly FBref scrape that used to run here on Mondays was removed when
+    fbref_collector.py moved into the daily GitHub Actions workflow: scraping
+    on a 512 MB instance competed with the API for memory, duplicated the
+    workflow's work, and could get the service OOM-restarted. Data collection
+    and training now happen exclusively in
+    .github/workflows/daily_fbref_update.yml.
+    """
     from data.fixtures import fetch_fixtures
     from routers.fixtures import compute_and_store_predictions
     from database import SessionLocal
-    from datetime import datetime, timezone
 
     try:
         print("[scheduler] Running daily fixture fetch...")
@@ -146,16 +165,6 @@ def scheduled_daily_fetch():
             db.close()
     except Exception as e:
         print(f"[scheduler] ERROR in fixture fetch: {e}")
-
-    try:
-        today = datetime.now(timezone.utc).weekday()
-        if today == 0:
-            print("[scheduler] Monday — running weekly FBref scrape...")
-            from data.fbref_collector import scrape_fbref_stats
-            scrape_fbref_stats()
-            print("[scheduler] FBref scrape done.")
-    except Exception as e:
-        print(f"[scheduler] ERROR in FBref scrape: {e}")
 
 
 def refresh_todays_fixtures():

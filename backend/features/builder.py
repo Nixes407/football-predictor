@@ -954,4 +954,11 @@ def build_and_save_features(
 
 
 if __name__ == "__main__":
-    build_and_save_features()
+    # GitHub Actions runs this as `python features/builder.py`. Exiting 0 on an
+    # empty build used to let the workflow continue into the trainer (which then
+    # found no CSV) and, worse, into the "reload models" step. Fail loudly here.
+    built = build_and_save_features()
+    if built.empty:
+        print("[builder] ERROR: no features were built — exiting 1")
+        sys.exit(1)
+    print(f"[builder] OK: {len(built)} rows written")

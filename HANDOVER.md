@@ -122,7 +122,8 @@ Otherwise Vercel blocks deployment.
 
 - SUPABASE_URL — https://fuhrgcwkvbtattrvijdp.supabase.co
 
-- SUPABASE_KEY — service_role key
+- SUPABASE_SERVICE_ROLE_KEY — service_role key
+  (SUPABASE_KEY is still accepted as a legacy fallback)
 
 - PIPELINE_SECRET — pipeline trigger secret
 
@@ -134,9 +135,26 @@ Otherwise Vercel blocks deployment.
 
 - NEXT_PUBLIC_API_URL — https://football-predictor-kyk5.onrender.com
 
-**GitHub Secrets:**
+**GitHub Secrets (Settings → Secrets and variables → Actions):**
 
-- Same as Render + RENDER_BACKEND
+- DATABASE_URL, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY),
+  PIPELINE_SECRET, RENDER_BACKEND, API_FOOTBALL_KEY
+
+## Pipeline Architecture (since the OOM fix)
+
+The Render free tier has 512 MB RAM. Once the training set grew from ~6,776 to
+15,000+ rows (PRs #78/#80/#81), builder.py was OOM-killed mid-run and Render
+restarted the service. Training therefore lives in GitHub Actions now:
+
+- `.github/workflows/daily_fbref_update.yml` (3:00 AM UTC): StatsBomb →
+  FotMob (+ Understat backup) → Match collector → FBref collector →
+  builder.py → trainer.py → upload to Supabase Storage bucket "models".
+- Render is notified with `POST /predict/admin/reload-models`, which only
+  re-downloads the artifacts into memory.
+- `POST /predict/admin/run-pipeline` and `.../run-pipeline-fast` return
+  **410 Gone** (stubs; they can no longer spawn builder/trainer on Render).
+- On startup the API reloads models from Supabase Storage in a background
+  thread; it never auto-starts training.
 
 ## Admin Endpoints
 
@@ -150,7 +168,9 @@ Otherwise Vercel blocks deployment.
 
 - `DELETE /predict/admin/clear-fixtures-cache?secret=X` — force fixture refresh
 
-- `POST /predict/admin/run-pipeline-fast?secret=X` — retrain models (~30-40 mins)
+- `POST /predict/admin/reload-models?secret=X` — re-download the pre-built models + features.csv from Supabase Storage (~seconds)
+
+- `POST /predict/admin/run-pipeline` / `run-pipeline-fast` — **410 Gone**; training moved to GitHub Actions
 
 - `GET /predict/admin/fix-bsa-label?secret=X` — one-off repair of stale `BEL-Jupiler Pro League` fixture labels; add `&dry_run=true` to preview. GET so it can be triggered from a phone browser
 
@@ -216,15 +236,15 @@ only where real corners are missing.
 
 ### PRIORITY 4 — RETRAIN ML BACKUP MODELS
 
-Current ML models trained on 2021-2024 data.
+Current ML models are retrained daily by GitHub Actions.
 
-After a full data collection, run:
+To retrain on demand, run the workflow manually:
 
-`POST /predict/admin/run-pipeline-fast`
+GitHub → Actions → "Daily Data Collection + Model Retrain" → Run workflow
 
-This rebuilds features and retrains 5 backup models
-
-with current season data.
+The workflow rebuilds features, retrains all 9 models, uploads them to
+Supabase Storage and calls `POST /predict/admin/reload-models` on Render.
+Do **not** run builder/trainer on Render — it OOMs the 512 MB instance.
 
 ### PRIORITY 5 — FRONTEND IMPROVEMENTS
 

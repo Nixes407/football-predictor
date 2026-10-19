@@ -132,7 +132,10 @@ npm run start     # serve the production build
 | `ALLOWED_ORIGINS`      | Comma-separated CORS allowlist of frontend origins       | `http://localhost:3000,https://your-frontend.vercel.app`   |
 | `FRONTEND_URL`         | Single-origin shortcut, merged into `ALLOWED_ORIGINS`    | `https://your-frontend.vercel.app`                          |
 | `ALLOWED_ORIGIN_REGEX` | Optional regex for unenumerable origins (Vercel previews)| `https://.*\.vercel\.app`                                   |
-| `PIPELINE_SECRET`      | Secret for `POST /predict/admin/run-pipeline`            | (generate with `secrets.token_urlsafe(32)`)                 |
+| `SUPABASE_URL`         | Supabase project URL (model bucket)                      | `https://your-project.supabase.co`                          |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service-role key for the `models` bucket            | (Supabase -> Settings -> API)                               |
+| `SUPABASE_KEY`         | Legacy alias for the key above (still accepted)          | (same service_role key)                                     |
+| `PIPELINE_SECRET`      | Secret for `POST /predict/admin/reload-models`           | (generate with `secrets.token_urlsafe(32)`)                 |
 
 `frontend/.env.local` (created from `frontend/.env.local.example`; see
 `frontend/.env.example` for the deployed value):
@@ -154,8 +157,15 @@ required. Details in [`docs/deploy.md`](docs/deploy.md).
   holds nothing but `{ "version": 2 }`. Set `NEXT_PUBLIC_API_URL` to the
   deployed backend origin.
 - **Backend → Render / Railway / Fly.** FastAPI runs as a long-lived ASGI
-  server. Set `DATABASE_URL` plus `ALLOWED_ORIGINS` containing the Vercel
-  origin, since requests are now cross-origin.
+  server. Set `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` and
+  `ALLOWED_ORIGINS` containing the Vercel origin, since requests are now
+  cross-origin.
+- **Data collection + training → GitHub Actions.** The daily workflow
+  (`.github/workflows/daily_fbref_update.yml`) runs the collectors, builder and
+  trainer on a 7 GB runner, uploads the artifacts to Supabase Storage and then
+  calls `POST /predict/admin/reload-models` on Render. The API itself never
+  trains: `run-pipeline` / `run-pipeline-fast` return **410 Gone**, and startup
+  only downloads the pre-built artifacts.
 - **No proxy layer.** `vercel.json` no longer rewrites `/api/*`; see
   [`docs/deploy.md`](docs/deploy.md) for the full setup and troubleshooting.
 

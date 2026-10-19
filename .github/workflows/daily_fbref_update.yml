@@ -1,26 +1,89 @@
 name: Daily Data Collection + Model Retrain
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Architecture (moved off Render in this workflow)
+#
+#   GitHub Actions, ubuntu-latest, 7 GB RAM:
+#     [1/5] StatsBomb collector
+#     [2/5] FotMob collector (+ Understat backup)
+#     [3/5] Match collector (football-data.co.uk via soccerdata)
+#     [4/5] FBref collector
+#     [5/5] builder.py -> features.csv, trainer.py -> 9 models
+#           -> upload every artifact to Supabase Storage bucket "models"
+#     [6/6] POST $RENDER_BACKEND/predict/admin/reload-models
+#           (Render only re-downloads the artifacts; it never trains)
+#
+#   Until PRs #78/#80/#81 this workflow ended with a call to
+#   POST /predict/admin/run-pipeline-fast, which ran
+#   fbref_collector -> builder -> trainer ON RENDER. Once the training set grew
+#   from ~6,776 to 15,000+ rows that exceeded the 512 MB free tier and Render
+#   OOM-killed / restarted the service mid-pipeline. Those endpoints now return
+#   410 Gone; all heavy work happens on the runner below.
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
   schedule:
     - cron: '0 3 * * *'    # 3:00 AM UTC daily
-  workflow_dispatch:         # manual trigger
+  workflow_dispatch:        # manual trigger
+
+# A manual run must not overlap the scheduled one: two trainers uploading to
+# the same bucket keys would race.
+concurrency:
+  group: daily-fbref-update
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+  # ── Required secrets (GitHub -> Settings -> Secrets and variables -> Actions)
+  # DATABASE_URL                Supabase Postgres (pooler) URL — collectors,
+  #                             builder and trainer read/write the same DB.
+  # SUPABASE_URL                https://<project>.supabase.co
+  # SUPABASE_SERVICE_ROLE_KEY   service_role key: upload/download the "models"
+  #                             bucket. SUPABASE_KEY is kept as a fallback
+  #                             because that is the name the Render service and
+  #                             the previous workflow already use.
+  # PIPELINE_SECRET             shared secret for /predict/admin/reload-models
+  # RENDER_BACKEND              https://football-predictor-kyk5.onrender.com
+  # API_FOOTBALL_KEY            optional, legacy collector (free plan is
+  #                             limited; the step never blocks the pipeline)
+  # ───────────────────────────────────────────────────────────────────────────
+  DATABASE_URL:              ${{ secrets.DATABASE_URL }}
+  SUPABASE_URL:              ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+  SUPABASE_KEY:              ${{ secrets.SUPABASE_KEY }}
+  PIPELINE_SECRET:           ${{ secrets.PIPELINE_SECRET }}
+  RENDER_BACKEND:            ${{ secrets.RENDER_BACKEND }}
+  API_FOOTBALL_KEY:          ${{ secrets.API_FOOTBALL_KEY }}
 
 jobs:
   collect-and-retrain:
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
-    env:
-      DATABASE_URL:      ${{ secrets.DATABASE_URL }}
-      SUPABASE_URL:      ${{ secrets.SUPABASE_URL }}
-      SUPABASE_KEY:      ${{ secrets.SUPABASE_KEY }}
-      PIPELINE_SECRET:   ${{ secrets.PIPELINE_SECRET }}
-      RENDER_BACKEND:    ${{ secrets.RENDER_BACKEND }}
-      API_FOOTBALL_KEY:  ${{ secrets.API_FOOTBALL_KEY }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # Fail in seconds, not after an hour of collecting, when a secret that
+      # only the final steps need is missing.
+      - name: Check required secrets
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${DATABASE_URL:-}" ]  || missing+=("DATABASE_URL")
+          [ -n "${SUPABASE_URL:-}" ]  || missing+=("SUPABASE_URL")
+          if [ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ] && [ -z "${SUPABASE_KEY:-}" ]; then
+            missing+=("SUPABASE_SERVICE_ROLE_KEY (or legacy SUPABASE_KEY)")
+          fi
+          [ -n "${RENDER_BACKEND:-}" ]  || missing+=("RENDER_BACKEND")
+          [ -n "${PIPELINE_SECRET:-}" ] || missing+=("PIPELINE_SECRET")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing GitHub Actions secret(s): ${missing[*]}"
+            echo "Add them in GitHub -> Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "All required secrets are present."
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -35,20 +98,18 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run StatsBomb collector
+      # ── [1/5] StatsBomb ────────────────────────────────────────────────────
+      # Still the only collector whose failure stops the run before any data
+      # is touched: it feeds the H2H/formula tables and fails loudly.
+      - name: "[1/5] Run StatsBomb Collector"
         working-directory: backend
         run: |
           echo "==> [1/5] Downloading StatsBomb open data..."
           python data/statsbomb_collector.py
-          if [ $? -ne 0 ]; then
-            echo "FATAL: StatsBomb collector failed."
-            echo "Pipeline will NOT be triggered."
-            echo "No data has been updated."
-            exit 1
-          fi
           echo "==> StatsBomb collection complete"
 
-      - name: Run FotMob collector (primary)
+      # ── [2/5] FotMob (+ Understat backup) ─────────────────────────────────
+      - name: "[2/5] Run FotMob Collector"
         id: fotmob
         working-directory: backend
         run: |
@@ -56,175 +117,198 @@ jobs:
           echo "==> [2/5] Collecting FotMob stats (primary)..."
           python data/fotmob_collector.py
           if [ $? -ne 0 ]; then
-            echo "WARNING: FotMob collector failed."
-            echo "fotmob_failed=true" >> $GITHUB_OUTPUT
+            echo "::warning::FotMob collector failed — running the Understat backup."
+            echo "fotmob_failed=true" >> "$GITHUB_OUTPUT"
           else
             echo "==> FotMob collection complete"
-            echo "fotmob_failed=false" >> $GITHUB_OUTPUT
+            echo "fotmob_failed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run Understat collector (backup)
-        working-directory: backend
+      - name: "[2/5] Run Understat Collector (backup)"
         if: steps.fotmob.outputs.fotmob_failed == 'true'
+        working-directory: backend
         run: |
-          set +e
           echo "==> FotMob failed — running Understat backup..."
           python data/understat_collector.py
-          if [ $? -ne 0 ]; then
-            echo "FATAL: Both FotMob and Understat failed."
-            echo "Pipeline will NOT be triggered."
-            exit 1
-          fi
           echo "==> Understat backup complete"
 
-      # -------------------------------------------------------------------
-      # football-data.org historical match collector (backend/data/collector.py)
-      # Populates the `matches` table (and `elo_ratings`) from
-      # football-data.co.uk via soccerdata.MatchHistory + extra CSVs.
-      #
-      # Coverage: all 11 TRAINING_LEAGUES (ENG-Premier League, ESP-La Liga,
-      #   GER-Bundesliga, ITA-Serie A, FRA-Ligue 1, ENG-Championship,
-      #   POR-Primeira Liga, NED-Eredivisie, TUR-Süper Lig, NOR-Eliteserien,
-      #   AUT-Bundesliga).
-      # Seasons: dynamic SEASONS range FIRST_TRAINING_SEASON (2021) through
-      #   current_season() (July-boundary rule) — e.g. 2021-2022 .. 2026-2027
-      #   when run in Oct 2026. Defined in PR #78 via season_range().
-      #
-      # Idempotency: incremental by design — `matches` uses
-      #   INSERT ... ON CONFLICT (match_id) DO NOTHING (only new/missing
-      #   results are inserted, existing rows are never re-downloaded into
-      #   the DB), and `elo_ratings` uses ON CONFLICT (team, date) DO UPDATE.
-      #   The scraper itself re-downloads in-progress season files (soccerdata
-      #   _is_complete), but the DB upsert keeps storage incremental.
-      #
-      # Placement: MUST run BEFORE the FBref/builder/trainer pipeline trigger
-      #   (next step: POST to RENDER_BACKEND/predict/admin/run-pipeline-fast).
-      #   The remote pipeline runs fbref_collector → builder → trainer on
-      #   Render; see backend/routers/predict.py run_pipeline_fast().
-      # -------------------------------------------------------------------
-      - name: Run Match Collector
+      # ── [3/5] Match collector ─────────────────────────────────────────────
+      # football-data.co.uk historical results (all 11 TRAINING_LEAGUES) and
+      # ClubElo history. Incremental: matches ON CONFLICT DO NOTHING, elo
+      # ON CONFLICT DO UPDATE. continue-on-error: true — a partial scrape must
+      # not block training on the rows that are already in the database.
+      - name: "[3/5] Run Match Collector"
+        id: matches
         working-directory: backend
         continue-on-error: true
         run: |
-          echo "==> [3/5] Collecting historical matches from football-data.org..."
+          # set +e: capture the exit code instead of letting `bash -e` abort the
+          # step before the RC check below can log the warning.
+          set +e
+          echo "==> [3/5] Collecting historical matches from football-data.co.uk..."
           echo "    Leagues: ENG-Premier League, ESP-La Liga, GER-Bundesliga, ITA-Serie A, FRA-Ligue 1, ENG-Championship, POR-Primeira Liga, NED-Eredivisie, TUR-Süper Lig, NOR-Eliteserien, AUT-Bundesliga (11 leagues)"
-          echo "    Seasons: dynamic range 2021-2022 .. current season (season_range() from data/collector.py, PR #78)"
-          echo "    Mode: incremental upsert — ON CONFLICT DO NOTHING (matches) / DO UPDATE (elo_ratings); only new/missing results are inserted"
+          echo "    Seasons: dynamic range 2021-2022 .. current season (season_range() from data/collector.py)"
+          echo "    Mode: incremental upsert — ON CONFLICT DO NOTHING (matches) / DO UPDATE (elo_ratings)"
           python data/collector.py
           RC=$?
           if [ $RC -ne 0 ]; then
-            echo "WARNING: Match collector exited with $RC — continuing pipeline (continue-on-error: true)."
-            echo "         Existing matches are preserved; only missing league-seasons failed to ingest."
+            echo "::warning::Match collector exited $RC — continuing (continue-on-error: true)."
+            echo "         Existing matches are preserved; only missing league-seasons failed."
             exit 0
           fi
           echo "==> Match collection complete (all 11 leagues, incremental)"
 
-      # Kept (not deleted) in case the API-Football account is restored, but
-      # its failure must not gate the rest of the pipeline: run_all() calls
-      # sys.exit(1) when check_status() rejects the key, which used to abort
-      # the job before fbref, builder and trainer ever ran.
-      # BUG FIX: internal fatal message contradicted continue-on-error: true.
-      # The step now logs a WARNING and exits 0 so the workflow UI and the
-      # actual behaviour (pipeline still triggered) agree.
-      - name: Run API-Football collector
+      # Kept in case the API-Football account is restored. Non-blocking: the
+      # free plan rejects 2025+ seasons and run_all() exits 1 in that case.
+      - name: "[3b/5] Run API-Football Collector (optional)"
+        id: api_football
         working-directory: backend
         continue-on-error: true
         run: |
-          echo "==> [4/5] Collecting API-Football data..."
+          set +e
+          echo "==> [3b/5] Collecting API-Football data (optional, non-blocking)..."
           python data/api_football_collector.py
           RC=$?
           if [ $RC -ne 0 ]; then
-            echo "WARNING: API-Football collector failed with exit $RC."
-            echo "Pipeline will still be triggered (continue-on-error: true)."
+            echo "::warning::API-Football collector exited $RC — continuing (free-plan limitation)."
             exit 0
           fi
           echo "==> API-Football collection complete"
 
-      - name: All collectors succeeded — trigger pipeline
+      # ── [4/5] FBref ───────────────────────────────────────────────────────
+      # MOVED HERE from Render (it used to run inside run-pipeline-fast).
+      # Season stats for the Big Five leagues, upserted into fbref_team_stats.
+      # continue-on-error: true — if it fails, the builder still works from the
+      # FBref rows already in the database (and check_features.py flags a
+      # completely empty FBref signal).
+      - name: "[4/5] Run FBref Collector"
+        id: fbref
+        working-directory: backend
+        continue-on-error: true
         run: |
-          echo "==> [5/5] All collectors completed — triggering FBref/builder/trainer pipeline"
-          echo "    Remote trigger: POST \${RENDER_BACKEND}/predict/admin/run-pipeline-fast"
-          echo "    This endpoint runs on Render: fbref_collector (Big Five FBref stats) -> builder (features.csv + encoders) -> trainer (9 models -> Supabase Storage)"
-          echo "    See: backend/routers/predict.py :: run_pipeline_fast() and backend/main.py :: auto_start_fast_pipeline()"
-          echo "==> Triggering Render fast pipeline..."
-          HTTP=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
-            -X POST \
-            "${RENDER_BACKEND}/predict/admin/run-pipeline-fast?secret=${PIPELINE_SECRET}")
-          echo "HTTP status: $HTTP"
-          cat /tmp/resp.json
-          if [ "$HTTP" != "200" ]; then
-            echo "FATAL: pipeline trigger failed with HTTP $HTTP"
-            exit 1
+          set +e
+          echo "==> [4/5] Scraping FBref team stats (Big Five, 2021-22 .. current)..."
+          python data/fbref_collector.py
+          RC=$?
+          if [ $RC -ne 0 ]; then
+            echo "::warning::FBref collector failed with exit $RC — builder will use the FBref rows already stored in the database."
+            echo "fbref_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          echo "==> Pipeline triggered successfully"
+          echo "==> FBref collection complete"
+          echo "fbref_ok=true" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for pipeline completion
+      # ── [5/5] Builder + Trainer ───────────────────────────────────────────
+      # This is the memory-heavy part that OOM-killed Render. A 7 GB runner
+      # has ~14x the headroom.
+      - name: "[5/5] Build features (builder.py)"
+        working-directory: backend
         run: |
-          echo "==> Waiting for pipeline to complete..."
-          MAX=5400
-          INTERVAL=60
-          ELAPSED=0
-          while [ $ELAPSED -lt $MAX ]; do
-            RESPONSE=$(curl -s \
-              "${RENDER_BACKEND}/predict/admin/status")
-            STATUS=$(echo "$RESPONSE" | python3 -c "
-          import sys,json
-          d=json.load(sys.stdin)
-          print(d.get('pipeline_status','unknown'))
-          ")
-            RUNNING=$(echo "$RESPONSE" | python3 -c "
-          import sys,json
-          d=json.load(sys.stdin)
-          print(d.get('pipeline_running',False))
-          ")
-            echo "[${ELAPSED}s] status=${STATUS} running=${RUNNING}"
-            if [ "$STATUS" = "complete" ]; then
-              echo "==> Pipeline complete!"
-              break
+          echo "==> [5/5] Building features.csv from matches + elo + FBref..."
+          python features/builder.py
+          echo "==> Sanity-checking features.csv before training..."
+          # --min-rows guards against a builder that produced almost nothing
+          # (the daily dataset is ~15,000 rows; 1,000 is a catastrophic-failure
+          # floor, not a quality target).
+          python scripts/check_features.py --min-rows 1000
+
+      - name: "[5/5] Train + upload models (trainer.py)"
+        working-directory: backend
+        run: |
+          echo "==> Training all 9 models and uploading to Supabase Storage..."
+          echo "    result (logistic) | result (xgboost) | home goals | away goals"
+          echo "    home corners | away corners | BTTS | Over 2.5 | Over 9.5 corners"
+          # --strict-upload: any missing artifact or failed upload exits 1, so
+          # the workflow can never tell Render to reload a partial model set.
+          python models/trainer.py --strict-upload
+
+      - name: "[5/5] Verify uploaded artifacts in Supabase Storage"
+        working-directory: backend
+        run: |
+          echo "==> Verifying bucket contents (models/*, encoders, features.csv)..."
+          python scripts/verify_remote_artifacts.py
+
+      # ── [6/6] Notify Render ───────────────────────────────────────────────
+      # Render only re-downloads the pre-built files into memory. The endpoint
+      # never runs builder/trainer/collectors, so it finishes in seconds and
+      # cannot OOM the 512 MB instance.
+      - name: "[6/6] Notify Render to reload models"
+        run: |
+          set -euo pipefail
+          BASE="${RENDER_BACKEND%/}"
+          URL="$BASE/predict/admin/reload-models?secret=${PIPELINE_SECRET}"
+          for attempt in 1 2 3; do
+            echo "==> [6/6] POST /predict/admin/reload-models (attempt $attempt)..."
+            HTTP=$(curl -sS --max-time 120 -o /tmp/reload.json -w "%{http_code}" -X POST "$URL") || HTTP=000
+            echo "HTTP status: $HTTP"
+            cat /tmp/reload.json 2>/dev/null || true
+            echo
+            if [ "$HTTP" = "200" ]; then
+              python3 - <<'PY'
+          import json
+          with open("/tmp/reload.json") as fh:
+              data = json.load(fh)
+          assert data.get("status") == "reloaded", data
+          print(f"Reloaded {len(data.get('models_loaded', []))} models and "
+                f"{data.get('features_rows')} feature rows in "
+                f"{data.get('reload_seconds')}s")
+          PY
+              exit 0
             fi
-            if echo "$STATUS" | grep -qE "^failed|^timeout|^error"; then
-              echo "FATAL: pipeline failed with status: $STATUS"
-              exit 1
-            fi
-            sleep $INTERVAL
-            ELAPSED=$((ELAPSED+INTERVAL))
+            case "$HTTP" in
+              409|502|503|504|000) sleep 15 ;;
+              *)
+                echo "::error::reload-models returned HTTP $HTTP"
+                exit 1
+                ;;
+            esac
           done
-          if [ $ELAPSED -ge $MAX ]; then
-            echo "FATAL: pipeline did not complete within 90 minutes"
-            exit 1
-          fi
+          echo "::error::reload-models did not succeed after 3 attempts"
+          exit 1
 
       - name: Verify models ready
         run: |
-          READY=$(curl -s \
-            "${RENDER_BACKEND}/predict/admin/status" \
-            | python3 -c "
-          import sys,json
-          d=json.load(sys.stdin)
-          print(d.get('ready',False))
-          ")
-          echo "Models ready: $READY"
-          if [ "$READY" != "True" ]; then
-            echo "FATAL: models not ready after pipeline"
-            exit 1
-          fi
-          echo "==> All models loaded and ready!"
+          set -euo pipefail
+          BASE="${RENDER_BACKEND%/}"
+          for attempt in $(seq 1 12); do
+            BODY=$(curl -sS --max-time 30 "$BASE/predict/admin/status" || true)
+            if echo "$BODY" | python3 -c '
+          import sys, json
+          data = json.load(sys.stdin)
+          models = data.get("models_loaded") or []
+          ok = bool(data.get("ready")) and int(data.get("features_rows") or 0) > 0
+          print("status=%s ready=%s models=%d features_rows=%s last_reload_at=%s" % (
+              data.get("pipeline_status"), data.get("ready"), len(models),
+              data.get("features_rows"), data.get("last_reload_at")))
+          sys.exit(0 if ok else 1)
+          '; then
+              echo "==> All models loaded and ready!"
+              exit 0
+            fi
+            echo "    attempt $attempt/12 not ready yet — retrying in 5s"
+            sleep 5
+          done
+          echo "::error::models not ready after reload-models"
+          exit 1
 
+      # Reporting only: a diagnostics hiccup must not turn a successful daily
+      # run red (e.g. the DB being briefly unavailable while it queries stats).
       - name: Print final diagnostics
+        continue-on-error: true
         run: |
-          echo "==> Final diagnostics:"
-          curl -s "${RENDER_BACKEND}/predict/admin/diagnostics" \
+          curl -sS --max-time 30 "${RENDER_BACKEND%/}/predict/admin/diagnostics" \
             | python3 -c "
           import sys,json
           print(json.dumps(json.load(sys.stdin),indent=2))
-          "
+          " || echo "WARNING: diagnostics unavailable — pipeline itself succeeded"
 
       - name: Success summary
         run: |
-          echo "================================"
+          echo "================================================================"
           echo "Daily update SUCCESSFUL"
-          echo "Date: $(date -u)"
-          echo "All collectors: PASSED"
-          echo "Pipeline: COMPLETE"
-          echo "Models: READY"
-          echo "================================"
+          echo "Date       : $(date -u)"
+          echo "Collectors : StatsBomb, FotMob, Match, FBref (Render no longer runs any)"
+          echo "Training   : builder.py + trainer.py on this GitHub Actions runner"
+          echo "Artifacts  : Supabase Storage bucket 'models' (9 models + encoders + features.csv)"
+          echo "Render     : models reloaded via /predict/admin/reload-models"
+          echo "================================================================"

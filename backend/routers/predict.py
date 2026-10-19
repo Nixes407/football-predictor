@@ -14,7 +14,12 @@ from __future__ import annotations
 
 import copy
 import os
-import warnings
+import shutil
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +27,10 @@ import joblib
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from scipy.stats import poisson
 from supabase import create_client
-import subprocess
-import sys
-import threading
 
 try:
     from models.formula_engine import (
@@ -45,12 +48,6 @@ except Exception as exc:
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
-PIPELINE_STEP_TIMEOUT_SECONDS = 7200
-# Increased from 7200 to 21600 seconds (2h -> 6h) for ~15k-18k matches
-# after league expansion PR #78/#80, versus ~7k previously. Apply to every
-# builder entry point; collectors and trainer retain their existing limits.
-BUILDER_TIMEOUT_SECONDS = 21600
-
 # The admin endpoints below import the database layer (and the one-off repair
 # script) from inside the request handler, i.e. by top-level module name.
 # ``database`` and ``scripts.fix_bsa_label`` only resolve while backend/ is on
@@ -60,6 +57,28 @@ BUILDER_TIMEOUT_SECONDS = 21600
 # itself inside the handler; do it once, here, for every endpoint.
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
+
+# Shared bucket manifest — the trainer uploads exactly what this file lists.
+import model_artifacts as artifacts  # noqa: E402  (needs the sys.path above)
+
+# A reload only downloads pre-built files; if another reload is already in
+# flight (e.g. the startup reload racing the GitHub Actions callback) wait this
+# long for it before answering 409. Kept well under the endpoint's 60 s budget.
+RELOAD_LOCK_TIMEOUT_SECONDS = 25
+
+# Training moved to GitHub Actions (7 GB runners). These endpoints are kept
+# only so an old cron/curl target gets an explicit 410 instead of running
+# builder.py/trainer.py on a 512 MB Render instance.
+_PIPELINE_MOVED_RESPONSE = {
+    "error": "training moved to GitHub Actions",
+    "status": "gone",
+    "detail": (
+        "builder.py and trainer.py now run in the daily GitHub Actions "
+        "workflow (.github/workflows/daily_fbref_update.yml). This service "
+        "only serves predictions. Use POST /predict/admin/reload-models to "
+        "re-download the pre-built artifacts from Supabase Storage."
+    ),
+}
 
 # Module-level artifact variables (all start as None)
 _result_model  = None
@@ -80,6 +99,8 @@ _pipeline_running = False
 _pipeline_status  = "idle"
 _pipeline_log     = []
 _pipeline_error = ""
+_last_reload_at = ""
+_reload_lock = threading.Lock()
 
 FEATURE_COLS = [
     # Home form 5
@@ -204,120 +225,104 @@ BLEND_ML_CRNRS      = 0.30   # ML weight for expected home/away corners
 # regardless of formula availability — those overrides live in PRs #72/#73/#74
 
 
-def download_models_from_supabase() -> bool:
-    """
-    Pull the model .joblib files and the shared artifacts from the "models"
-    bucket in Supabase Storage into BACKEND_DIR / "models".
+def _supabase_storage_client():
+    """Return ``(client, error_message)`` for the "models" bucket.
 
-    Credentials come from SUPABASE_URL and SUPABASE_KEY. Returns
-    True only when every file downloaded and wrote successfully —
-    anything else returns False so the caller can fall back to
-    building the models locally. Never raises.
+    The service role key is preferred (uploads need it; downloads work with
+    either the service role or the legacy ``SUPABASE_KEY``). Never raises so
+    the API can keep serving the artifacts already on disk.
     """
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_KEY")
-
+    url, key = artifacts.supabase_credentials()
     if not url or not key:
-        print("[predict] WARNING: SUPABASE_URL and/or SUPABASE_KEY is not set "
-              "— skipping Supabase model download")
-        return False
-
+        return None, artifacts.missing_credentials_message()
     try:
-        client = create_client(url, key)
-    except Exception as exc:
-        print(f"[predict] WARNING: could not create Supabase client: {exc}")
-        return False
+        return create_client(url, key), ""
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
+        return None, f"could not create Supabase client: {exc}"
 
-    models_dir = BACKEND_DIR / "models"
 
-    # (path inside the "models" bucket, where to save it locally)
-    model_files = [
-        (
-            "result_model_v1.joblib",
-            models_dir / "result_model_v1.joblib",
-        ),
-        (
-            "home_goals_v1.joblib",
-            models_dir / "home_goals_v1.joblib",
-        ),
-        (
-            "away_goals_v1.joblib",
-            models_dir / "away_goals_v1.joblib",
-        ),
-        (
-            "home_corners_v1.joblib",
-            models_dir / "home_corners_v1.joblib",
-        ),
-        (
-            "away_corners_v1.joblib",
-            models_dir / "away_corners_v1.joblib",
-        ),
-        (
-            "btts_model_v1.joblib",
-            models_dir / "btts_model_v1.joblib",
-        ),
-        (
-            "over25_model_v1.joblib",
-            models_dir / "over25_model_v1.joblib",
-        ),
-        (
-            "league_encoder.joblib",
-            BACKEND_DIR / "data" / "league_encoder.joblib",
-        ),
-        (
-            "season_encoder.joblib",
-            BACKEND_DIR / "data" / "season_encoder.joblib",
-        ),
-        (
-            "features.csv",
-            BACKEND_DIR / "data" / "processed" / "features.csv",
-        ),
-    ]
+def _download_artifacts_to(staging_dir: Path, client=None) -> list[str]:
+    """Download every artifact into ``staging_dir`` and return what arrived.
 
-    # (path inside the "models" bucket, where to save it locally) — best effort
-    optional_model_files = [
-        (
-            "over95_corners_model_v1.joblib",
-            models_dir / "over95_corners_model_v1.joblib",
-        ),
-        (
-            "result_model_xgb_v1.joblib",
-            models_dir / "result_model_xgb_v1.joblib",
-        ),
-        (
-            "result_model_xgb_v1_label_encoder.joblib",
-            models_dir / "result_model_xgb_v1_label_encoder.joblib",
-        ),
-    ]
+    Nothing outside ``staging_dir`` is touched, so a failure halfway through
+    leaves the artifacts currently served by the API intact. Raises
+    ``RuntimeError`` when a required object is missing or empty; optional
+    objects are logged and skipped.
+    """
+    if client is None:
+        client, error = _supabase_storage_client()
+        if client is None:
+            raise RuntimeError(error)
 
-    for file_name, save_path in model_files:
+    bucket = client.storage.from_(artifacts.MODEL_BUCKET)
+    downloaded: list[str] = []
+
+    for object_name in artifacts.REQUIRED_DOWNLOAD_OBJECTS:
+        data = bucket.download(object_name)
+        if not data:
+            raise RuntimeError(
+                f"Supabase Storage returned an empty file for {object_name}"
+            )
+        target = artifacts.local_path(object_name, staging_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        downloaded.append(object_name)
+        print(f"[predict] Downloaded {object_name} "
+              f"({len(data) / 1024:.0f} KiB)")
+
+    # Optional market models never fail a reload: a model added by a newer
+    # release is not in the bucket until the next training run uploads it, and
+    # the router already degrades to the Poisson figure when its global is None.
+    for object_name in artifacts.OPTIONAL_DOWNLOAD_OBJECTS:
         try:
-            data = client.storage.from_("models").download(file_name)
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            save_path.write_bytes(data)
-            print(f"[predict] Downloaded from Supabase -> models/{file_name}")
-        except Exception as exc:
-            print(f"[predict] WARNING: could not download "
-                  f"{file_name}: {exc}")
-            return False
-
-    # Optional market models are fetched after the core set and never fail the
-    # download: a model added by a newer release is not in the bucket until
-    # the next training run uploads it, and treating that as a missing core
-    # artifact would force a full local rebuild on every such deploy. The
-    # router already degrades to the Poisson figure when the global is None.
-    for file_name, save_path in optional_model_files:
-        try:
-            data = client.storage.from_("models").download(file_name)
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            save_path.write_bytes(data)
-            print(f"[predict] Downloaded from Supabase -> models/{file_name}")
-        except Exception as exc:
-            print(f"[predict] NOTE: optional {file_name} not in Supabase "
+            data = bucket.download(object_name)
+        except Exception as exc:  # noqa: BLE001 - optional by design
+            print(f"[predict] NOTE: optional {object_name} not in Supabase "
                   f"bucket yet ({exc}) — falling back to Poisson")
+            continue
+        if not data:
+            print(f"[predict] NOTE: optional {object_name} is empty in "
+                  f"Supabase — falling back to Poisson")
+            continue
+        target = artifacts.local_path(object_name, staging_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        downloaded.append(object_name)
+        print(f"[predict] Downloaded {object_name} "
+              f"({len(data) / 1024:.0f} KiB)")
 
-    print("Models downloaded from Supabase Storage")
-    return True
+    return downloaded
+
+
+def _install_artifacts(staging_dir: Path, object_names: list[str]) -> None:
+    """Move the staged files into place with an atomic per-file rename."""
+    for object_name in object_names:
+        source = artifacts.local_path(object_name, staging_dir)
+        if not source.exists():
+            continue
+        destination = artifacts.local_path(object_name)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+
+
+def download_models_from_supabase() -> bool:
+    """Download the bucket into the local artifact directories.
+
+    Thin backwards-compatible wrapper around :func:`_download_artifacts_to`
+    plus :func:`_install_artifacts`: returns True when every *required*
+    artifact was staged and installed, False otherwise. Never raises.
+    """
+    staging_dir = Path(tempfile.mkdtemp(prefix=".staging-", dir=BACKEND_DIR))
+    try:
+        downloaded = _download_artifacts_to(staging_dir)
+        _install_artifacts(staging_dir, downloaded)
+        print("[predict] Models downloaded from Supabase Storage")
+        return True
+    except Exception as exc:  # noqa: BLE001 - legacy contract: never raise
+        print(f"[predict] WARNING: model download failed: {exc}")
+        return False
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 def load_artifacts() -> None:
@@ -334,7 +339,8 @@ def load_artifacts() -> None:
     models_dir = BACKEND_DIR / "models"
     data_dir   = BACKEND_DIR / "data"
 
-    artifacts = {
+    # NOTE: not named ``artifacts`` — that is the imported manifest module.
+    artifact_paths = {
         "_result_model":  models_dir / "result_model_v1.joblib",
         "_xgb_result_model": models_dir / "result_model_xgb_v1.joblib",
         "_xgb_label_encoder": models_dir / "result_model_xgb_v1_label_encoder.joblib",
@@ -351,10 +357,14 @@ def load_artifacts() -> None:
         "_le_season":     data_dir   / "season_encoder.joblib",
     }
 
-    for var_name, path in artifacts.items():
+    # Decode everything first, then publish the globals in one dict update.
+    # A reload therefore swaps the whole artifact set at once instead of
+    # exposing a half-new/half-old set while joblib.load works through the
+    # files (and a file that fails to decode keeps its previous object).
+    loaded: dict[str, Any] = {}
+    for var_name, path in artifact_paths.items():
         try:
-            obj = joblib.load(path)
-            globals()[var_name] = obj
+            loaded[var_name] = joblib.load(path)
             print(f"[predict] Loaded {path.name}")
         except FileNotFoundError:
             print(f"[predict] WARNING: {path.name} not found "
@@ -368,7 +378,7 @@ def load_artifacts() -> None:
         df = pd.read_csv(features_path)
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.sort_values("date").reset_index(drop=True)
-        _features_df = df
+        loaded["_features_df"] = df
         print(f"[predict] Loaded features.csv "
               f"({len(df)} rows)")
     except FileNotFoundError:
@@ -376,6 +386,8 @@ def load_artifacts() -> None:
     except Exception as exc:
         print(f"[predict] WARNING: could not load "
               f"features.csv: {exc}")
+
+    globals().update(loaded)
 
 
 def _get_runtime_feature_cols() -> list[str]:
@@ -415,107 +427,166 @@ def _get_runtime_feature_cols() -> list[str]:
     return FEATURE_COLS
 
 
-def auto_start_fast_pipeline() -> None:
-    """
-    Called at startup. Checks Supabase Storage first: a complete
-    set of models there is downloaded and loaded locally, and the
-    pipeline is skipped. Otherwise, if models are not loaded,
-    automatically starts builder + trainer in a
-    background thread. Collector is skipped because
-    data is already in the database.
-    """
-    global _pipeline_running, _pipeline_status, _pipeline_log
+#: Which module global each model artifact populates. Used by
+#: /admin/status, /admin/reload-models and the startup reload so that all
+#: three report the same set of loaded models.
+_ARTIFACT_GLOBALS: dict[str, str] = {
+    "result_model_v1.joblib": "_result_model",
+    "result_model_xgb_v1.joblib": "_xgb_result_model",
+    "result_model_xgb_v1_label_encoder.joblib": "_xgb_label_encoder",
+    "home_goals_v1.joblib": "_home_goals",
+    "away_goals_v1.joblib": "_away_goals",
+    "home_corners_v1.joblib": "_home_corners",
+    "away_corners_v1.joblib": "_away_corners",
+    "btts_model_v1.joblib": "_btts_model",
+    "over25_model_v1.joblib": "_over25_model",
+    "over95_corners_model_v1.joblib": "_over95_corners_model",
+}
 
-    if download_models_from_supabase():
-        load_artifacts()
-        _pipeline_status = "complete"
-        _pipeline_running = False
-        print("[pipeline] Models loaded from Supabase Storage "
-              "— skipping pipeline")
-        return
 
-    if all([
+def _loaded_model_names() -> list[str]:
+    """Return the model artifacts currently loaded into memory."""
+    return [
+        object_name
+        for object_name, global_name in _ARTIFACT_GLOBALS.items()
+        if globals().get(global_name) is not None
+    ]
+
+
+def _models_ready() -> bool:
+    """True when the five core markets can be predicted."""
+    return all([
         (_result_model is not None or _xgb_result_model is not None),
         _home_goals    is not None,
         _away_goals    is not None,
         _home_corners  is not None,
         _away_corners  is not None,
-    ]):
-        print("[pipeline] Models already loaded — skipping auto-start.")
-        return
+    ])
 
-    if _pipeline_running:
-        print("[pipeline] Pipeline already running — skipping auto-start.")
-        return
 
-    print("[pipeline] Models missing at startup — "
-          "auto-starting fast pipeline...")
+class ReloadInProgress(RuntimeError):
+    """Raised when a reload already holds the lock."""
 
-    def _run():
-        global _pipeline_running, _pipeline_status, _pipeline_log
+
+def reload_models_from_supabase() -> dict[str, Any]:
+    """Download the pre-built artifacts and load them into memory.
+
+    This is the ONLY pipeline action allowed on the Render service. It streams
+    files that GitHub Actions already trained — it never runs builder.py,
+    trainer.py or a collector, so it stays fast and flat in memory.
+
+    Downloads are staged in a temporary directory inside ``backend/`` and only
+    moved into place once every required object has arrived, then the artifacts
+    are (re)loaded. A failed reload therefore leaves the previously served
+    models untouched.
+
+    Raises :class:`ReloadInProgress` if another reload holds the lock, and
+    ``RuntimeError``/``Exception`` if the download or load fails.
+    """
+    global _pipeline_running, _pipeline_status, _pipeline_log
+    global _pipeline_error, _last_reload_at
+
+    if not _reload_lock.acquire(timeout=RELOAD_LOCK_TIMEOUT_SECONDS):
+        raise ReloadInProgress(
+            "another reload is already in progress; retry shortly"
+        )
+
+    started = time.monotonic()
+    staging_dir = Path(tempfile.mkdtemp(prefix=".staging-", dir=BACKEND_DIR))
+    try:
         _pipeline_running = True
-        _pipeline_log = ["[AUTO] Starting on startup..."]
-        backend_dir = str(BACKEND_DIR)
-
-        steps = [
-            ("fbref_collector", ["python", "data/fbref_collector.py"]),
-            ("builder",         ["python", "features/builder.py"]),
-            ("trainer",         ["python", "models/trainer.py"]),
+        _pipeline_status = "reloading_models"
+        _pipeline_log = [
+            "[reload] downloading pre-built artifacts from Supabase Storage"
         ]
+        _pipeline_error = ""
+        print("[reload] Downloading pre-built artifacts from Supabase Storage...")
 
-        for name, cmd in steps:
-            _pipeline_status = f"running_{name}"
-            _pipeline_log.append(f"[AUTO] Starting {name}...")
-            print(f"[pipeline][AUTO] Starting {name}...")
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    cwd=backend_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=(BUILDER_TIMEOUT_SECONDS if name == "builder"
-                             else PIPELINE_STEP_TIMEOUT_SECONDS),
-                )
-                if proc.stdout:
-                    print(proc.stdout[-3000:])
-                if proc.stderr:
-                    print(proc.stderr[-1000:])
-                if proc.returncode == 0:
-                    _pipeline_log.append(f"[AUTO] {name} completed OK")
-                    print(f"[pipeline][AUTO] {name} done (rc=0)")
-                else:
-                    global _pipeline_error
-                    _pipeline_error = (
-                        proc.stderr[-2000:] if proc.stderr
-                        else proc.stdout[-2000:] if proc.stdout
-                        else "no output captured"
-                    )
-                    _pipeline_log.append(
-                        f"[AUTO] {name} FAILED rc={proc.returncode}")
-                    print(f"[pipeline][AUTO] {name} FAILED")
-                    print(_pipeline_error)
-                    _pipeline_status = f"failed_{name}"
-                    _pipeline_running = False
-                    return
-            except subprocess.TimeoutExpired:
-                _pipeline_log.append(f"[AUTO] {name} timed out")
-                _pipeline_status = f"timeout_{name}"
-                _pipeline_running = False
-                return
-            except Exception as exc:
-                _pipeline_log.append(f"[AUTO] {name} error: {exc}")
-                _pipeline_status = f"error_{name}"
-                _pipeline_running = False
-                return
-
+        downloaded = _download_artifacts_to(staging_dir)
+        _install_artifacts(staging_dir, downloaded)
         load_artifacts()
-        _pipeline_status = "complete"
-        _pipeline_log.append("[AUTO] Pipeline complete. Artifacts loaded.")
-        print("[pipeline][AUTO] Done. Artifacts reloaded.")
-        _pipeline_running = False
 
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
+        models_loaded = _loaded_model_names()
+        # Every *required* object must have decoded in this run — but the
+        # globals may still hold yesterday's object if a file was unreadable,
+        # so also check the encoders/features explicitly.
+        required_globals = [
+            _ARTIFACT_GLOBALS[name]
+            for name in artifacts.REQUIRED_DOWNLOAD_OBJECTS
+            if name in _ARTIFACT_GLOBALS
+        ]
+        missing = [
+            global_name
+            for global_name in required_globals + ["_le_league", "_le_season"]
+            if globals().get(global_name) is None
+        ]
+        if missing or _features_df is None:
+            raise RuntimeError(
+                "reload incomplete: "
+                f"{', '.join(missing) or 'features.csv'} missing after "
+                f"download (loaded: {models_loaded or 'none'})"
+            )
+
+        elapsed = time.monotonic() - started
+        _pipeline_status = "complete"
+        _last_reload_at = datetime.now(timezone.utc).isoformat()
+        _pipeline_log.append(
+            f"[reload] complete in {elapsed:.1f}s — "
+            f"{len(models_loaded)} models, {len(_features_df)} feature rows"
+        )
+        print(f"[reload] Complete in {elapsed:.1f}s — "
+              f"{len(models_loaded)} models, {len(_features_df)} feature rows")
+
+        return {
+            "features_rows": int(len(_features_df)),
+            "models_loaded": models_loaded,
+            "reload_seconds": round(elapsed, 2),
+            "reloaded_at": _last_reload_at,
+        }
+    except Exception as exc:
+        _pipeline_status = "error_reload"
+        _pipeline_error = str(exc)
+        _pipeline_log.append(f"[reload] FAILED: {exc}")
+        print(f"[reload] FAILED: {exc}")
+        raise
+    finally:
+        _pipeline_running = False
+        _reload_lock.release()
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def startup_reload_models() -> None:
+    """Kick off a background artifact reload at application startup.
+
+    Runs in a daemon thread so a slow render/network does not delay the port
+    bind (Render kills services that take too long to become healthy). It only
+    downloads pre-built artifacts — no builder, trainer or collector code is
+    ever executed here.
+
+    Set ``SKIP_STARTUP_MODEL_RELOAD=1`` to disable it (useful for tests).
+    """
+    if os.environ.get("SKIP_STARTUP_MODEL_RELOAD", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        print("[startup] SKIP_STARTUP_MODEL_RELOAD is set — "
+              "using artifacts already on disk")
+        return
+
+    def _run() -> None:
+        try:
+            reload_models_from_supabase()
+            print("[startup] Models reloaded from Supabase Storage")
+        except ReloadInProgress as exc:
+            print(f"[startup] NOTE: {exc}")
+        except Exception as exc:  # noqa: BLE001 - never crash the app
+            print(f"[startup] WARNING: could not reload models from Supabase "
+                  f"Storage: {exc}. The API will answer 503 for prediction "
+                  f"endpoints until POST /predict/admin/reload-models "
+                  f"succeeds.")
+
+    threading.Thread(
+        target=_run, name="startup-model-reload", daemon=True
+    ).start()
 
 
 # Call once at import time
@@ -1433,212 +1504,90 @@ def diagnostics() -> dict:
     }
 
 
-@router.post("/admin/run-pipeline")
-def run_pipeline(secret: str = "") -> dict:
-    """
-    Trigger the full data pipeline in a background
-    thread so the HTTP request returns immediately.
-    Monitor progress via GET /predict/admin/status
-    """
-    import os
-    global _pipeline_running, _pipeline_status, _pipeline_log
+# --------------------------------------------------------------------------- #
+# Training moved to GitHub Actions — heavy endpoints are permanently gone
+# --------------------------------------------------------------------------- #
+# PRs #78/#80/#81 grew the training set from ~6,776 to 15,000+ rows and the
+# builder no longer fits in Render's 512 MB free tier: the service was OOM-killed
+# mid-pipeline and restarted by Render. builder.py and trainer.py now run in
+# .github/workflows/daily_fbref_update.yml on a 7 GB ubuntu-latest runner.
+#
+# These two routes are kept (instead of deleted) so any leftover cron job, curl
+# script or bookmark gets an explicit 410 Gone instead of a 404, and — most
+# importantly — so nothing can ever spawn the heavy pipeline on Render again.
+@router.post("/admin/run-pipeline", status_code=410)
+def run_pipeline(secret: str = "") -> JSONResponse:  # noqa: ARG001 - legacy arg
+    """Gone: the full pipeline now runs in GitHub Actions."""
+    return JSONResponse(status_code=410, content=_PIPELINE_MOVED_RESPONSE)
 
+
+@router.post("/admin/run-pipeline-fast", status_code=410)
+def run_pipeline_fast(secret: str = "") -> JSONResponse:  # noqa: ARG001 - legacy arg
+    """Gone: FBref + builder + trainer now run in GitHub Actions."""
+    return JSONResponse(status_code=410, content=_PIPELINE_MOVED_RESPONSE)
+
+
+@router.post(
+    "/admin/reload-models",
+    responses={
+        403: {"description": "Invalid or missing PIPELINE_SECRET"},
+        409: {"description": "Another reload is already in progress"},
+        503: {"description": "Download or load failed — previous models stay live"},
+    },
+)
+def reload_models(secret: str = "") -> dict[str, Any]:
+    """Download the pre-built artifacts from Supabase Storage into memory.
+
+    The lightweight half of the daily GitHub Actions handshake: the workflow
+    uploads freshly trained models to the ``models`` bucket, then calls this
+    endpoint. It only downloads files that already exist — it never runs
+    builder, trainer or a collector — so it completes in seconds.
+
+    Requires ``PIPELINE_SECRET`` like the other write endpoints.
+
+    Responses
+    ---------
+    200 ``{"status": "reloaded", "features_rows": N, "models_loaded": [...]}``
+    403 invalid/missing secret
+    409 another reload is in progress (retry shortly)
+    503 the download or the load failed; previously loaded models stay live
+    """
     expected = os.getenv("PIPELINE_SECRET", "")
     if not expected or secret != expected:
         raise HTTPException(
             status_code=403,
-            detail="Invalid or missing secret key."
+            detail="Invalid or missing secret key.",
         )
 
-    if _pipeline_running:
-        return {
-            "status": "already_running",
-            "message": "Pipeline is already running. "
-                       "Check /predict/admin/status for progress."
-        }
-
-    def _run():
-        global _pipeline_running, _pipeline_status, _pipeline_log, _pipeline_error
-        _pipeline_running = True
-        _pipeline_log = []
-        backend_dir = str(BACKEND_DIR)
-
-        steps = [
-            ("collector",       ["python", "data/collector.py"]),
-            ("fbref_collector", ["python", "data/fbref_collector.py"]),
-            ("builder",         ["python", "features/builder.py"]),
-            ("trainer",         ["python", "models/trainer.py"]),
-        ]
-
-        for name, cmd in steps:
-            _pipeline_status = f"running_{name}"
-            _pipeline_log.append(f"Starting {name}...")
-            print(f"[pipeline] Starting {name}...")
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    cwd=backend_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=(BUILDER_TIMEOUT_SECONDS if name == "builder"
-                             else PIPELINE_STEP_TIMEOUT_SECONDS),
-                )
-                if proc.stdout:
-                    print(proc.stdout[-3000:])
-                if proc.stderr:
-                    print(proc.stderr[-1000:])
-                if proc.returncode == 0:
-                    _pipeline_log.append(f"{name} completed OK")
-                    print(f"[pipeline] {name} done (rc=0)")
-                else:
-                    global _pipeline_error
-                    _pipeline_error = (
-                        proc.stderr[-2000:] if proc.stderr
-                        else proc.stdout[-2000:] if proc.stdout
-                        else "no output captured"
-                    )
-                    _pipeline_log.append(
-                        f"{name} FAILED rc={proc.returncode}")
-                    print(f"[pipeline] {name} FAILED")
-                    print(_pipeline_error)
-                    _pipeline_status = f"failed_{name}"
-                    _pipeline_running = False
-                    return
-            except subprocess.TimeoutExpired:
-                _pipeline_log.append(f"{name} timed out")
-                _pipeline_status = f"timeout_{name}"
-                _pipeline_running = False
-                return
-            except Exception as exc:
-                _pipeline_log.append(f"{name} error: {exc}")
-                _pipeline_status = f"error_{name}"
-                _pipeline_running = False
-                return
-
-        load_artifacts()
-        _pipeline_status = "complete"
-        _pipeline_log.append("Pipeline complete. Artifacts loaded.")
-        print("[pipeline] All steps done. Artifacts reloaded.")
-        _pipeline_running = False
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-
-    return {
-        "status": "started",
-        "message": "Pipeline started in background. "
-                   "Poll /predict/admin/status to monitor progress."
-    }
-
-
-@router.post("/admin/run-pipeline-fast")
-def run_pipeline_fast(secret: str = "") -> dict:
-    """
-    Run FBref collector, builder and trainer — skips match collector.
-    Use this when data is already in the database
-    and you just need to regenerate the model files.
-    Builder runtime depends on dataset size; it has a six-hour limit.
-    """
-    import os
-    global _pipeline_running, _pipeline_status, _pipeline_log
-
-    expected = os.getenv("PIPELINE_SECRET", "")
-    if not expected or secret != expected:
+    try:
+        report = reload_models_from_supabase()
+    except ReloadInProgress as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - surfaced to the caller
         raise HTTPException(
-            status_code=403,
-            detail="Invalid or missing secret key."
-        )
+            status_code=503,
+            detail=f"model reload failed: {exc}",
+        ) from exc
 
-    if _pipeline_running:
-        return {
-            "status": "already_running",
-            "message": "Pipeline is already running. "
-                       "Check /predict/admin/status for progress."
-        }
-
-    def _run():
-        global _pipeline_running, _pipeline_status, _pipeline_log
-        _pipeline_running = True
-        _pipeline_log = []
-        backend_dir = str(BACKEND_DIR)
-
-        steps = [
-            ("fbref_collector", ["python", "data/fbref_collector.py"]),
-            ("builder",         ["python", "features/builder.py"]),
-            ("trainer",         ["python", "models/trainer.py"]),
-        ]
-
-        for name, cmd in steps:
-            _pipeline_status = f"running_{name}"
-            _pipeline_log.append(f"Starting {name}...")
-            print(f"[pipeline] Starting {name}...")
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    cwd=backend_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=(BUILDER_TIMEOUT_SECONDS if name == "builder"
-                             else PIPELINE_STEP_TIMEOUT_SECONDS),
-                )
-                if proc.stdout:
-                    print(proc.stdout[-3000:])
-                if proc.stderr:
-                    print(proc.stderr[-1000:])
-                if proc.returncode == 0:
-                    _pipeline_log.append(f"{name} completed OK")
-                    print(f"[pipeline] {name} done (rc=0)")
-                else:
-                    global _pipeline_error
-                    _pipeline_error = (
-                        proc.stderr[-2000:] if proc.stderr
-                        else proc.stdout[-2000:] if proc.stdout
-                        else "no output captured"
-                    )
-                    _pipeline_log.append(
-                        f"{name} FAILED rc={proc.returncode}")
-                    print(f"[pipeline] {name} FAILED")
-                    print(_pipeline_error)
-                    _pipeline_status = f"failed_{name}"
-                    _pipeline_running = False
-                    return
-            except subprocess.TimeoutExpired:
-                _pipeline_log.append(f"{name} timed out")
-                _pipeline_status = f"timeout_{name}"
-                _pipeline_running = False
-                return
-            except Exception as exc:
-                _pipeline_log.append(f"{name} error: {exc}")
-                _pipeline_status = f"error_{name}"
-                _pipeline_running = False
-                return
-
-        load_artifacts()
-        _pipeline_status = "complete"
-        _pipeline_log.append("Fast pipeline complete. Artifacts loaded.")
-        print("[pipeline] Builder + trainer done. Artifacts reloaded.")
-        _pipeline_running = False
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-
-    return {
-        "status": "started",
-        "message": "Fast pipeline started (FBref collector + builder + trainer). "
-                   "Poll /predict/admin/status to monitor progress."
-    }
+    return {"status": "reloaded", **report}
 
 
 @router.get("/admin/status")
 def pipeline_status() -> dict:
     """
-    Check pipeline progress and loaded artifacts.
+    Check which artifacts are loaded and when they were last refreshed.
+
+    ``pipeline_status`` is ``complete`` once a reload has loaded a full set of
+    models. It never reports a running builder/trainer: training happens in
+    GitHub Actions, and this service only reloads pre-built artifacts.
     """
     return {
+        "pipeline_mode":    "github_actions",
         "pipeline_running": _pipeline_running,
         "pipeline_status":  _pipeline_status,
         "pipeline_log":     _pipeline_log[-10:],
         "pipeline_error":   _pipeline_error,
+        "last_reload_at":   _last_reload_at,
         "result_model":  _result_model  is not None,
         "xgb_result_model": _xgb_result_model is not None,
         "home_goals":    _home_goals    is not None,
@@ -1652,13 +1601,8 @@ def pipeline_status() -> dict:
         "le_season":     _le_season     is not None,
         "features_df":   _features_df   is not None,
         "features_rows": len(_features_df) if _features_df is not None else 0,
-        "ready": all([
-            (_result_model is not None or _xgb_result_model is not None),
-            _home_goals   is not None,
-            _away_goals   is not None,
-            _home_corners is not None,
-            _away_corners is not None,
-        ]),
+        "models_loaded": _loaded_model_names(),
+        "ready": _models_ready(),
         "blend_weights": {
             "1x2": {"formula": BLEND_FORMULA_1X2, "ml": BLEND_ML_1X2},
             "goals": {"formula": BLEND_FORMULA_GOALS, "ml": BLEND_ML_GOALS},
