@@ -1509,7 +1509,14 @@ def run_pipeline_fast(secret: str = "") -> JSONResponse:  # noqa: ARG001 - legac
     return JSONResponse(status_code=410, content=_PIPELINE_MOVED_RESPONSE)
 
 
-@router.post("/admin/reload-models")
+@router.post(
+    "/admin/reload-models",
+    responses={
+        403: {"description": "Invalid or missing PIPELINE_SECRET"},
+        409: {"description": "Another reload is already in progress"},
+        503: {"description": "Download or load failed — previous models stay live"},
+    },
+)
 def reload_models(secret: str = "") -> dict[str, Any]:
     """Download the pre-built artifacts from Supabase Storage into memory.
 
