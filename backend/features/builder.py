@@ -351,15 +351,18 @@ def compute_team_rolling_form(
     draws  = int((res == "D").sum())
     losses = int((res == "L").sum())
     points = wins * 3 + draws
+    # Reuse each goal reduction within this call (six calls per match).
+    gf_total = gf.sum()
+    ga_total = ga.sum()
 
     return {
         "wins":     wins,
         "draws":    draws,
         "losses":   losses,
         "points":   points,
-        "gf":       float(gf.sum()),
-        "ga":       float(ga.sum()),
-        "gd":       float(gf.sum() - ga.sum()),
+        "gf":       float(gf_total),
+        "ga":       float(ga_total),
+        "gd":       float(gf_total - ga_total),
         "shots":    float(shots.sum()),
         "shots_ot": float(shots_ot.sum()),
         "corners":  float(corners.sum()),
