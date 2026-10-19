@@ -147,8 +147,14 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 # 3. rebuild features and retrain + upload all 9 models to Supabase Storage:
 .venv/bin/python -c "from features.builder import build_and_save_features as b; b('data/processed/features.csv')"
 .venv/bin/python models/trainer.py
-# (or POST /predict/admin/run-pipeline on the deployed backend)
 ```
+
+`models/trainer.py` uploads the artifacts to Supabase Storage by default. On the
+deployed backend, reload them with
+`POST /predict/admin/reload-models?secret=$PIPELINE_SECRET` — the legacy
+`run-pipeline` / `run-pipeline-fast` endpoints now return **410 Gone** because
+training moved to GitHub Actions (the 512 MB Render instance OOMs on this
+dataset).
 
 ## Known limitations / follow-ups
 
