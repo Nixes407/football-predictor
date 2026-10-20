@@ -192,8 +192,6 @@ class FBrefFeatureCutoffTests(unittest.TestCase):
         db.close.assert_called_once()
 
     def test_saved_csv_is_safe_and_has_the_trainers_full_feature_schema(self):
-        import ast
-
         match = self.matches().assign(
             result="H", home_goals=2, away_goals=1,
             home_shots=10, away_shots=8, home_shots_ot=4, away_shots_ot=3,
@@ -208,13 +206,10 @@ class FBrefFeatureCutoffTests(unittest.TestCase):
             path = str(Path(directory) / "features.csv")
             result = builder.build_and_save_features(path)
             saved = pd.read_csv(path)
-        # Read the existing trainer declaration without importing it or training.
-        trainer = ast.parse((Path(builder.__file__).parents[1] / "models/trainer.py").read_text())
-        feature_cols = next(
-            ast.literal_eval(node.value) for node in trainer.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == "FEATURE_COLS" for t in node.targets)
-        )
+        # The single source of truth the trainer and the API both import.
+        from features.feature_columns import FEATURE_COLS
+
+        feature_cols = FEATURE_COLS
         self.assertEqual(len(feature_cols), 108)
         self.assertTrue(set(feature_cols).issubset(saved.columns))
         self.assert_stats(result, "home", 0.0)

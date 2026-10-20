@@ -212,6 +212,16 @@ jobs:
           # floor, not a quality target).
           python scripts/check_features.py --min-rows 1000
 
+      # Fails the run BEFORE a 9-model training pass if the feature code that
+      # built features.csv and the inference path in routers/predict.py have
+      # drifted apart. The models would otherwise train happily and then score
+      # live fixtures from different numbers, with no error anywhere.
+      - name: "[5/5] Feature parity regression tests"
+        working-directory: backend
+        run: |
+          echo "==> Checking training/inference feature parity..."
+          python -m unittest tests.test_feature_parity -v
+
       - name: "[5/5] Train + upload models (trainer.py)"
         working-directory: backend
         run: |

@@ -20,6 +20,11 @@ from pathlib import Path
 
 import pandas as pd
 
+# backend/ must be importable when this file is run as ``scripts/check_features.py``.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from features.feature_columns import MATCH_HISTORY_COLUMNS  # noqa: E402
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -57,6 +62,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[check] date range  : {dates.min()} -> {dates.max()}")
     if "league" in df.columns:
         print(f"[check] leagues     : {df['league'].nunique()} distinct")
+
+    # The API replays this CSV's rolling windows at inference time; without
+    # the raw match columns the shot-derived features cannot be rebuilt and
+    # fall back to the team's last stored row (see features/inference.py).
+    missing_history = [c for c in MATCH_HISTORY_COLUMNS if c not in df.columns]
+    if missing_history:
+        print(f"[check] WARNING: features.csv has no raw match history "
+              f"({missing_history}); inference will fall back to stored "
+              f"shot values until the next builder run")
+    else:
+        print("[check] match history: all raw columns present")
 
     fbref_cols = [c for c in df.columns if "fbref" in c]
     if fbref_cols:

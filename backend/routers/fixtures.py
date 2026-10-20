@@ -63,10 +63,12 @@ _FOTMOB_NAMES_FILE = (
     Path(__file__).resolve().parent.parent / "data" / "fotmob_team_names.json"
 )
 
-# Season used when a stored fixture carries none (matches the default of
-# predict.MatchRequest). The formula engine resolves it to the newest season
-# the league actually has data for.
-DEFAULT_SEASON = "2024-2025"
+# Season used when a stored fixture carries none (same rule as
+# predict.MatchRequest). It must be the CURRENT season: the model encodes the
+# season, so a stale fixed label fed the classifier a value that described a
+# different year. The formula engine resolves it to the newest season the
+# league actually has data for.
+DEFAULT_SEASON = predict_module.feature_inference.current_season_label()
 
 UCL_LEAGUE = "UEFA-Champions League"
 
@@ -481,6 +483,8 @@ def _compute_prediction_values(
         season_encoded,
         features_df,
         runtime_cols,
+        league=league,
+        season=season,
     )
     X = pd.DataFrame([vector])[runtime_cols]
 
