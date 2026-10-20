@@ -98,7 +98,7 @@ if str(_BACKEND) not in sys.path:
 
 from database import (
     SessionLocal, TeamSeasonStats, PlayerSeasonStats,
-    ensure_team_corners_column,
+    cleanup_non_team_rows, ensure_team_corners_column,
 )
 from sqlalchemy import and_
 
@@ -308,14 +308,14 @@ DEEP_STAT_QUERIES = {
     ],
     "corners": [
         {"stat": "corner_taken_team", "type": "teams"},
-        {"stat": "corner_taken", "teamOrPlayer": "team"},
         {"stat": "corners_team", "type": "teams"},
+        {"stat": "corner_taken", "teamOrPlayer": "team"},
         {"stat": "corners", "teamOrPlayer": "team"},
     ],
     "crosses": [
         {"stat": "accurate_cross_team", "type": "teams"},
-        {"stat": "accurate_cross", "teamOrPlayer": "team"},
         {"stat": "crosses_team", "type": "teams"},
+        {"stat": "accurate_cross", "teamOrPlayer": "team"},
         {"stat": "crosses", "teamOrPlayer": "team"},
     ],
     "touchesOppBox": [
@@ -324,8 +324,8 @@ DEEP_STAT_QUERIES = {
     ],
     "shotsTotal": [
         {"stat": "total_scoring_att_team", "type": "teams"},
-        {"stat": "total_scoring_att", "teamOrPlayer": "team"},
         {"stat": "shots_team", "type": "teams"},
+        {"stat": "total_scoring_att", "teamOrPlayer": "team"},
         {"stat": "shots", "teamOrPlayer": "team"},
     ],
 }
@@ -522,8 +522,48 @@ def _match_season(seasons: list, season: str):
     return None
 
 
+def _is_player_leaderboard_row(row: dict) -> bool:
+    """True when a deep-stats row describes a player rather than a club.
+
+    FotMob's ``/api/data/leagueseasondeepstats`` ignores ``teamOrPlayer=team``
+    when the ``stat`` parameter is a bare player stat name (e.g.
+    ``total_scoring_att``, ``accurate_cross``, ``expected_goals``, ``goals``)
+    and returns the *player* leaderboard, where ``name`` is the player and
+    ``teamName``/``teamId`` is their club. Rejecting those rows prevents
+    player names from polluting ``team_season_stats``.
+    """
+    if not isinstance(row, dict):
+        return False
+    if any(k in row for k in (
+        "playerName", "player_name", "minutesPlayed", "minutes_played",
+        "position", "positionId",
+    )):
+        return True
+    name = (
+        row.get("name")
+        or row.get("ParticipantName")
+        or row.get("participant_name")
+    )
+    team_name = (
+        row.get("teamName")
+        or row.get("team_name")
+        or row.get("ParticipantTeam")
+    )
+    if isinstance(name, str) and isinstance(team_name, str):
+        if name.strip() and team_name.strip():
+            if _norm_team(name) != _norm_team(team_name):
+                return True
+    row_id = _coerce_team_id(row.get("id"))
+    team_id = _coerce_team_id(row.get("teamId") or row.get("team_id"))
+    if row_id is not None and team_id is not None and row_id != team_id:
+        return True
+    return False
+
+
 def _row_team(row: dict) -> str | None:
     """Team name from a deep-stats row, tolerating alternative layouts."""
+    if _is_player_leaderboard_row(row):
+        return None
     for key in ("name", "teamName", "ParticipantName", "participant_name", "team_name"):
         value = row.get(key)
         if isinstance(value, str) and value.strip():
@@ -992,7 +1032,24 @@ def _player_attrs(entry: dict) -> dict:
 
 
 def _merge_teams(stats: dict, table: dict) -> dict:
-    """Deep-stats entries keyed by team, with standings-only teams appended."""
+    """Deep-stats entries keyed by team, with standings-only teams appended.
+
+    When the authoritative league table is available, any deep-stats key not
+    in ``table`` (e.g. a player name that leaked from a fallback endpoint)
+    is dropped so ``team_season_stats`` only ever receives actual clubs in
+    that league and season.
+    """
+    if table:
+        table_by_norm = {_norm_team(name): name for name in table}
+        teams: dict = {}
+        for name, entry in stats.items():
+            canonical = table_by_norm.get(_norm_team(name))
+            if canonical is not None:
+                teams[canonical] = entry
+        for name in table:
+            if name not in teams:
+                teams[name] = {}
+        return teams
     teams = dict(stats)
     known = {_norm_team(name) for name in teams}
     for name in table:
@@ -1308,12 +1365,22 @@ class _FotMobClient:
             rows = None
             used = None
             for query in self._ordered_queries(queries):
-                payload, rows = self._deep_fetch(
+                payload, candidate_rows = self._deep_fetch(
                     league_id, season_param, query, country,
                 )
-                if rows:
-                    used = query
-                    break
+                if not candidate_rows:
+                    continue
+                # Reject player leaderboards returned by FotMob when a legacy
+                # teamOrPlayer=team fallback uses a bare player stat name.
+                if any(
+                    _is_player_leaderboard_row(r)
+                    for r in candidate_rows
+                    if isinstance(r, dict)
+                ):
+                    continue
+                rows = candidate_rows
+                used = query
+                break
             if not rows:
                 print(f"[fotmob] WARNING: no {logical} stats for "
                       f"league {league_id} {season}")
@@ -1321,7 +1388,7 @@ class _FotMobClient:
                     print(f"[fotmob] {logical} rows fetched: 0; merged teams: 0")
                 continue
             style = {k: v for k, v in used.items() if k != "stat"}
-            if self._deep_style != style:
+            if style.get("type") == "teams" and self._deep_style != style:
                 self._deep_style = style
                 print(f"[fotmob] Deep-stats params that worked: {style}")
             if league_id not in self._team_statslist_logged and payload is not None:
@@ -1868,7 +1935,8 @@ def collect_team_stats(client: _FotMobClient | None = None) -> int:
     if not ensure_team_corners_column():
         raise RuntimeError("team_season_stats.misc_corners is not ready")
 
-    # Clean up potentially corrupted Belgian data
+    # Clean up potentially corrupted Belgian data and any non-team/player rows
+    cleanup_non_team_rows()
     db_clean = SessionLocal()
     try:
         deleted = db_clean.query(

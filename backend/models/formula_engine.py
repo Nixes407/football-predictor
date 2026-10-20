@@ -696,6 +696,8 @@ def _load_season_stats(
             TeamSeasonStats.season == season,
         )).first()
     )
+    if exact is not None and not _is_real_team_row(exact):
+        exact = None
 
     target_key = _dedup_team_key(team)
     variants = [
@@ -703,7 +705,7 @@ def _load_season_stats(
             TeamSeasonStats.league == league,
             TeamSeasonStats.season == season,
         )).all()
-        if _dedup_team_key(r.team) == target_key
+        if _is_real_team_row(r) and _dedup_team_key(r.team) == target_key
     ]
 
     rows = ([exact] if exact is not None else []) + [
@@ -890,19 +892,21 @@ def load_team_stats(
             query = query.order_by(
                 TeamSeasonStats.season.desc())
 
-        # Prefer most recent season with data
+        # Prefer most recent season with data when no season was specified.
         PREFERRED_SEASONS = [
             "2026-2027", "2025-2026", "2024-2025",
             "2026", "2025", "2024",
         ]
         row = None
         if season:
-            row = query.filter(
+            candidate = query.filter(
                 TeamSeasonStats.season == season
             ).first()
-        if row is None:
+            if candidate is not None and _is_real_team_row(candidate):
+                row = candidate
+        else:
             for preferred in PREFERRED_SEASONS:
-                row = (
+                candidate = (
                     db.query(TeamSeasonStats)
                     .filter(and_(
                         TeamSeasonStats.team   == team,
@@ -910,14 +914,19 @@ def load_team_stats(
                         TeamSeasonStats.season == preferred,
                     )).first()
                 )
-                if row is not None:
+                if candidate is not None and _is_real_team_row(candidate):
+                    row = candidate
                     break
-        if row is None:
-            row = query.first()
+            if row is None:
+                for candidate in query.all():
+                    if _is_real_team_row(candidate):
+                        row = candidate
+                        break
 
         # Also check for a duplicate row under a provider-variant name
-        # (e.g. Understat "Wolverhampton Wanderers" vs API-Football "Wolves")
-        # so neither xG nor standings columns are missed.
+        # (e.g. Understat "Wolverhampton Wanderers" vs API-Football "Wolves",
+        # or caller shorthand "Leeds" vs FotMob "Leeds United") so neither
+        # xG nor standings columns are missed.
         target_key = _dedup_team_key(team)
         # Variant-name rows are scoped to the season that was just
         # resolved (or to the requested season when nothing was found).
@@ -935,10 +944,40 @@ def load_team_stats(
             league_query = league_query.order_by(
                 TeamSeasonStats.season.desc()
             )
-        matching_rows = [
+        season_candidates = [
             r for r in league_query.all()
+            if _is_real_team_row(r)
+        ]
+        matching_rows = [
+            r for r in season_candidates
             if _dedup_team_key(r.team) == target_key
         ]
+
+        # If a caller passed a protected city stem alone (e.g. "Sheffield"
+        # for "Sheffield United"), _dedup_team_key keeps "sheffield united"
+        # and "sheffield wednesday" distinct so both clubs stay separate in
+        # league_teams. Resolve the bare stem to a single club here without
+        # merging the two rivals.
+        if row is None and not matching_rows and target_key:
+            prefix = f"{target_key} "
+            stem_matches = [
+                r for r in season_candidates
+                if _dedup_team_key(r.team).startswith(prefix)
+            ]
+            if stem_matches:
+                preferred_key = f"{target_key} united"
+                stem_keys = [
+                    _dedup_team_key(r.team) for r in stem_matches
+                ]
+                chosen_key = (
+                    preferred_key
+                    if preferred_key in stem_keys
+                    else stem_keys[0]
+                )
+                matching_rows = [
+                    r for r in stem_matches
+                    if _dedup_team_key(r.team) == chosen_key
+                ]
 
         # No exact-name row and no season to pin the variant rows to:
         # keep only the newest season the variant name appears in, so
@@ -953,15 +992,18 @@ def load_team_stats(
         if row is None and not matching_rows:
             return None
 
-        stats = _row_to_stats_dict(row if row is not None else matching_rows[0])
+        primary = row if row is not None else matching_rows[0]
+        stats = _row_to_stats_dict(primary)
         for extra in matching_rows:
-            if row is not None and extra.id == row.id:
+            if extra.id == primary.id:
                 continue
             stats = _merge_stat_dicts(stats, _row_to_stats_dict(extra))
         stats["games"] = games_played(stats)
         # Early in the season, lean on last season so one thin row does not
         # carry the whole prediction (see _blend_with_previous_season).
-        stats = _blend_with_previous_season(db, team, league, stats)
+        stats = _blend_with_previous_season(
+            db, primary.team or team, league, stats
+        )
         return stats
 
     except Exception as exc:
@@ -1036,6 +1078,27 @@ _MEASURED_TEAM_COLUMNS = (
     "misc_crs", "pos_poss", "pos_touch_att3rd",
 )
 
+# Columns that only a genuine club row ever receives. FotMob's legacy
+# ``teamOrPlayer="team"`` fallback on ``/api/data/leagueseasondeepstats``
+# returns *player* leaderboards for bare stat names (``total_scoring_att``,
+# ``accurate_cross``, ``touches_in_opp_box``, ``corner_taken``, ...), which
+# leaked hundreds of player rows per league/season into ``team_season_stats``
+# (e.g. 330 players + 20 clubs = 350 rows in ENG-Premier League 2026-2027,
+# 466 players + 24 clubs = 490 rows in ENG-Championship 2026-2027). Those
+# leaked player rows only carry individual leaderboard counters (``sh_shots``,
+# ``misc_crs``, ``sh_xg``, ``sh_sot``, ``sh_goals``, ``gk_saves``, ...) and
+# never have league-table columns (``gk_ga``, ``gk_w``, ``gk_d``, ``gk_l``),
+# team possession (``pos_poss``), or team-only FBref/Understat/StatsBomb rate
+# columns. Requiring at least one team-identity column alongside a measured
+# stat column rejects both empty standings shells and leaked player rows.
+_TEAM_IDENTITY_COLUMNS = (
+    "pos_poss",
+    "gk_ga", "gk_ga90", "gk_w", "gk_d", "gk_l",
+    "sh_npxg", "sh_sh_per90", "sh_sot_per90",
+    "ps_prgp", "pos_prgc", "gsc_gca", "gsc_gca90",
+    "def_press", "def_tkl_int", "pos_touch_att3rd",
+)
+
 # Most clubs a single top-flight season can hold — the expanded training set
 # tops out at 24 (ENG-Championship). A larger count means team_season_stats
 # holds rows that are not that league's clubs for that season, so the
@@ -1048,16 +1111,24 @@ def _is_real_team_row(row) -> bool:
     Whether one ``team_season_stats`` row really describes a club's season.
 
     Collectors upsert a row as soon as they see a team, so the table also
-    holds empty shells and artefacts whose "team" is a numeric id. Counting
-    those inflates ``league_teams`` and drags the league means towards the
-    neutral defaults, so they are dropped here.
+    holds empty shells, numeric team-id artefacts, and player leaderboard
+    rows leaked by FotMob's ``teamOrPlayer="team"`` fallback. Counting
+    those inflates ``league_teams`` (e.g. 350 in Premier League, 490 in
+    Championship) and corrupts league means, so a row must have both a
+    measured stat column and a team-identity column.
     """
     name = str(getattr(row, "team", "") or "").strip()
     if not name or not any(ch.isalpha() for ch in name):
         return False
-    return any(
+    has_measured = any(
         getattr(row, column, None) is not None
         for column in _MEASURED_TEAM_COLUMNS
+    )
+    if not has_measured:
+        return False
+    return any(
+        getattr(row, column, None) is not None
+        for column in _TEAM_IDENTITY_COLUMNS
     )
 
 
@@ -1068,14 +1139,21 @@ def _league_season_rows(
     """
     Every team row for exactly one league and one season.
 
+    This is the active code path used by :func:`load_league_averages` and
+    :func:`compute_league_baselines` (called from :func:`_predict_match`) to
+    compute ``league_teams``, ``ratings.league.teams``, ``goals_per_game``,
+    ``mean_attack``, ``mean_defence``, ``corner_scale``, ``league_avg_xg``
+    and ``league_avg_sot``.
+
     Both halves of the scope are applied together, and a missing season is
     resolved from the league rather than dropped: filtering on the league
     alone aggregates every campaign on file plus every club that ever
     played in it, which is how a 20-club league could be reported as
     hundreds of teams.
 
-    Rows are deduplicated by club (:func:`_dedup_team_key`) after the
-    unusable ones are dropped, so one club stored under two provider
+    Rows are filtered with :func:`_is_real_team_row` (dropping both empty
+    shells and leaked FotMob player rows) and deduplicated by club
+    (:func:`_dedup_team_key`), so one club stored under two provider
     spellings is still one team. Returns ``(rows, season_used)``; ``rows``
     is empty when the league has no rows for that season, or when no
     session can be opened.
@@ -2701,12 +2779,15 @@ def _predict_match(
 
     # Player data: one query per team, reused for squad quality and for
     # matching the injury list against the output those players were
-    # actually contributing.
-    home_squad = load_squad_players(home_team, league, season)
-    away_squad = load_squad_players(away_team, league, season)
+    # actually contributing. Use the resolved club name from the loaded
+    # team row when the caller passed a shorthand (e.g. "Leeds" -> "Leeds United").
+    home_team_key = home_raw.get("team") or home_team
+    away_team_key = away_raw.get("team") or away_team
+    home_squad = load_squad_players(home_team_key, league, season)
+    away_squad = load_squad_players(away_team_key, league, season)
 
-    home_players = load_key_players(home_team, league, season)
-    away_players = load_key_players(away_team, league, season)
+    home_players = load_key_players(home_team_key, league, season)
+    away_players = load_key_players(away_team_key, league, season)
 
     # Compute ratings
     home_attack  = compute_attack_rating(
