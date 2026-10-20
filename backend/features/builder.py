@@ -20,21 +20,25 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from database import session_scope
 from database import SessionLocal, FBrefTeamStats
 
+# The model input columns live in ONE module, shared with the trainer and the
+# API. ``FBREF_STAT_COLUMNS`` is re-exported here because the FBref join (and
+# its tests) is defined in terms of it.
+try:  # imported as ``features.builder`` (trainer, API, tests)
+    from features.feature_columns import (  # noqa: F401 - re-exported
+        FBREF_STAT_COLUMNS,
+        MATCH_HISTORY_ALIASES,
+        MATCH_HISTORY_COLUMNS,
+    )
+except ImportError:  # pragma: no cover - ``python features/builder.py``
+    from feature_columns import (  # type: ignore[no-redef]
+        FBREF_STAT_COLUMNS,
+        MATCH_HISTORY_ALIASES,
+        MATCH_HISTORY_COLUMNS,
+    )
+
 
 # Key columns that identify one team's season in fbref_team_stats.
 FBREF_KEY_COLUMNS = ["team", "league", "season"]
-
-# Stat columns read from fbref_team_stats (keys excluded).
-FBREF_STAT_COLUMNS = [
-    "games",
-    "shots", "shots_on_target", "shot_accuracy",
-    "goals_per_shot", "goals_per_sot",
-    "yellow_cards", "red_cards", "fouls_committed", "fouls_drawn",
-    "offsides", "crosses", "interceptions", "tackles_won",
-    "pens_won", "pens_conceded",
-    "sota", "goals_against", "saves", "save_pct",
-    "clean_sheets", "pk_faced", "pk_saved",
-]
 
 # Collection metadata is loaded for the availability cutoff, never as a feature.
 FBREF_COLUMNS = FBREF_KEY_COLUMNS + FBREF_STAT_COLUMNS + ["updated_at"]
@@ -403,19 +407,68 @@ def compute_h2h(
     }
 
 
+def get_latest_elo_before(
+    team: str,
+    before_date: pd.Timestamp,
+    raise_on_error: bool = False,
+) -> float | None:
+    """Latest EloRating for ``team`` dated strictly before ``before_date``.
+
+    Direct database read, used at inference time to resolve the two ratings a
+    live fixture needs. The features CSV only stores each team's *pre-match*
+    rating, so reconstructing Elo from it would systematically score a team
+    with the rating it held one match earlier. ``None`` means "no rating
+    known"; the caller then falls back to the reconstructed history and
+    finally to 1500. A database error also returns None unless
+    ``raise_on_error`` is set, which lets the API tell the two apart.
+    """
+    try:
+        with session_scope() as session:
+            row = session.execute(
+                text(
+                    "SELECT elo FROM elo_ratings "
+                    "WHERE team = :team AND date < :date "
+                    "ORDER BY date DESC LIMIT 1"
+                ),
+                {"team": team, "date": pd.Timestamp(before_date).date()},
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001 - caller falls back
+        if raise_on_error:
+            raise
+        print(f"[builder] WARNING: could not read Elo for {team}: {exc}")
+        return None
+    if row is None or row[0] is None:
+        return None
+    try:
+        return float(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
 def compute_elo_features(
     elo_df: pd.DataFrame,
     home_team: str,
     away_team: str,
     before_date: pd.Timestamp,
+    elo_lookup=None,
 ) -> dict:
     """
     Returns home_elo, away_elo and elo_difference.
-    Falls back to 1500.0 (global Elo average) if a
-    team has no rating history.
+
+    ``elo_lookup(team, before_date)`` optionally resolves a rating from the
+    authoritative source (``elo_ratings``); the reconstructed ``elo_df`` is
+    used when it returns None. Falls back to 1500.0 (global Elo average) if a
+    team has no rating history at all.
     """
-    home_elo = get_pre_match_elo(elo_df, home_team, before_date)
-    away_elo = get_pre_match_elo(elo_df, away_team, before_date)
+    def resolve(team: str) -> float | None:
+        if elo_lookup is not None:
+            value = elo_lookup(team, before_date)
+            if value is not None:
+                return value
+        return get_pre_match_elo(elo_df, team, before_date)
+
+    home_elo = resolve(home_team)
+    away_elo = resolve(away_team)
     home_elo = home_elo if home_elo is not None else 1500.0
     away_elo = away_elo if away_elo is not None else 1500.0
 
@@ -642,19 +695,234 @@ def over95_corners_target(row: pd.Series) -> int | None:
     return 1 if (home_c + away_c) >= OVER95_CORNERS_THRESHOLD else 0
 
 
+#: Number of match-derived features :func:`compute_match_features` returns
+#: (the 60 shared with FEATURE_COLS plus the 16 specialist-classifier rates).
+MATCH_FEATURE_COUNT = 76
+
+
+def compute_match_features(
+    df: pd.DataFrame,
+    elo_df: pd.DataFrame,
+    home_team: str,
+    away_team: str,
+    before_date: pd.Timestamp,
+    elo_lookup=None,
+) -> dict[str, float]:
+    """Every rolling-form / Elo / H2H feature for one fixture.
+
+    THE definition of those columns. ``build_features`` calls it once per
+    training row and ``features/inference.py`` calls it once per live fixture,
+    so training and inference share a single implementation and cannot drift.
+
+    Every window and H2H lookup uses matches strictly before ``before_date``.
+    Missing history is 0.0 (never NaN), matching what the models trained on.
+    """
+    hf5  = compute_team_rolling_form(
+        df, home_team, before_date, window=5,  venue="all")
+    hf10 = compute_team_rolling_form(
+        df, home_team, before_date, window=10, venue="all")
+    hh5  = compute_team_rolling_form(
+        df, home_team, before_date, window=5,  venue="home")
+    af5  = compute_team_rolling_form(
+        df, away_team, before_date, window=5,  venue="all")
+    af10 = compute_team_rolling_form(
+        df, away_team, before_date, window=10, venue="all")
+    aa5  = compute_team_rolling_form(
+        df, away_team, before_date, window=5,  venue="away")
+    h2h  = compute_h2h(df, home_team, away_team, before_date)
+    elo  = compute_elo_features(
+        elo_df, home_team, away_team, before_date, elo_lookup=elo_lookup)
+    home_btts = compute_btts_rolling(
+        df, home_team, before_date, window=5, venue="home")
+    away_btts = compute_btts_rolling(
+        df, away_team, before_date, window=5, venue="away")
+    home_o25 = compute_over25_rolling(
+        df, home_team, before_date, window=5, venue="home")
+    away_o25 = compute_over25_rolling(
+        df, away_team, before_date, window=5, venue="away")
+    home_c5 = compute_corners_rolling(
+        df, home_team, before_date, window=5, venue="home")
+    away_c5 = compute_corners_rolling(
+        df, away_team, before_date, window=5, venue="away")
+
+    feat = {
+        # Home form 5
+        "home_form_wins_5":      hf5["wins"],
+        "home_form_draws_5":     hf5["draws"],
+        "home_form_losses_5":    hf5["losses"],
+        "home_form_points_5":    hf5["points"],
+        "home_form_gf_5":        hf5["gf"],
+        "home_form_ga_5":        hf5["ga"],
+        "home_form_gd_5":        hf5["gd"],
+        "home_form_shots_5":     hf5["shots"],
+        "home_form_shots_ot_5":  hf5["shots_ot"],
+        "home_form_corners_5":   hf5["corners"],
+
+        # Home form 10
+        "home_form_wins_10":     hf10["wins"],
+        "home_form_draws_10":    hf10["draws"],
+        "home_form_losses_10":   hf10["losses"],
+        "home_form_points_10":   hf10["points"],
+        "home_form_gf_10":       hf10["gf"],
+        "home_form_ga_10":       hf10["ga"],
+        "home_form_gd_10":       hf10["gd"],
+
+        # Home at home 5
+        "home_home_wins_5":      hh5["wins"],
+        "home_home_draws_5":     hh5["draws"],
+        "home_home_losses_5":    hh5["losses"],
+        "home_home_points_5":    hh5["points"],
+        "home_home_gf_5":        hh5["gf"],
+        "home_home_ga_5":        hh5["ga"],
+        "home_home_gd_5":        hh5["gd"],
+        "home_home_shots_5":     hh5["shots"],
+        "home_home_corners_5":   hh5["corners"],
+
+        # Away form 5
+        "away_form_wins_5":      af5["wins"],
+        "away_form_draws_5":     af5["draws"],
+        "away_form_losses_5":    af5["losses"],
+        "away_form_points_5":    af5["points"],
+        "away_form_gf_5":        af5["gf"],
+        "away_form_ga_5":        af5["ga"],
+        "away_form_gd_5":        af5["gd"],
+        "away_form_shots_5":     af5["shots"],
+        "away_form_shots_ot_5":  af5["shots_ot"],
+        "away_form_corners_5":   af5["corners"],
+
+        # Away form 10
+        "away_form_wins_10":     af10["wins"],
+        "away_form_draws_10":    af10["draws"],
+        "away_form_losses_10":   af10["losses"],
+        "away_form_points_10":   af10["points"],
+        "away_form_gf_10":       af10["gf"],
+        "away_form_ga_10":       af10["ga"],
+        "away_form_gd_10":       af10["gd"],
+
+        # Away at away 5
+        "away_away_wins_5":      aa5["wins"],
+        "away_away_draws_5":     aa5["draws"],
+        "away_away_losses_5":    aa5["losses"],
+        "away_away_points_5":    aa5["points"],
+        "away_away_gf_5":        aa5["gf"],
+        "away_away_ga_5":        aa5["ga"],
+        "away_away_gd_5":        aa5["gd"],
+        "away_away_shots_5":     aa5["shots"],
+        "away_away_corners_5":   aa5["corners"],
+
+        # Elo
+        "home_elo":              elo["home_elo"],
+        "away_elo":              elo["away_elo"],
+        "elo_difference":        elo["elo_difference"],
+
+        # BTTS-specific rolling rates
+        "home_btts_rate_5":      home_btts["btts_rate"],
+        "away_btts_rate_5":      away_btts["btts_rate"],
+        "home_cs_rate_5":        home_btts["cs_rate"],
+        "away_cs_rate_5":        away_btts["cs_rate"],
+        "home_scored_rate_5":    home_btts["scored_rate"],
+        "away_scored_rate_5":    away_btts["scored_rate"],
+
+        # Over-2.5-specific rolling rates
+        "home_over25_rate_5":        home_o25["over25_rate"],
+        "away_over25_rate_5":        away_o25["over25_rate"],
+        "home_high_scoring_rate_5":  home_o25["high_scoring_rate"],
+        "away_high_scoring_rate_5":  away_o25["high_scoring_rate"],
+
+        # Corner-specific rolling rates (venue-aware), for the Over 9.5
+        # corners classifier only — deliberately NOT part of FEATURE_COLS.
+        "home_corners_for_pg_5":      home_c5["corners_for_pg"],
+        "away_corners_for_pg_5":      away_c5["corners_for_pg"],
+        "home_corners_against_pg_5":  home_c5["corners_against_pg"],
+        "away_corners_against_pg_5":  away_c5["corners_against_pg"],
+        "home_over95_corners_rate_5": home_c5["over95_rate"],
+        "away_over95_corners_rate_5": away_c5["over95_rate"],
+
+        # H2H
+        "h2h_home_wins_5":       h2h["home_wins"],
+        "h2h_draws_5":           h2h["draws"],
+        "h2h_away_wins_5":       h2h["away_wins"],
+        "h2h_home_gf_5":         h2h["home_gf"],
+        "h2h_away_gf_5":         h2h["away_gf"]
+    }
+
+    # Model inputs are never NaN: anything the history cannot provide is 0.0.
+    # (Targets keep their NaN — the trainer filters on them, never imputes.)
+    return {
+        name: (0.0 if pd.isna(value) else value) for name, value in feat.items()
+    }
+
+
+def build_feature_row(
+    df: pd.DataFrame,
+    elo_df: pd.DataFrame,
+    home_team: str,
+    away_team: str,
+    before_date: pd.Timestamp,
+    row: pd.Series | None = None,
+) -> dict:
+    """One complete training row: features + targets + meta + raw history.
+
+    ``row`` is the match itself. Without it only the model inputs are returned,
+    which is exactly what inference needs for a fixture not yet played.
+    """
+    feat = compute_match_features(df, elo_df, home_team, away_team, before_date)
+    if row is None:
+        return feat
+
+    feat.update({
+        # Targets (never filled with 0)
+        "target_result":       row.get("result"),
+        "target_home_goals":   row.get("home_goals"),
+        "target_away_goals":   row.get("away_goals"),
+        "target_home_corners": row.get("home_corners"),
+        "target_away_corners": row.get("away_corners"),
+        "target_btts": (
+            None if (pd.isna(row.get("home_goals", row.get("home_score")))
+                     or pd.isna(row.get("away_goals", row.get("away_score"))))
+            else (1 if (
+                (row.get("home_goals", row.get("home_score", 0)) or 0) > 0
+                and (row.get("away_goals", row.get("away_score", 0)) or 0) > 0
+            ) else 0)
+        ),
+        "target_over25": (
+            None if (pd.isna(row.get("home_goals", row.get("home_score")))
+                     or pd.isna(row.get("away_goals", row.get("away_score"))))
+            else (1 if (
+                (row.get("home_goals", row.get("home_score", 0)) or 0)
+                + (row.get("away_goals", row.get("away_score", 0)) or 0) >= 3
+            ) else 0)
+        ),
+        "target_over95_corners": over95_corners_target(row),
+
+        # Meta (kept for chronological splitting later)
+        "date":      before_date,
+        "league":    row.get("league"),
+        "season":    row.get("season"),
+        "home_team": home_team,
+        "away_team": away_team,
+
+        # Raw match data, carried as meta so the saved features CSV holds the
+        # history inference has to replay. Never a model input.
+        **{column: row.get(column) for column in MATCH_HISTORY_COLUMNS},
+    })
+    return feat
+
+
 def build_features(
     df: pd.DataFrame,
     elo_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """
-    Build one feature row per match in df.
+    """One feature row per match in ``df``.
 
-    df     = full matches DataFrame (all columns from DB).
-    elo_df = full elo_ratings DataFrame (optional).
+    ``df`` is the full matches DataFrame, ``elo_df`` the elo_ratings history.
+    All rolling windows and H2H lookups use only matches dated strictly before
+    the row's own date (no leakage).
 
-    STRICT RULE: all rolling windows and h2h lookups
-    use only matches with date strictly less than the
-    current row date. No data leakage of any kind.
+    The raw match columns in :data:`MATCH_HISTORY_COLUMNS` are written with
+    every row: the prediction service replays the same rolling windows from
+    them (see ``features/inference.py``), so the features CSV doubles as the
+    inference-time match history.
     """
     if elo_df is None:
         elo_df = pd.DataFrame()
@@ -672,172 +940,16 @@ def build_features(
     for i, row in df.iterrows():
         if i % 500 == 0:
             print(f"[builder] Processing row {i}/{total}...")
-
-        date      = row["date"]
-        home_team = row["home_team"]
-        away_team = row["away_team"]
-
-        hf5  = compute_team_rolling_form(
-            df, home_team, date, window=5,  venue="all")
-        hf10 = compute_team_rolling_form(
-            df, home_team, date, window=10, venue="all")
-        hh5  = compute_team_rolling_form(
-            df, home_team, date, window=5,  venue="home")
-        af5  = compute_team_rolling_form(
-            df, away_team, date, window=5,  venue="all")
-        af10 = compute_team_rolling_form(
-            df, away_team, date, window=10, venue="all")
-        aa5  = compute_team_rolling_form(
-            df, away_team, date, window=5,  venue="away")
-        h2h  = compute_h2h(df, home_team, away_team, date)
-        elo  = compute_elo_features(
-            elo_df, home_team, away_team, date)
-        home_btts = compute_btts_rolling(
-            df, home_team, date, window=5, venue="home")
-        away_btts = compute_btts_rolling(
-            df, away_team, date, window=5, venue="away")
-        home_o25 = compute_over25_rolling(
-            df, home_team, date, window=5, venue="home")
-        away_o25 = compute_over25_rolling(
-            df, away_team, date, window=5, venue="away")
-        home_c5 = compute_corners_rolling(
-            df, home_team, date, window=5, venue="home")
-        away_c5 = compute_corners_rolling(
-            df, away_team, date, window=5, venue="away")
-
-        feat = {
-            # Home form 5
-            "home_form_wins_5":      hf5["wins"],
-            "home_form_draws_5":     hf5["draws"],
-            "home_form_losses_5":    hf5["losses"],
-            "home_form_points_5":    hf5["points"],
-            "home_form_gf_5":        hf5["gf"],
-            "home_form_ga_5":        hf5["ga"],
-            "home_form_gd_5":        hf5["gd"],
-            "home_form_shots_5":     hf5["shots"],
-            "home_form_shots_ot_5":  hf5["shots_ot"],
-            "home_form_corners_5":   hf5["corners"],
-
-            # Home form 10
-            "home_form_wins_10":     hf10["wins"],
-            "home_form_draws_10":    hf10["draws"],
-            "home_form_losses_10":   hf10["losses"],
-            "home_form_points_10":   hf10["points"],
-            "home_form_gf_10":       hf10["gf"],
-            "home_form_ga_10":       hf10["ga"],
-            "home_form_gd_10":       hf10["gd"],
-
-            # Home at home 5
-            "home_home_wins_5":      hh5["wins"],
-            "home_home_draws_5":     hh5["draws"],
-            "home_home_losses_5":    hh5["losses"],
-            "home_home_points_5":    hh5["points"],
-            "home_home_gf_5":        hh5["gf"],
-            "home_home_ga_5":        hh5["ga"],
-            "home_home_gd_5":        hh5["gd"],
-            "home_home_shots_5":     hh5["shots"],
-            "home_home_corners_5":   hh5["corners"],
-
-            # Away form 5
-            "away_form_wins_5":      af5["wins"],
-            "away_form_draws_5":     af5["draws"],
-            "away_form_losses_5":    af5["losses"],
-            "away_form_points_5":    af5["points"],
-            "away_form_gf_5":        af5["gf"],
-            "away_form_ga_5":        af5["ga"],
-            "away_form_gd_5":        af5["gd"],
-            "away_form_shots_5":     af5["shots"],
-            "away_form_shots_ot_5":  af5["shots_ot"],
-            "away_form_corners_5":   af5["corners"],
-
-            # Away form 10
-            "away_form_wins_10":     af10["wins"],
-            "away_form_draws_10":    af10["draws"],
-            "away_form_losses_10":   af10["losses"],
-            "away_form_points_10":   af10["points"],
-            "away_form_gf_10":       af10["gf"],
-            "away_form_ga_10":       af10["ga"],
-            "away_form_gd_10":       af10["gd"],
-
-            # Away at away 5
-            "away_away_wins_5":      aa5["wins"],
-            "away_away_draws_5":     aa5["draws"],
-            "away_away_losses_5":    aa5["losses"],
-            "away_away_points_5":    aa5["points"],
-            "away_away_gf_5":        aa5["gf"],
-            "away_away_ga_5":        aa5["ga"],
-            "away_away_gd_5":        aa5["gd"],
-            "away_away_shots_5":     aa5["shots"],
-            "away_away_corners_5":   aa5["corners"],
-
-            # Elo
-            "home_elo":              elo["home_elo"],
-            "away_elo":              elo["away_elo"],
-            "elo_difference":        elo["elo_difference"],
-
-            # BTTS-specific rolling rates
-            "home_btts_rate_5":      home_btts["btts_rate"],
-            "away_btts_rate_5":      away_btts["btts_rate"],
-            "home_cs_rate_5":        home_btts["cs_rate"],
-            "away_cs_rate_5":        away_btts["cs_rate"],
-            "home_scored_rate_5":    home_btts["scored_rate"],
-            "away_scored_rate_5":    away_btts["scored_rate"],
-
-            # Over-2.5-specific rolling rates
-            "home_over25_rate_5":        home_o25["over25_rate"],
-            "away_over25_rate_5":        away_o25["over25_rate"],
-            "home_high_scoring_rate_5":  home_o25["high_scoring_rate"],
-            "away_high_scoring_rate_5":  away_o25["high_scoring_rate"],
-
-            # Corner-specific rolling rates (venue-aware), for the Over 9.5
-            # corners classifier only — deliberately NOT part of FEATURE_COLS.
-            "home_corners_for_pg_5":      home_c5["corners_for_pg"],
-            "away_corners_for_pg_5":      away_c5["corners_for_pg"],
-            "home_corners_against_pg_5":  home_c5["corners_against_pg"],
-            "away_corners_against_pg_5":  away_c5["corners_against_pg"],
-            "home_over95_corners_rate_5": home_c5["over95_rate"],
-            "away_over95_corners_rate_5": away_c5["over95_rate"],
-
-            # H2H
-            "h2h_home_wins_5":       h2h["home_wins"],
-            "h2h_draws_5":           h2h["draws"],
-            "h2h_away_wins_5":       h2h["away_wins"],
-            "h2h_home_gf_5":         h2h["home_gf"],
-            "h2h_away_gf_5":         h2h["away_gf"],
-
-            # Targets (never filled with 0)
-            "target_result":         row.get("result"),
-            "target_home_goals":     row.get("home_goals"),
-            "target_away_goals":     row.get("away_goals"),
-            "target_home_corners":   row.get("home_corners"),
-            "target_away_corners":   row.get("away_corners"),
-            "target_btts": (
-                None if (pd.isna(row.get("home_goals", row.get("home_score")))
-                         or pd.isna(row.get("away_goals", row.get("away_score"))))
-                else (1 if (
-                    (row.get("home_goals", row.get("home_score", 0)) or 0) > 0
-                    and (row.get("away_goals", row.get("away_score", 0)) or 0) > 0
-                ) else 0)
-            ),
-            "target_over25": (
-                None if (pd.isna(row.get("home_goals", row.get("home_score")))
-                         or pd.isna(row.get("away_goals", row.get("away_score"))))
-                else (1 if (
-                    (row.get("home_goals", row.get("home_score", 0)) or 0)
-                    + (row.get("away_goals", row.get("away_score", 0)) or 0) >= 3
-                ) else 0)
-            ),
-            "target_over95_corners": over95_corners_target(row),
-
-            # Meta (kept for chronological splitting later)
-            "date":      date,
-            "league":    row.get("league"),
-            "season":    row.get("season"),
-            "home_team": home_team,
-            "away_team": away_team,
-        }
-
-        rows.append(feat)
+        rows.append(
+            build_feature_row(
+                df,
+                elo_df,
+                row["home_team"],
+                row["away_team"],
+                row["date"],
+                row=row,
+            )
+        )
 
     out = pd.DataFrame(rows)
 

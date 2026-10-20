@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from scipy.stats import poisson
 from supabase import create_client
 
@@ -60,6 +60,23 @@ if str(BACKEND_DIR) not in sys.path:
 
 # Shared bucket manifest — the trainer uploads exactly what this file lists.
 import model_artifacts as artifacts  # noqa: E402  (needs the sys.path above)
+
+# Feature definitions and assembly. The column lists are the SAME objects the
+# trainer fits on (``features/feature_columns.py``), and the feature *values*
+# come from the builder's own functions (``features/inference.py``), so the
+# training and inference paths cannot drift apart.
+from features import builder as feature_builder  # noqa: E402
+from features import inference as feature_inference  # noqa: E402
+from features.feature_columns import (  # noqa: E402
+    BTTS_FEATURE_COLS,
+    FEATURE_COLS,
+    OVER25_FEATURE_COLS,
+    OVER95_CORNERS_FEATURE_COLS,
+    OVER95_CORNERS_REQUIRED_COLS,
+    validate_feature_column_counts,
+)
+
+validate_feature_column_counts()
 
 # A reload only downloads pre-built files; if another reload is already in
 # flight (e.g. the startup reload racing the GitHub Actions callback) wait this
@@ -102,117 +119,11 @@ _pipeline_error = ""
 _last_reload_at = ""
 _reload_lock = threading.Lock()
 
-FEATURE_COLS = [
-    # Home form 5
-    "home_form_wins_5", "home_form_draws_5",
-    "home_form_losses_5", "home_form_points_5",
-    "home_form_gf_5", "home_form_ga_5",
-    "home_form_gd_5", "home_form_shots_5",
-    "home_form_shots_ot_5", "home_form_corners_5",
-    # Home form 10
-    "home_form_wins_10", "home_form_draws_10",
-    "home_form_losses_10", "home_form_points_10",
-    "home_form_gf_10", "home_form_ga_10",
-    "home_form_gd_10",
-    # Home at home 5
-    "home_home_wins_5", "home_home_draws_5",
-    "home_home_losses_5", "home_home_points_5",
-    "home_home_gf_5", "home_home_ga_5",
-    "home_home_gd_5", "home_home_shots_5",
-    "home_home_corners_5",
-    # Away form 5
-    "away_form_wins_5", "away_form_draws_5",
-    "away_form_losses_5", "away_form_points_5",
-    "away_form_gf_5", "away_form_ga_5",
-    "away_form_gd_5", "away_form_shots_5",
-    "away_form_shots_ot_5", "away_form_corners_5",
-    # Away form 10
-    "away_form_wins_10", "away_form_draws_10",
-    "away_form_losses_10", "away_form_points_10",
-    "away_form_gf_10", "away_form_ga_10",
-    "away_form_gd_10",
-    # Away at away 5
-    "away_away_wins_5", "away_away_draws_5",
-    "away_away_losses_5", "away_away_points_5",
-    "away_away_gf_5", "away_away_ga_5",
-    "away_away_gd_5", "away_away_shots_5",
-    "away_away_corners_5",
-    # Elo
-    "home_elo", "away_elo", "elo_difference",
-    # H2H
-    "h2h_home_wins_5", "h2h_draws_5",
-    "h2h_away_wins_5", "h2h_home_gf_5",
-    "h2h_away_gf_5",
-    # League and season
-    "league_encoded", "season_encoded",
-    # FBref home team stats
-    "home_fbref_games",
-    "home_fbref_shots", "home_fbref_shots_on_target",
-    "home_fbref_shot_accuracy",
-    "home_fbref_goals_per_shot", "home_fbref_goals_per_sot",
-    "home_fbref_yellow_cards", "home_fbref_red_cards",
-    "home_fbref_fouls_committed", "home_fbref_fouls_drawn",
-    "home_fbref_offsides", "home_fbref_crosses",
-    "home_fbref_interceptions", "home_fbref_tackles_won",
-    "home_fbref_pens_won", "home_fbref_pens_conceded",
-    "home_fbref_sota", "home_fbref_goals_against",
-    "home_fbref_saves", "home_fbref_save_pct",
-    "home_fbref_clean_sheets",
-    "home_fbref_pk_faced", "home_fbref_pk_saved",
-    # FBref away team stats
-    "away_fbref_games",
-    "away_fbref_shots", "away_fbref_shots_on_target",
-    "away_fbref_shot_accuracy",
-    "away_fbref_goals_per_shot", "away_fbref_goals_per_sot",
-    "away_fbref_yellow_cards", "away_fbref_red_cards",
-    "away_fbref_fouls_committed", "away_fbref_fouls_drawn",
-    "away_fbref_offsides", "away_fbref_crosses",
-    "away_fbref_interceptions", "away_fbref_tackles_won",
-    "away_fbref_pens_won", "away_fbref_pens_conceded",
-    "away_fbref_sota", "away_fbref_goals_against",
-    "away_fbref_saves", "away_fbref_save_pct",
-    "away_fbref_clean_sheets",
-    "away_fbref_pk_faced", "away_fbref_pk_saved",
-]
+# The four model input lists are imported above from
+# ``features/feature_columns.py`` — the single source of truth shared with
+# ``models/trainer.py``. They used to be copy-pasted here, which is exactly how
+# the inference path drifted from the training path.
 
-BTTS_FEATURE_COLS = [
-    "home_btts_rate_5", "away_btts_rate_5",
-    "home_cs_rate_5", "away_cs_rate_5",
-    "home_scored_rate_5", "away_scored_rate_5",
-    "home_form_gf_5", "away_form_gf_5",
-    "home_form_ga_5", "away_form_ga_5",
-    "home_fbref_goals_against", "away_fbref_goals_against",
-    "home_fbref_clean_sheets", "away_fbref_clean_sheets",
-    "home_elo", "away_elo",
-    "league_encoded",
-]
-
-OVER25_FEATURE_COLS = [
-    "home_over25_rate_5", "away_over25_rate_5",
-    "home_high_scoring_rate_5", "away_high_scoring_rate_5",
-    "home_form_gf_5", "away_form_gf_5",
-    "home_form_ga_5", "away_form_ga_5",
-    "home_form_gf_10", "away_form_gf_10",
-    "home_fbref_goals_against", "away_fbref_goals_against",
-    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
-    "home_elo", "away_elo",
-    "elo_difference",
-    "league_encoded",
-]
-
-# Must stay identical to OVER95_CORNERS_FEATURE_COLS in models/trainer.py —
-# the classifier is scored on exactly the columns it was trained on, in order.
-OVER95_CORNERS_FEATURE_COLS = [
-    "home_corners_for_pg_5", "away_corners_for_pg_5",
-    "home_corners_against_pg_5", "away_corners_against_pg_5",
-    "home_over95_corners_rate_5", "away_over95_corners_rate_5",
-    "home_home_corners_5", "away_away_corners_5",
-    "home_form_corners_5", "away_form_corners_5",
-    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
-    "home_fbref_crosses", "away_fbref_crosses",
-    "home_elo", "away_elo",
-    "league_encoded",
-]
 
 # ── Blend weights: formula_v1 vs ML ──────────────────────────────────────────
 BLEND_FORMULA_1X2   = 0.60   # formula weight for home/draw/away win probs
@@ -335,6 +246,18 @@ def load_artifacts() -> None:
     global _home_corners, _away_corners, _btts_model, _over25_model
     global _over95_corners_model
     global _le_league, _le_season, _features_df
+    global _fbref_df, _fbref_load_attempted, _history_source, _history_fbref_source
+    global _history, _elo_cache, _elo_lookup_failures
+
+    # A reload ships a new features.csv and possibly new FBref rows; drop the
+    # reconstructed histories so the next prediction rebuilds them.
+    _fbref_df = None
+    _fbref_load_attempted = False
+    _history_source = None
+    _history_fbref_source = None
+    _history = {}
+    _elo_cache = {}
+    _elo_lookup_failures = 0
 
     models_dir = BACKEND_DIR / "models"
     data_dir   = BACKEND_DIR / "data"
@@ -599,86 +522,269 @@ class MatchRequest(BaseModel):
     home_team: str
     away_team: str
     league: str
-    season: str = "2024-2025"
+    # A live fixture belongs to the season it is played in, and the encoder is
+    # rebuilt from that season's rows every day. The old fixed "2024-2025"
+    # default silently encoded a two-year-old season for any caller that did
+    # not send one, feeding the model a value that did not describe the match.
+    season: str = Field(default_factory=feature_inference.current_season_label)
 
 
 def _encode_label(encoder, value: str, fallback: int = 0) -> int:
+    """Encode a label with the encoder the builder fitted (never raises).
+
+    Thin wrapper over :func:`features.inference.encode_label` so the trainer's
+    encoder and the API cannot apply different rules.
     """
-    Encode a string label using a fitted LabelEncoder.
-    If the value was not seen during training, returns
-    fallback (default 0) and prints a warning.
-    Never raises.
+    return feature_inference.encode_label(encoder, value, fallback=fallback)
+
+
+# --------------------------------------------------------------------------- #
+# Inference feature assembly
+# --------------------------------------------------------------------------- #
+# The features a live fixture is scored on are built by the builder's own
+# functions (see features/inference.py): the same rolling windows, venue
+# splits, Elo lookup, H2H window and FBref snapshot as every training row.
+# Reading the "latest feature row" of a team out of features.csv — what this
+# module used to do — produced stale and opponent-independent values.
+
+#: fbref_team_stats snapshot, loaded once per artifact reload. Read lazily: a
+#: slow or unreachable database must not delay the port bind, and an empty
+#: result falls back to the FBref columns the features CSV already carries.
+_fbref_df: pd.DataFrame | None = None
+_fbref_load_attempted = False
+
+
+def _load_fbref_snapshot() -> pd.DataFrame | None:
+    """Return the current ``fbref_team_stats`` rows, or None when unavailable.
+
+    The builder date-filters these rows against the match date before they
+    become features; doing the same at inference means a snapshot collected
+    after a team's last match still reaches the model. Attempted once per
+    process (per reload) so an unreachable database is not retried per request.
     """
-    if encoder is None:
-        return fallback
+    global _fbref_df, _fbref_load_attempted
+
+    if _fbref_load_attempted:
+        return _fbref_df
+    _fbref_load_attempted = True
     try:
-        return int(encoder.transform([value])[0])
-    except ValueError:
-        known = list(encoder.classes_)
-        print(f"[predict] WARNING: unseen label '{value}'. "
-              f"Known: {known}. Using fallback={fallback}")
-        return fallback
+        snapshot = feature_builder.load_fbref_stats()
+        _fbref_df = (
+            snapshot if snapshot is not None and len(snapshot) > 0 else None
+        )
+        if _fbref_df is None:
+            print("[predict] NOTE: no fbref_team_stats rows — FBref features "
+                  "come from features.csv")
+        else:
+            print(f"[predict] Loaded {len(_fbref_df)} FBref team-season rows "
+                  f"for inference")
+    except Exception as exc:  # noqa: BLE001 - degrade, never fail a request
+        print(f"[predict] WARNING: could not read fbref_team_stats ({exc}) — "
+              f"FBref features come from features.csv")
+        _fbref_df = None
+    return _fbref_df
 
 
-def _get_team_features(
-    team: str,
-    role: str,
+_history_source = None
+_history_fbref_source = None
+_history: dict[str, pd.DataFrame] = {}
+
+
+def _inference_history(df: pd.DataFrame | None = None) -> dict[str, pd.DataFrame]:
+    """Match / Elo / FBref history rebuilt from the loaded features CSV.
+
+    ``df`` defaults to the loaded ``_features_df``. Cached until the artifacts
+    are reloaded (or a different frame is passed in): rebuilding three frames
+    per request would waste time for no benefit.
+    """
+    global _history_source, _history_fbref_source, _history
+
+    source = _features_df if df is None else df
+    fbref_df = _load_fbref_snapshot()
+    if source is None or source.empty:
+        # No match history, but the FBref snapshot is independent of it: a
+        # first-ever fixture still gets its team-season stats.
+        return {
+            "matches": feature_inference.empty_match_history(),
+            "elo": feature_inference.empty_elo_history(),
+            "fbref": fbref_df if fbref_df is not None else pd.DataFrame(),
+        }
+
+    if _history_source is source and _history_fbref_source is fbref_df:
+        return _history
+
+    _history = {
+        "matches": feature_inference.match_history_from_features(source),
+        "elo": feature_inference.elo_history_from_features(source),
+        "fbref": (
+            fbref_df
+            if fbref_df is not None
+            else feature_inference.fbref_history_from_features(source)
+        ),
+    }
+    _history_source = source
+    _history_fbref_source = fbref_df
+    return _history
+
+
+#: Columns a specialist classifier cannot be scored without. An older
+#: features.csv without them means the model was trained on different inputs,
+#: so the caller keeps the Poisson value instead of guessing.
+BTTS_REQUIRED_COLS = [
+    "home_btts_rate_5", "away_btts_rate_5",
+    "home_cs_rate_5", "away_cs_rate_5",
+    "home_scored_rate_5", "away_scored_rate_5",
+]
+
+OVER25_REQUIRED_COLS = [
+    "home_over25_rate_5", "away_over25_rate_5",
+    "home_high_scoring_rate_5", "away_high_scoring_rate_5",
+]
+
+
+#: Features derived from shot counts. A features CSV written before the raw
+#: match columns were added cannot replay them, so each one falls back to the
+#: value stored on the team's latest row instead of silently becoming 0.
+_SHOT_DERIVED_FEATURES: tuple[tuple[str, str], ...] = (
+    ("home", "home_form_shots_5"),
+    ("home", "home_form_shots_ot_5"),
+    ("home", "home_home_shots_5"),
+    ("away", "away_form_shots_5"),
+    ("away", "away_form_shots_ot_5"),
+    ("away", "away_away_shots_5"),
+)
+
+_SHOT_RAW_COLUMNS = (
+    "home_shots", "away_shots", "home_shots_ot", "away_shots_ot",
+)
+
+
+def _latest_stored_value(
+    df: pd.DataFrame, team: str, role: str, column: str
+) -> float | None:
+    """Value of ``column`` on the team's most recent row in that role."""
+    team_column = f"{role}_team"
+    if df is None or column not in df.columns or team_column not in df.columns:
+        return None
+    rows = df.loc[df[team_column] == team]
+    if rows.empty:
+        return None
+    value = pd.to_numeric(rows.iloc[-1].get(column), errors="coerce")
+    return None if pd.isna(value) else float(value)
+
+
+def _apply_legacy_shot_fallback(
+    features: dict[str, float],
+    home_team: str,
+    away_team: str,
     df: pd.DataFrame,
-    feature_cols: list[str] | None = None,
 ) -> dict[str, float]:
+    """Keep shot-form features populated when the CSV lacks raw shot counts."""
+    if df is None:
+        return features
+    if all(column in df.columns for column in _SHOT_RAW_COLUMNS):
+        return features
+    for role, column in _SHOT_DERIVED_FEATURES:
+        team = home_team if role == "home" else away_team
+        value = _latest_stored_value(df, team, role, column)
+        if value is not None:
+            features[column] = value
+    return features
+
+
+#: Cache of ``(team, cutoff date) -> rating`` for the Elo lookup. A daily
+#: prediction run asks for the same two teams many times (one call per model
+#: plus one per fixture), so the database is asked once per team per day.
+_elo_cache: dict[tuple[str, str], float | None] = {}
+_ELO_CACHE_LIMIT = 4096
+_elo_lookup_failures = 0
+_ELO_MAX_FAILURES = 3
+
+
+def _elo_rating_lookup(team: str, before_date: Any) -> float | None:
+    """Latest ``elo_ratings`` value for ``team`` strictly before ``before_date``.
+
+    Kept as its own function so the parity test can substitute the synthetic
+    rating history for the database (no DB access in tests).
     """
-    Extract the most recent feature row for a team.
+    return feature_builder.get_latest_elo_before(
+        team, before_date, raise_on_error=True
+    )
 
-    role = "home" -> use rows where home_team == team,
-                     return all home_* and h2h_* columns
-    role = "away" -> use rows where away_team == team,
-                     return all away_* columns
 
-    ``feature_cols`` defaults to the hardcoded FEATURE_COLS. Callers that
-    know the model's own feature list (``_get_runtime_feature_cols``) pass it
-    through, so a model trained on extra columns reads those columns from the
-    features CSV instead of scoring them as 0.
+def _elo_lookup(team: str, before_date: Any) -> float | None:
+    """Cached, fail-safe wrapper around :func:`_elo_rating_lookup`.
 
-    Returns a dict of feature_name -> value.
-    Falls back to zeros with a warning if no history.
+    Returns None when the database cannot answer, which makes the caller fall
+    back to the reconstructed history and then to the builder's 1500 default.
+    After a few consecutive failures the lookup stops trying for this process
+    (a reload resets it), so a broken database connection cannot add latency
+    to every prediction.
     """
-    if df is None or df.empty:
-        print(f"[predict] WARNING: no features data loaded")
+    global _elo_lookup_failures
+
+    if _elo_lookup_failures >= _ELO_MAX_FAILURES:
+        return None
+    key = (team, str(before_date))
+    if key in _elo_cache:
+        return _elo_cache[key]
+    try:
+        value = _elo_rating_lookup(team, before_date)
+    except Exception as exc:  # noqa: BLE001 - fall back to the reconstructed history
+        _elo_lookup_failures += 1
+        print(f"[predict] WARNING: Elo lookup failed for {team} ({exc}); "
+              f"using the ratings stored in features.csv")
+        return None
+    # A lookup that finds nothing is legitimate (the team has no rating yet);
+    # only a raised exception counts as a failure.
+    if len(_elo_cache) >= _ELO_CACHE_LIMIT:
+        _elo_cache.clear()
+    _elo_cache[key] = value
+    return value
+
+
+def _inference_feature_row(
+    df: pd.DataFrame,
+    home_team: str,
+    away_team: str,
+    league: str | None = None,
+    season: str | None = None,
+    before_date: Any = None,
+) -> dict[str, float]:
+    """All model inputs for one fixture, exactly as the builder computes them.
+
+    ``df`` is the loaded features CSV; ``before_date`` defaults to today, so
+    only matches from earlier days are used (the builder's cutoff rule).
+    """
+    if df is None:
         return {}
-
-    if role == "home":
-        mask = df["home_team"] == team
-    else:
-        mask = df["away_team"] == team
-
-    team_rows = df[mask]
-
-    if team_rows.empty:
-        print(f"[predict] WARNING: no history for "
-              f"{team} as {role} — using zeros")
+    history = _inference_history(df)
+    try:
+        features = feature_inference.build_inference_features(
+            history["matches"],
+            history["elo"],
+            history["fbref"],
+            home_team,
+            away_team,
+            before_date=before_date,
+            league=league,
+            season=season,
+            elo_lookup=_elo_lookup,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced as a warning, not a 500
+        print(f"[predict] WARNING: could not build features for "
+              f"{home_team} vs {away_team}: {exc}")
         return {}
+    return _apply_legacy_shot_fallback(features, home_team, away_team, df)
 
-    latest = team_rows.iloc[-1]
 
-    if role == "home":
-        prefixes = (
-            "home_form_", "home_home_",
-            "home_elo", "h2h_",
-            "home_fbref_",
-        )
-    else:
-        prefixes = (
-            "away_form_", "away_away_",
-            "away_elo",
-            "away_fbref_",
-        )
-
-    result = {}
-    for col in (feature_cols if feature_cols is not None else FEATURE_COLS):
-        if any(col.startswith(p) for p in prefixes):
-            result[col] = float(latest.get(col, 0.0) or 0.0)
-
-    return result
+def _finite(value: Any, default: float = 0.0) -> float:
+    """``float(value)`` clamped to a finite number for model input."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    return numeric if np.isfinite(numeric) else default
 
 
 def _build_feature_vector(
@@ -688,38 +794,31 @@ def _build_feature_vector(
     season_encoded: int,
     df: pd.DataFrame,
     feature_cols: list[str] | None = None,
+    *,
+    league: str | None = None,
+    season: str | None = None,
+    before_date: Any = None,
 ) -> dict[str, float]:
-    """
-    Build the full 62-feature vector for a prediction request.
+    """Build the full feature vector for a prediction request.
 
-    Uses the most recent home stats for home_team and
-    the most recent away stats for away_team from the
-    features CSV. Elo and H2H come from the home row
-    (they are always computed from home perspective).
+    Every value comes from the builder's own feature functions, so a live
+    fixture and the equivalent historical training row agree exactly (see
+    ``tests/test_feature_parity.py``). ``league``/``season`` are the fixture's
+    strings, used for the FBref team-season lookup; ``before_date`` overrides
+    today's cutoff (tests and backfills only).
     """
-    home_feats = _get_team_features(home_team, "home", df, feature_cols)
-    away_feats = _get_team_features(away_team, "away", df, feature_cols)
+    features = _inference_feature_row(
+        df, home_team, away_team, league=league, season=season,
+        before_date=before_date,
+    )
+    features["league_encoded"] = float(league_encoded)
+    features["season_encoded"] = float(season_encoded)
 
     cols_to_use = feature_cols if feature_cols is not None else FEATURE_COLS
-    vector: dict[str, float] = {}
-    for col in cols_to_use:
-        if col == "league_encoded":
-            vector[col] = float(league_encoded)
-        elif col == "season_encoded":
-            vector[col] = float(season_encoded)
-        elif col == "elo_difference":
-            vector[col] = (
-                home_feats.get("home_elo", 0.0)
-                - away_feats.get("away_elo", 0.0)
-            )
-        elif col in home_feats:
-            vector[col] = home_feats[col]
-        elif col in away_feats:
-            vector[col] = away_feats[col]
-        else:
-            vector[col] = 0.0
-
-    return vector
+    return {
+        column: _finite(features.get(column, 0.0))
+        for column in cols_to_use
+    }
 
 
 def _poisson_over(lam: float, threshold: float) -> float:
@@ -740,65 +839,63 @@ def _poisson_btts(home_lam: float, away_lam: float) -> float:
     return round(p_home * p_away, 4)
 
 
+def _model_feature_vector(
+    model_name: str,
+    columns: list[str],
+    required: list[str],
+    home_team: str,
+    away_team: str,
+    league_encoded: int,
+    df: pd.DataFrame,
+    league: str | None = None,
+    season: str | None = None,
+) -> dict[str, float] | None:
+    """Feature vector for a specialist classifier, built by the builder.
+
+    ``required`` columns must exist in the CSV and be computable: they are what
+    makes the classifier's inputs meaningful. Everything else (FBref, form) may
+    legitimately be absent and is then 0.0 — the same value the builder writes
+    for a team with no such history.
+
+    Returns None when ``df`` cannot support the model, so the caller keeps the
+    Poisson estimate instead of feeding the classifier zeros it never saw.
+    """
+    if df is None or df.empty:
+        return None
+    missing = [c for c in required if c not in df.columns
+               and c != "league_encoded"]
+    if missing:
+        print(f"[predict] WARNING: {model_name} features missing in CSV: "
+              f"{missing}")
+        return None
+
+    features = _inference_feature_row(
+        df, home_team, away_team, league=league, season=season
+    )
+    if not features:
+        return None
+    features["league_encoded"] = float(league_encoded)
+    return {
+        column: _finite(features.get(column, 0.0))
+        for column in columns
+    }
+
+
 def _build_btts_feature_vector(
     home_team: str,
     away_team: str,
     league_encoded: int,
     df: pd.DataFrame,
+    *,
+    league: str | None = None,
+    season: str | None = None,
 ) -> dict[str, float] | None:
-    """Build the 17-feature vector expected by the BTTS classifier.
-
-    Returns None when the required columns are not present or
-    when no history exists for the teams.
-    """
-    if df is None or df.empty:
-        return None
-    # Check all 17 columns exist in the CSV
-    missing = [c for c in BTTS_FEATURE_COLS if c not in df.columns and c != "league_encoded"]
-    # league_encoded is supplied, but also may exist in CSV; ignore it from missing check
-    if missing:
-        # If any BTTS-specific rolling columns are missing, cannot build
-        # but allow partial if only some FBref columns missing – fill with 0
-        # We only fail if the 6 new rate cols are missing
-        btts_new = ["home_btts_rate_5", "away_btts_rate_5", "home_cs_rate_5", "away_cs_rate_5", "home_scored_rate_5", "away_scored_rate_5"]
-        if any(c in missing for c in btts_new):
-            print(f"[predict] WARNING: BTTS features missing in CSV: {missing}")
-            return None
-    # Most recent rows per role
-    try:
-        home_rows = df[df["home_team"] == home_team]
-        away_rows = df[df["away_team"] == away_team]
-        if home_rows.empty and away_rows.empty:
-            return None
-        home_latest = home_rows.iloc[-1] if not home_rows.empty else None
-        away_latest = away_rows.iloc[-1] if not away_rows.empty else None
-    except Exception as exc:
-        print(f"[predict] WARNING: could not get BTTS team rows: {exc}")
-        return None
-
-    vector: dict[str, float] = {}
-    for col in BTTS_FEATURE_COLS:
-        if col == "league_encoded":
-            vector[col] = float(league_encoded)
-        elif col.startswith("home_"):
-            if home_latest is not None and col in home_latest.index:
-                try:
-                    vector[col] = float(home_latest.get(col, 0.0) or 0.0)
-                except Exception:
-                    vector[col] = 0.0
-            else:
-                vector[col] = 0.0
-        elif col.startswith("away_"):
-            if away_latest is not None and col in away_latest.index:
-                try:
-                    vector[col] = float(away_latest.get(col, 0.0) or 0.0)
-                except Exception:
-                    vector[col] = 0.0
-            else:
-                vector[col] = 0.0
-        else:
-            vector[col] = 0.0
-    return vector
+    """Build the 17-feature vector expected by the BTTS classifier."""
+    return _model_feature_vector(
+        "BTTS", BTTS_FEATURE_COLS, BTTS_REQUIRED_COLS,
+        home_team, away_team, league_encoded, df,
+        league=league, season=season,
+    )
 
 
 def _get_btts_probability(
@@ -806,24 +903,20 @@ def _get_btts_probability(
     away_team: str,
     league_encoded: int,
     df: pd.DataFrame,
+    *,
+    league: str | None = None,
+    season: str | None = None,
 ) -> float | None:
     """Return BTTS probability from the dedicated classifier, or None."""
     global _btts_model
     if _btts_model is None:
         return None
-    # Quick check: are the 6 new BTTS rate cols present?
-    if df is None or df.empty:
-        return None
-    required_new = ["home_btts_rate_5", "away_btts_rate_5", "home_cs_rate_5", "away_cs_rate_5", "home_scored_rate_5", "away_scored_rate_5"]
-    if any(c not in df.columns for c in required_new):
-        return None
-    vector = _build_btts_feature_vector(home_team, away_team, league_encoded, df)
+    vector = _build_btts_feature_vector(
+        home_team, away_team, league_encoded, df,
+        league=league, season=season,
+    )
     if vector is None:
         return None
-    # Ensure all expected columns are filled
-    for c in BTTS_FEATURE_COLS:
-        if c not in vector:
-            vector[c] = 0.0
     try:
         X = pd.DataFrame([vector])[BTTS_FEATURE_COLS]
         proba = _btts_model.predict_proba(X)
@@ -842,66 +935,16 @@ def _build_over25_feature_vector(
     away_team: str,
     league_encoded: int,
     df: pd.DataFrame,
+    *,
+    league: str | None = None,
+    season: str | None = None,
 ) -> dict[str, float] | None:
-    """Build the 18-feature vector expected by the Over 2.5 classifier.
-
-    Returns None when the required columns are not present or
-    when no history exists for the teams.
-    """
-    if df is None or df.empty:
-        return None
-    # Check all 18 columns exist in the CSV
-    missing = [c for c in OVER25_FEATURE_COLS if c not in df.columns and c != "league_encoded"]
-    # league_encoded is supplied, but also may exist in CSV; ignore it from missing check
-    if missing:
-        # If any Over-2.5-specific rolling columns are missing, cannot build
-        # but allow partial if only some FBref columns missing – fill with 0
-        # We only fail if the 4 new rate cols are missing
-        over25_new = ["home_over25_rate_5", "away_over25_rate_5",
-                      "home_high_scoring_rate_5", "away_high_scoring_rate_5"]
-        if any(c in missing for c in over25_new):
-            print(f"[predict] WARNING: Over 2.5 features missing in CSV: {missing}")
-            return None
-    # Most recent rows per role
-    try:
-        home_rows = df[df["home_team"] == home_team]
-        away_rows = df[df["away_team"] == away_team]
-        if home_rows.empty and away_rows.empty:
-            return None
-        home_latest = home_rows.iloc[-1] if not home_rows.empty else None
-        away_latest = away_rows.iloc[-1] if not away_rows.empty else None
-    except Exception as exc:
-        print(f"[predict] WARNING: could not get Over 2.5 team rows: {exc}")
-        return None
-
-    vector: dict[str, float] = {}
-    for col in OVER25_FEATURE_COLS:
-        if col == "league_encoded":
-            vector[col] = float(league_encoded)
-        elif col == "elo_difference":
-            # Derived: always the home perspective Elo gap, never a raw column
-            vector[col] = (
-                vector.get("home_elo", 0.0) - vector.get("away_elo", 0.0)
-            )
-        elif col.startswith("home_"):
-            if home_latest is not None and col in home_latest.index:
-                try:
-                    vector[col] = float(home_latest.get(col, 0.0) or 0.0)
-                except Exception:
-                    vector[col] = 0.0
-            else:
-                vector[col] = 0.0
-        elif col.startswith("away_"):
-            if away_latest is not None and col in away_latest.index:
-                try:
-                    vector[col] = float(away_latest.get(col, 0.0) or 0.0)
-                except Exception:
-                    vector[col] = 0.0
-            else:
-                vector[col] = 0.0
-        else:
-            vector[col] = 0.0
-    return vector
+    """Build the 18-feature vector expected by the Over 2.5 classifier."""
+    return _model_feature_vector(
+        "Over 2.5", OVER25_FEATURE_COLS, OVER25_REQUIRED_COLS,
+        home_team, away_team, league_encoded, df,
+        league=league, season=season,
+    )
 
 
 def _get_over25_probability(
@@ -909,25 +952,20 @@ def _get_over25_probability(
     away_team: str,
     league_encoded: int,
     df: pd.DataFrame,
+    *,
+    league: str | None = None,
+    season: str | None = None,
 ) -> float | None:
     """Return Over 2.5 probability from the dedicated classifier, or None."""
     global _over25_model
     if _over25_model is None:
         return None
-    # Quick check: are the 4 new Over 2.5 rate cols present?
-    if df is None or df.empty:
-        return None
-    required_new = ["home_over25_rate_5", "away_over25_rate_5",
-                    "home_high_scoring_rate_5", "away_high_scoring_rate_5"]
-    if any(c not in df.columns for c in required_new):
-        return None
-    vector = _build_over25_feature_vector(home_team, away_team, league_encoded, df)
+    vector = _build_over25_feature_vector(
+        home_team, away_team, league_encoded, df,
+        league=league, season=season,
+    )
     if vector is None:
         return None
-    # Ensure all expected columns are filled
-    for c in OVER25_FEATURE_COLS:
-        if c not in vector:
-            vector[c] = 0.0
     try:
         X = pd.DataFrame([vector])[OVER25_FEATURE_COLS]
         proba = _over25_model.predict_proba(X)
@@ -941,74 +979,22 @@ def _get_over25_probability(
         return None
 
 
-# The 6 corner-specific rates the classifier cannot be scored without: an
-# older features.csv without them means the model was trained on different
-# inputs, so the caller must keep the Poisson value instead of guessing.
-OVER95_CORNERS_REQUIRED_COLS = [
-    "home_corners_for_pg_5", "away_corners_for_pg_5",
-    "home_corners_against_pg_5", "away_corners_against_pg_5",
-    "home_over95_corners_rate_5", "away_over95_corners_rate_5",
-]
-
-
 def _build_over95_corners_feature_vector(
     home_team: str,
     away_team: str,
     league_encoded: int,
     df: pd.DataFrame,
+    *,
+    league: str | None = None,
+    season: str | None = None,
 ) -> dict[str, float] | None:
-    """Build the 17-feature vector expected by the Over 9.5 corners model.
-
-    Returns None when the corner-specific rolling columns are not present or
-    when no history exists for either team.
-    """
-    if df is None or df.empty:
-        return None
-    missing = [
-        c for c in OVER95_CORNERS_FEATURE_COLS
-        if c not in df.columns and c != "league_encoded"
-    ]
-    # Only the 6 new corner rates are mandatory — FBref and form columns may
-    # legitimately be absent from a partial features run, and are then 0.0.
-    if any(c in missing for c in OVER95_CORNERS_REQUIRED_COLS):
-        print(f"[predict] WARNING: Over 9.5 corners features missing in CSV: "
-              f"{missing}")
-        return None
-    try:
-        home_rows = df[df["home_team"] == home_team]
-        away_rows = df[df["away_team"] == away_team]
-        if home_rows.empty and away_rows.empty:
-            return None
-        home_latest = home_rows.iloc[-1] if not home_rows.empty else None
-        away_latest = away_rows.iloc[-1] if not away_rows.empty else None
-    except Exception as exc:
-        print(f"[predict] WARNING: could not get Over 9.5 corners team rows: "
-              f"{exc}")
-        return None
-
-    vector: dict[str, float] = {}
-    for col in OVER95_CORNERS_FEATURE_COLS:
-        if col == "league_encoded":
-            vector[col] = float(league_encoded)
-            continue
-        if col.startswith("home_") and home_latest is not None \
-                and col in home_latest.index:
-            source = home_latest
-        elif col.startswith("away_") and away_latest is not None \
-                and col in away_latest.index:
-            source = away_latest
-        else:
-            vector[col] = 0.0
-            continue
-        try:
-            value = float(source.get(col, 0.0) or 0.0)
-        except Exception:
-            value = 0.0
-        # A NaN here would propagate through the scaler and make the model
-        # raise, so an unrecorded corner rate is scored as 0 — the same value
-        # builder.py gives a team with no prior matches.
-        vector[col] = value if np.isfinite(value) else 0.0
-    return vector
+    """Build the 17-feature vector expected by the Over 9.5 corners model."""
+    return _model_feature_vector(
+        "Over 9.5 corners", OVER95_CORNERS_FEATURE_COLS,
+        OVER95_CORNERS_REQUIRED_COLS,
+        home_team, away_team, league_encoded, df,
+        league=league, season=season,
+    )
 
 
 def _get_over95_corners_probability(
@@ -1016,24 +1002,20 @@ def _get_over95_corners_probability(
     away_team: str,
     league_encoded: int,
     df: pd.DataFrame,
+    *,
+    league: str | None = None,
+    season: str | None = None,
 ) -> float | None:
     """P(total corners >= 10) from the dedicated classifier, or None."""
     global _over95_corners_model
     if _over95_corners_model is None:
         return None
-    if df is None or df.empty:
-        return None
-    if any(c not in df.columns for c in OVER95_CORNERS_REQUIRED_COLS):
-        return None
     vector = _build_over95_corners_feature_vector(
-        home_team, away_team, league_encoded, df
+        home_team, away_team, league_encoded, df,
+        league=league, season=season,
     )
     if vector is None:
         return None
-    # Ensure all expected columns are filled
-    for c in OVER95_CORNERS_FEATURE_COLS:
-        if c not in vector:
-            vector[c] = 0.0
     try:
         X = pd.DataFrame([vector])[OVER95_CORNERS_FEATURE_COLS]
         proba = _over95_corners_model.predict_proba(X)
@@ -1272,6 +1254,8 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
                 season_enc,
                 _features_df,
                 runtime_cols,
+                league=req.league,
+                season=req.season,
             )
 
             # Fill any missing columns with 0
@@ -1416,7 +1400,8 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         try:
             league_enc_for_btts = _encode_label(_le_league, req.league)
             btts_prob = _get_btts_probability(
-                req.home_team, req.away_team, league_enc_for_btts, _features_df
+                req.home_team, req.away_team, league_enc_for_btts, _features_df,
+                league=req.league, season=req.season,
             )
             if btts_prob is not None:
                 if "goals" in final_result and isinstance(final_result["goals"], dict):
@@ -1429,7 +1414,8 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         try:
             league_enc_for_over25 = _encode_label(_le_league, req.league)
             over25_prob = _get_over25_probability(
-                req.home_team, req.away_team, league_enc_for_over25, _features_df
+                req.home_team, req.away_team, league_enc_for_over25, _features_df,
+                league=req.league, season=req.season,
             )
             if over25_prob is not None:
                 if "goals" in final_result and isinstance(final_result["goals"], dict):
@@ -1442,7 +1428,8 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         try:
             league_enc_for_corners = _encode_label(_le_league, req.league)
             corners95_prob = _get_over95_corners_probability(
-                req.home_team, req.away_team, league_enc_for_corners, _features_df
+                req.home_team, req.away_team, league_enc_for_corners, _features_df,
+                league=req.league, season=req.season,
             )
             if corners95_prob is not None:
                 if "corners" in final_result and isinstance(final_result["corners"], dict):
@@ -1479,6 +1466,14 @@ def diagnostics() -> dict:
     fbref_in_model = [c for c in runtime_cols
                       if 'fbref' in c]
 
+    # Which assembly path a live request takes, so a deployment can be checked
+    # without issuing a prediction: both should report "builder".
+    history_columns_present = bool(
+        _features_df is not None
+        and all(column in _features_df.columns
+                for column in feature_builder.MATCH_HISTORY_COLUMNS)
+    )
+
     return {
         "hardcoded_feature_cols": len(FEATURE_COLS),
         "model_feature_cols":     len(runtime_cols),
@@ -1489,6 +1484,19 @@ def diagnostics() -> dict:
         "csv_fbref_sample":       fbref_in_csv[:5],
         "cols_match":             (
             set(runtime_cols) == set(FEATURE_COLS)
+        ),
+        # Feature parity (see docs/feature-parity-audit.md and
+        # tests/test_feature_parity.py).
+        "feature_assembly":            "builder",
+        "feature_columns_source":      "features/feature_columns.py",
+        "features_csv_has_match_history": history_columns_present,
+        "elo_lookup":                  (
+            "database" if _elo_lookup_failures < _ELO_MAX_FAILURES
+            else "features.csv_fallback"
+        ),
+        "elo_cache_entries":           len(_elo_cache),
+        "fbref_source":                (
+            "database" if _fbref_df is not None else "features.csv"
         ),
         "formula_engine": (
             get_engine_status()

@@ -53,6 +53,17 @@ from supabase import create_client
 from xgboost import XGBClassifier
 
 import model_artifacts as artifacts
+from features.feature_columns import (  # noqa: E402 - needs _BACKEND_DIR on sys.path
+    BTTS_FEATURE_COLS,
+    FEATURE_COLS,
+    OVER25_FEATURE_COLS,
+    OVER95_CORNERS_FEATURE_COLS,
+    validate_feature_column_counts,
+)
+
+# A model's input contract is not adjustable at runtime: refuse to train (or
+# import) with a feature list that no longer matches the published artifacts.
+validate_feature_column_counts()
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
@@ -61,79 +72,10 @@ warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 # --------------------------------------------------------------------------- #
 # Feature columns
 # --------------------------------------------------------------------------- #
-
-FEATURE_COLS = [
-    # Home form 5
-    "home_form_wins_5", "home_form_draws_5",
-    "home_form_losses_5", "home_form_points_5",
-    "home_form_gf_5", "home_form_ga_5",
-    "home_form_gd_5", "home_form_shots_5",
-    "home_form_shots_ot_5", "home_form_corners_5",
-    # Home form 10
-    "home_form_wins_10", "home_form_draws_10",
-    "home_form_losses_10", "home_form_points_10",
-    "home_form_gf_10", "home_form_ga_10",
-    "home_form_gd_10",
-    # Home at home 5
-    "home_home_wins_5", "home_home_draws_5",
-    "home_home_losses_5", "home_home_points_5",
-    "home_home_gf_5", "home_home_ga_5",
-    "home_home_gd_5", "home_home_shots_5",
-    "home_home_corners_5",
-    # Away form 5
-    "away_form_wins_5", "away_form_draws_5",
-    "away_form_losses_5", "away_form_points_5",
-    "away_form_gf_5", "away_form_ga_5",
-    "away_form_gd_5", "away_form_shots_5",
-    "away_form_shots_ot_5", "away_form_corners_5",
-    # Away form 10
-    "away_form_wins_10", "away_form_draws_10",
-    "away_form_losses_10", "away_form_points_10",
-    "away_form_gf_10", "away_form_ga_10",
-    "away_form_gd_10",
-    # Away at away 5
-    "away_away_wins_5", "away_away_draws_5",
-    "away_away_losses_5", "away_away_points_5",
-    "away_away_gf_5", "away_away_ga_5",
-    "away_away_gd_5", "away_away_shots_5",
-    "away_away_corners_5",
-    # Elo
-    "home_elo", "away_elo", "elo_difference",
-    # H2H
-    "h2h_home_wins_5", "h2h_draws_5",
-    "h2h_away_wins_5", "h2h_home_gf_5",
-    "h2h_away_gf_5",
-    # League and season
-    "league_encoded", "season_encoded",
-    # FBref home team stats
-    "home_fbref_games",
-    "home_fbref_shots", "home_fbref_shots_on_target",
-    "home_fbref_shot_accuracy",
-    "home_fbref_goals_per_shot", "home_fbref_goals_per_sot",
-    "home_fbref_yellow_cards", "home_fbref_red_cards",
-    "home_fbref_fouls_committed", "home_fbref_fouls_drawn",
-    "home_fbref_offsides", "home_fbref_crosses",
-    "home_fbref_interceptions", "home_fbref_tackles_won",
-    "home_fbref_pens_won", "home_fbref_pens_conceded",
-    "home_fbref_sota", "home_fbref_goals_against",
-    "home_fbref_saves", "home_fbref_save_pct",
-    "home_fbref_clean_sheets",
-    "home_fbref_pk_faced", "home_fbref_pk_saved",
-    # FBref away team stats
-    "away_fbref_games",
-    "away_fbref_shots", "away_fbref_shots_on_target",
-    "away_fbref_shot_accuracy",
-    "away_fbref_goals_per_shot", "away_fbref_goals_per_sot",
-    "away_fbref_yellow_cards", "away_fbref_red_cards",
-    "away_fbref_fouls_committed", "away_fbref_fouls_drawn",
-    "away_fbref_offsides", "away_fbref_crosses",
-    "away_fbref_interceptions", "away_fbref_tackles_won",
-    "away_fbref_pens_won", "away_fbref_pens_conceded",
-    "away_fbref_sota", "away_fbref_goals_against",
-    "away_fbref_saves", "away_fbref_save_pct",
-    "away_fbref_clean_sheets",
-    "away_fbref_pk_faced", "away_fbref_pk_saved",
-]
+# The lists themselves live in ``features/feature_columns.py`` — the single
+# source of truth shared with ``routers/predict.py``. They used to be
+# copy-pasted into both modules, which is how the inference path silently
+# drifted from the training path. Import them; never redefine them here.
 
 # The 1X2 target column produced by builder.py.
 TARGET_COL = "target_result"
@@ -281,54 +223,16 @@ def filter_training_leagues(
 
     return df.loc[keep].reset_index(drop=True)
 
-BTTS_FEATURE_COLS = [
-    "home_btts_rate_5", "away_btts_rate_5",
-    "home_cs_rate_5", "away_cs_rate_5",
-    "home_scored_rate_5", "away_scored_rate_5",
-    "home_form_gf_5", "away_form_gf_5",
-    "home_form_ga_5", "away_form_ga_5",
-    "home_fbref_goals_against", "away_fbref_goals_against",
-    "home_fbref_clean_sheets", "away_fbref_clean_sheets",
-    "home_elo", "away_elo",
-    "league_encoded",
-]
 
+# --------------------------------------------------------------------------- #
+# Market targets (never feature columns)
+# --------------------------------------------------------------------------- #
+
+#: BTTS and the two totals use their own feature set (see
+#: ``features/feature_columns.py``); these are the labels they train on.
 TARGET_BTTS_COL = "target_btts"
 
-OVER25_FEATURE_COLS = [
-    "home_over25_rate_5", "away_over25_rate_5",
-    "home_high_scoring_rate_5", "away_high_scoring_rate_5",
-    "home_form_gf_5", "away_form_gf_5",
-    "home_form_ga_5", "away_form_ga_5",
-    "home_form_gf_10", "away_form_gf_10",
-    "home_fbref_goals_against", "away_fbref_goals_against",
-    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
-    "home_elo", "away_elo",
-    "elo_difference",
-    "league_encoded",
-]
-
 TARGET_OVER25_COL = "target_over25"
-
-# Dedicated feature set for the Over 9.5 corners classifier. Deliberately
-# narrow: opponent-adjusted corner rates carry the signal, while the shared
-# 108-column vector dilutes it with goal/discipline noise.
-OVER95_CORNERS_FEATURE_COLS = [
-    # New corner-specific rolling rates (per game / fractions)
-    "home_corners_for_pg_5", "away_corners_for_pg_5",
-    "home_corners_against_pg_5", "away_corners_against_pg_5",
-    "home_over95_corners_rate_5", "away_over95_corners_rate_5",
-    # Existing venue-specific corners taken
-    "home_home_corners_5", "away_away_corners_5",
-    # Existing overall corners form
-    "home_form_corners_5", "away_form_corners_5",
-    # FBref attacking volume — the closest available corner drivers
-    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
-    "home_fbref_crosses", "away_fbref_crosses",
-    # Team strength and league context
-    "home_elo", "away_elo",
-    "league_encoded",
-]
 
 TARGET_OVER95_CORNERS_COL = "target_over95_corners"
 
