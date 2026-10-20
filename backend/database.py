@@ -589,6 +589,54 @@ class PlayerSeasonStats(Base):
 # --------------------------------------------------------------------------- #
 
 
+def ensure_fbref_team_stats_columns(bind=None) -> bool:
+    """Add any missing FBrefTeamStats columns to an existing table safely.
+
+    ``create_all`` creates new tables with every mapped column, whereas an
+    already-deployed ``fbref_team_stats`` table only receives newer columns via
+    additive ``ALTER TABLE ... ADD COLUMN``. Existing columns and stored data
+    are never dropped or altered.
+    """
+    target = engine if bind is None else bind
+    if target is None:
+        print("[database] ERROR: no database engine configured, cannot ensure fbref_team_stats columns.")
+        return False
+    try:
+        inspector = inspect(target)
+        if "fbref_team_stats" not in inspector.get_table_names():
+            return True
+        existing_cols = {
+            column["name"] for column in inspector.get_columns("fbref_team_stats")
+        }
+        dialect = target.dialect.name
+        added: list[str] = []
+        for col in FBrefTeamStats.__table__.columns:
+            if col.name == "id" or col.name in existing_cols:
+                continue
+            is_string = isinstance(col.type, String)
+            if dialect == "postgresql":
+                sql_type = "VARCHAR" if is_string else "DOUBLE PRECISION"
+                statement = (
+                    f"ALTER TABLE fbref_team_stats "
+                    f"ADD COLUMN IF NOT EXISTS {col.name} {sql_type}"
+                )
+            else:
+                sql_type = "VARCHAR" if is_string else "FLOAT"
+                statement = (
+                    f"ALTER TABLE fbref_team_stats "
+                    f"ADD COLUMN {col.name} {sql_type}"
+                )
+            with target.begin() as connection:
+                connection.exec_driver_sql(statement)
+            added.append(col.name)
+        if added:
+            print(f"[database] Added fbref_team_stats columns: {', '.join(added)}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[database] ERROR: could not ensure fbref_team_stats columns: {exc}")
+        return False
+
+
 def ensure_team_corners_column(bind=None) -> bool:
     """Add the season-total corners column to an existing table safely.
 
@@ -684,6 +732,8 @@ def init_db(bind=None) -> bool:
 
     try:
         Base.metadata.create_all(bind=target)
+        if not ensure_fbref_team_stats_columns(target):
+            return False
         if not ensure_team_corners_column(target):
             return False
         cleanup_non_team_rows(target)
@@ -708,6 +758,7 @@ __all__ = [
     "TeamSeasonStats",
     "cleanup_non_team_rows",
     "engine",
+    "ensure_fbref_team_stats_columns",
     "ensure_team_corners_column",
     "get_database_url",
     "get_engine_url",

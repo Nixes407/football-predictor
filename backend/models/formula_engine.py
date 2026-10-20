@@ -38,7 +38,12 @@ _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from database import SessionLocal, TeamSeasonStats, PlayerSeasonStats
+from database import (
+    FBrefTeamStats,
+    PlayerSeasonStats,
+    SessionLocal,
+    TeamSeasonStats,
+)
 from sqlalchemy import and_, text
 
 # ═══════════════════════════════════════════
@@ -328,6 +333,11 @@ def _warn_once(key: str, message: str) -> None:
     print(message)
 
 
+def invalidate_cache() -> None:
+    """Clear cached league/season lookups after new stats are collected."""
+    _CACHE.clear()
+
+
 def _cache_get(key: tuple) -> Any:
     """Return a cached value, or None when absent/expired."""
     hit = _CACHE.get(key)
@@ -585,6 +595,70 @@ def _merge_stat_dicts(primary: dict, secondary: dict) -> dict:
     return merged
 
 
+def _find_fbref_team_row(db, team: str, league: str, season: str | None):
+    """Return matching ``FBrefTeamStats`` row for ``(team, league, season)``, or ``None``."""
+    try:
+        query = db.query(FBrefTeamStats).filter(FBrefTeamStats.league == league)
+        if season:
+            query = query.filter(FBrefTeamStats.season == season)
+        else:
+            query = query.order_by(FBrefTeamStats.season.desc())
+        exact = query.filter(FBrefTeamStats.team == team).first()
+        if exact is not None:
+            return exact
+        target_key = _dedup_team_key(team)
+        for candidate in query.all():
+            if _dedup_team_key(str(candidate.team)) == target_key:
+                return candidate
+    except Exception:
+        return None
+    return None
+
+
+def _fbref_fallback_stats_dict(fbref_row, target_games: float | None) -> dict:
+    """Map an ``FBrefTeamStats`` row into the flat ``formula_engine`` stat dict.
+
+    When ``target_games`` is known (a season-totals ``TeamSeasonStats`` row),
+    keep season totals so ``to_per_game`` normalises everything together. When
+    ``target_games`` is ``None`` (a per-game row), divide totals by
+    ``fbref_row.games`` so all values share per-game units.
+    """
+    fb_games = _safe(getattr(fbref_row, "games", None), 0.0)
+    if target_games is not None:
+        scale: float | None = 1.0
+    elif fb_games > 0:
+        scale = 1.0 / fb_games
+    else:
+        scale = None
+
+    def _scaled(val):
+        if val is None or scale is None:
+            return None
+        try:
+            fval = float(val)
+            return round(fval * scale, 4) if math.isfinite(fval) else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "shots": _scaled(getattr(fbref_row, "shots", None)),
+        "sot": _scaled(getattr(fbref_row, "shots_on_target", None)),
+        "sot_pct": getattr(fbref_row, "shot_accuracy", None),
+        "g_per_sh": getattr(fbref_row, "goals_per_shot", None),
+        "cs": _scaled(getattr(fbref_row, "clean_sheets", None)),
+        "saves": _scaled(getattr(fbref_row, "saves", None)),
+        "save_pct": getattr(fbref_row, "save_pct", None),
+        "sota": _scaled(getattr(fbref_row, "sota", None)),
+        "ga": _scaled(getattr(fbref_row, "goals_against", None)),
+        "misc_crs": _scaled(getattr(fbref_row, "crosses", None)),
+        "int_": _scaled(getattr(fbref_row, "interceptions", None)),
+        "tkl": _scaled(getattr(fbref_row, "tackles_won", None)),
+        "team": getattr(fbref_row, "team", None),
+        "league": getattr(fbref_row, "league", None),
+        "season": getattr(fbref_row, "season", None),
+    }
+
+
 def _blend_stats(
     current: dict,
     previous: dict | None,
@@ -712,11 +786,22 @@ def _load_season_stats(
         r for r in variants if exact is None or r.id != exact.id
     ]
     if not rows:
-        return None
+        fbref_only = _find_fbref_team_row(db, team, league, season)
+        if fbref_only is None:
+            return None
+        stats = _fbref_fallback_stats_dict(fbref_only, target_games=None)
+        stats["games"] = None
+        return stats
 
     stats = _row_to_stats_dict(rows[0])
     for extra in rows[1:]:
         stats = _merge_stat_dicts(stats, _row_to_stats_dict(extra))
+    row_games = games_played(stats)
+    fbref_row = _find_fbref_team_row(db, rows[0].team or team, league, season)
+    if fbref_row is not None:
+        stats = _merge_stat_dicts(
+            stats, _fbref_fallback_stats_dict(fbref_row, target_games=row_games)
+        )
     return stats
 
 
@@ -990,7 +1075,14 @@ def load_team_stats(
             ]
 
         if row is None and not matching_rows:
-            return None
+            fbref_only = _find_fbref_team_row(db, team, league, season_filter)
+            if fbref_only is None:
+                return None
+            stats = _fbref_fallback_stats_dict(fbref_only, target_games=None)
+            stats["games"] = None
+            return _blend_with_previous_season(
+                db, fbref_only.team or team, league, stats
+            )
 
         primary = row if row is not None else matching_rows[0]
         stats = _row_to_stats_dict(primary)
@@ -999,6 +1091,14 @@ def load_team_stats(
                 continue
             stats = _merge_stat_dicts(stats, _row_to_stats_dict(extra))
         stats["games"] = games_played(stats)
+        fbref_row = _find_fbref_team_row(
+            db, primary.team or team, league, primary.season or season_filter
+        )
+        if fbref_row is not None:
+            stats = _merge_stat_dicts(
+                stats,
+                _fbref_fallback_stats_dict(fbref_row, target_games=stats["games"]),
+            )
         # Early in the season, lean on last season so one thin row does not
         # carry the whole prediction (see _blend_with_previous_season).
         stats = _blend_with_previous_season(

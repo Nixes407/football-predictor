@@ -365,8 +365,17 @@ def build_inference_features(
         elo_lookup=elo_lookup,
     )
 
+    # Live fixtures (before_date is None) may use an FBref snapshot scraped
+    # earlier on the same UTC day; historical parity calls pass before_date
+    # explicitly and keep the exact midnight cutoff used by builder.py.
+    fbref_cutoff = (
+        pd.Timestamp.now(tz="UTC")
+        if before_date is None
+        else cutoff
+    )
+
     fixture = pd.DataFrame([{
-        "date": cutoff,
+        "date": fbref_cutoff,
         "home_team": home_team,
         "away_team": away_team,
         "league": league,

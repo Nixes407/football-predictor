@@ -7,7 +7,9 @@ name: Daily Data Collection + Model Retrain
 #     [1/5] StatsBomb collector
 #     [2/5] FotMob collector (+ Understat backup)
 #     [3/5] Match collector (football-data.co.uk via soccerdata)
-#     [4/5] FBref collector
+#     [4/5] Trigger FBref scrape on Render + poll status (max 12 min, non-blocking)
+#           (GitHub Actions AWS IPs trigger Cloudflare CAPTCHAs on FBref;
+#            Render runs ONLY fbref_collector.py via headless Chrome)
 #     [5/5] builder.py -> features.csv, trainer.py -> 9 models
 #           -> upload every artifact to Supabase Storage bucket "models"
 #     [6/6] POST $RENDER_BACKEND/predict/admin/reload-models
@@ -175,28 +177,91 @@ jobs:
           fi
           echo "==> API-Football collection complete"
 
-      # ── [4/5] FBref ───────────────────────────────────────────────────────
-      # MOVED HERE from Render (it used to run inside run-pipeline-fast).
-      # Season stats for the Big Five leagues, upserted into fbref_team_stats.
-      # continue-on-error: true — if it fails, the builder still works from the
-      # FBref rows already in the database (and check_features.py flags a
-      # completely empty FBref signal).
-      - name: "[4/5] Run FBref Collector"
-        id: fbref
-        working-directory: backend
+      # ── [4/5] FBref (executed on Render, never on GitHub Actions) ────────
+      # GitHub Actions runners sit on AWS us-east IPs where FBref challenges
+      # headless browsers with an unsolvable Cloudflare CAPTCHA. Render runs
+      # ONLY fbref_collector.py (Big Five leagues) and writes directly to
+      # Supabase PostgreSQL before builder.py runs below. Both steps exit 0 on
+      # failure/timeout so training is never blocked.
+      - name: "[4/5] Trigger FBref scrape on Render"
+        id: fbref_trigger
         continue-on-error: true
         run: |
           set +e
-          echo "==> [4/5] Scraping FBref team stats (Big Five, 2021-22 .. current)..."
-          python data/fbref_collector.py
-          RC=$?
-          if [ $RC -ne 0 ]; then
-            echo "::warning::FBref collector failed with exit $RC — builder will use the FBref rows already stored in the database."
-            echo "fbref_ok=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          BASE="${RENDER_BACKEND%/}"
+          URL="$BASE/predict/admin/run-fbref-scrape?secret=${PIPELINE_SECRET}"
+          TRIGGERED="false"
+          for attempt in 1 2 3; do
+            echo "==> [4/5] Triggering FBref scrape on Render (attempt $attempt)..."
+            HTTP=$(curl -sS --max-time 90 -o /tmp/fbref_trigger.json -w "%{http_code}" -X POST "$URL")
+            RC=$?
+            if [ $RC -ne 0 ]; then
+              HTTP="000"
+            fi
+            echo "HTTP status: $HTTP"
+            cat /tmp/fbref_trigger.json 2>/dev/null || true
+            echo
+            if [ "$HTTP" = "200" ]; then
+              TRIGGERED="true"
+              break
+            fi
+            sleep 10
+          done
+          if [ "$TRIGGERED" != "true" ]; then
+            echo "::warning::Could not trigger FBref scrape on Render (HTTP $HTTP) — builder.py will use existing fbref_team_stats rows."
           fi
-          echo "==> FBref collection complete"
-          echo "fbref_ok=true" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: "[4/5] Wait for FBref scrape on Render (max 12 min)"
+        id: fbref_wait
+        continue-on-error: true
+        run: |
+          set +e
+          BASE="${RENDER_BACKEND%/}"
+          URL="$BASE/predict/admin/fbref-scrape-status?secret=${PIPELINE_SECRET}"
+          POLL_SLEEP="${FBREF_POLL_INTERVAL_SECONDS:-30}"
+          echo "==> [4/5] Polling Render FBref scrape status (up to 24 x ${POLL_SLEEP}s = 12 min max)..."
+          for i in $(seq 1 24); do
+            HTTP=$(curl -sS --max-time 30 -o /tmp/fbref_status.json -w "%{http_code}" "$URL")
+            RC=$?
+            if [ $RC -ne 0 ]; then
+              HTTP="000"
+            fi
+            STATE="unknown"
+            if [ "$HTTP" = "200" ] && [ -s /tmp/fbref_status.json ]; then
+              STATE=$(python3 - <<'PY'
+          import json
+          with open("/tmp/fbref_status.json") as fh:
+              data = json.load(fh)
+          status = str(data.get("status") or "unknown")
+          rows = data.get("fbref_team_stats_rows")
+          last_run = data.get("last_run_at")
+          last_res = data.get("last_result")
+          print(f"{status}\t{rows}\t{last_run}\t{last_res}")
+          PY
+              )
+              STATUS=$(printf "%s" "$STATE" | cut -f1)
+              ROWS=$(printf "%s" "$STATE" | cut -f2)
+              LAST_RUN=$(printf "%s" "$STATE" | cut -f3)
+              LAST_RES=$(printf "%s" "$STATE" | cut -f4-)
+              echo "    [poll $i/24] status=$STATUS | fbref_team_stats_rows=$ROWS | last_run_at=$LAST_RUN | last_result=$LAST_RES"
+              if [ "$STATUS" = "complete" ]; then
+                echo "==> FBref scrape complete on Render! fbref_team_stats_rows=$ROWS"
+                exit 0
+              fi
+              if [ "$STATUS" = "failed" ]; then
+                echo "::warning::FBref scrape failed on Render ($LAST_RES) — builder.py will proceed with existing DB rows ($ROWS)."
+                exit 0
+              fi
+            else
+              echo "    [poll $i/24] HTTP=$HTTP waiting for Render status response..."
+            fi
+            if [ "$i" -lt 24 ]; then
+              sleep "$POLL_SLEEP"
+            fi
+          done
+          echo "::warning::FBref scrape did not finish within 12 minutes (24 polls) — builder.py will proceed with existing DB rows."
+          exit 0
 
       # ── [5/5] Builder + Trainer ───────────────────────────────────────────
       # This is the memory-heavy part that OOM-killed Render. A 7 GB runner
@@ -327,8 +392,8 @@ jobs:
           echo "================================================================"
           echo "Daily update SUCCESSFUL"
           echo "Date       : $(date -u)"
-          echo "Collectors : StatsBomb, FotMob, Match, FBref (Render no longer runs any)"
+          echo "Collectors : StatsBomb, FotMob, Match (GitHub Actions) + FBref (Render)"
           echo "Training   : builder.py + trainer.py on this GitHub Actions runner"
           echo "Artifacts  : Supabase Storage bucket 'models' (9 models + encoders + features.csv)"
-          echo "Render     : models reloaded via /predict/admin/reload-models"
+          echo "Render     : FBref scraped via /predict/admin/run-fbref-scrape; models reloaded via /predict/admin/reload-models"
           echo "================================================================"
