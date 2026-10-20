@@ -625,6 +625,55 @@ def ensure_team_corners_column(bind=None) -> bool:
         return False
 
 
+def cleanup_non_team_rows(bind=None) -> int:
+    """Delete leaked player leaderboard rows and empty shells from team_season_stats.
+
+    FotMob's legacy ``teamOrPlayer="team"`` fallback on
+    ``/api/data/leagueseasondeepstats`` returned player leaderboards for bare
+    stat names (``total_scoring_att``, ``accurate_cross``, ...), inserting
+    hundreds of player rows per league/season into ``team_season_stats``.
+    Those rows carry neither league-standings columns (``gk_ga``, ``gk_w``,
+    ``gk_d``, ``gk_l``), team possession (``pos_poss``), nor team-only
+    FBref/Understat/StatsBomb columns. Deleting them at startup restores
+    ``team_season_stats`` to actual clubs only.
+    """
+    target = engine if bind is None else bind
+    if target is None:
+        return 0
+    try:
+        inspector = inspect(target)
+        if "team_season_stats" not in inspector.get_table_names():
+            return 0
+        statement = """
+            DELETE FROM team_season_stats
+            WHERE pos_poss IS NULL
+              AND gk_ga IS NULL
+              AND gk_ga90 IS NULL
+              AND gk_w IS NULL
+              AND gk_d IS NULL
+              AND gk_l IS NULL
+              AND sh_npxg IS NULL
+              AND sh_sh_per90 IS NULL
+              AND sh_sot_per90 IS NULL
+              AND ps_prgp IS NULL
+              AND pos_prgc IS NULL
+              AND gsc_gca IS NULL
+              AND gsc_gca90 IS NULL
+              AND def_press IS NULL
+              AND def_tkl_int IS NULL
+              AND pos_touch_att3rd IS NULL
+        """
+        with target.begin() as connection:
+            result = connection.exec_driver_sql(statement)
+            deleted = int(result.rowcount or 0)
+        if deleted > 0:
+            print(f"[database] Removed {deleted} non-team/player rows from team_season_stats")
+        return deleted
+    except Exception as exc:  # noqa: BLE001
+        print(f"[database] WARNING: could not clean non-team rows: {exc}")
+        return 0
+
+
 def init_db(bind=None) -> bool:
     """Create tables and safely apply the small additive schema evolution."""
     target = engine if bind is None else bind
@@ -637,6 +686,7 @@ def init_db(bind=None) -> bool:
         Base.metadata.create_all(bind=target)
         if not ensure_team_corners_column(target):
             return False
+        cleanup_non_team_rows(target)
         tables = sorted(inspect(target).get_table_names())
         print(f"[database] Tables ready: {', '.join(tables) or 'none'}")
         return True
@@ -656,6 +706,7 @@ __all__ = [
     "PlayerSeasonStats",
     "SessionLocal",
     "TeamSeasonStats",
+    "cleanup_non_team_rows",
     "engine",
     "ensure_team_corners_column",
     "get_database_url",
