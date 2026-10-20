@@ -422,6 +422,15 @@ _PROTECTED_TEAM_STEMS = frozenset({
 })
 
 _TEAM_ALIASES = {
+    # FotMob's short forms. Without them the suffix strip below turns
+    # "man city" and "man utd" into the same key ("man") — two different
+    # clubs collapsed into one — while leaving FBref's "manchester city"
+    # / "manchester utd" as two more keys for the same two clubs.
+    "man city":                 "manchester city",
+    "man utd":                  "manchester united",
+    "man united":               "manchester united",
+    "manchester utd":           "manchester united",
+    "spurs":                    "tottenham",
     "wolverhampton":            "wolves",
     "wolverhampton wanderers":  "wolves",
     "nott'm forest":            "nottingham forest",
@@ -1015,90 +1024,179 @@ def resolve_season(league: str, season: str | None = None) -> str | None:
     return seasons[0] if seasons else None
 
 
+# Columns that make a row a real team season rather than an empty shell (a
+# standings-only API-Football row, a FotMob row whose deep-stats fetch
+# failed) or a mis-keyed artefact (a numeric team id, a blank name). A row
+# must carry at least one of them to take part in league calibration.
+_MEASURED_TEAM_COLUMNS = (
+    "sh_xg", "sh_npxg", "sh_shots", "sh_sot", "sh_goals",
+    "gk_ga", "gk_saves",
+    "ps_prgp", "pos_prgc", "gsc_gca",
+    "def_press", "def_tkl_int",
+    "misc_crs", "pos_poss", "pos_touch_att3rd",
+)
+
+# Most clubs a single top-flight season can hold — the expanded training set
+# tops out at 24 (ENG-Championship). A larger count means team_season_stats
+# holds rows that are not that league's clubs for that season, so the
+# calibration means are computed over teams that do not play in it.
+MAX_PLAUSIBLE_LEAGUE_TEAMS = 30
+
+
+def _is_real_team_row(row) -> bool:
+    """
+    Whether one ``team_season_stats`` row really describes a club's season.
+
+    Collectors upsert a row as soon as they see a team, so the table also
+    holds empty shells and artefacts whose "team" is a numeric id. Counting
+    those inflates ``league_teams`` and drags the league means towards the
+    neutral defaults, so they are dropped here.
+    """
+    name = str(getattr(row, "team", "") or "").strip()
+    if not name or not any(ch.isalpha() for ch in name):
+        return False
+    return any(
+        getattr(row, column, None) is not None
+        for column in _MEASURED_TEAM_COLUMNS
+    )
+
+
+def _league_season_rows(
+    league: str,
+    season: str | None,
+) -> tuple[list, str | None]:
+    """
+    Every team row for exactly one league and one season.
+
+    Both halves of the scope are applied together, and a missing season is
+    resolved from the league rather than dropped: filtering on the league
+    alone aggregates every campaign on file plus every club that ever
+    played in it, which is how a 20-club league could be reported as
+    hundreds of teams.
+
+    Rows are deduplicated by club (:func:`_dedup_team_key`) after the
+    unusable ones are dropped, so one club stored under two provider
+    spellings is still one team. Returns ``(rows, season_used)``; ``rows``
+    is empty when the league has no rows for that season, or when no
+    session can be opened.
+    """
+    if not season:
+        season = (league_seasons(league) or [None])[0]
+    if not season:
+        return [], None
+
+    db = _new_session()
+    if db is None:
+        return [], season
+    try:
+        query = db.query(TeamSeasonStats).filter(and_(
+            TeamSeasonStats.league == league,
+            TeamSeasonStats.season == season,
+        ))
+
+        rows: list = []
+        seen: set[str] = set()
+        for row in query.all():
+            # Defence in depth: the SQL filter is the guarantee, this is the
+            # check that proves it. A row that somehow slipped through (a
+            # look-alike label, a driver that ignored the bind parameters)
+            # must never reach league calibration.
+            if str(row.league) != league or str(row.season) != season:
+                continue
+            if not _is_real_team_row(row):
+                continue
+            key = _dedup_team_key(str(row.team).lower().strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+
+        if len(rows) > MAX_PLAUSIBLE_LEAGUE_TEAMS:
+            # Name the first few offenders: an inflated count is always a
+            # data problem (another league's clubs, a stale campaign, player
+            # rows, ...), and the Render log is the only place it surfaces.
+            sample = ", ".join(str(r.team) for r in rows[:10])
+            _warn_once(
+                f"league_size:{league}:{season}",
+                f"[formula] WARNING: {league} {season} holds {len(rows)} "
+                f"distinct teams — a top flight has at most "
+                f"{MAX_PLAUSIBLE_LEAGUE_TEAMS}, so team_season_stats keeps "
+                f"rows that are not that league's clubs. Rating "
+                f"normalisation for it is unreliable. First rows: {sample}",
+            )
+        return rows, season
+    except Exception as exc:
+        print(f"[formula] ERROR loading {league} {season} rows: {exc}")
+        return [], season
+    finally:
+        _close_session(db)
+
+
 def load_league_averages(
     league: str,
     season: str | None = None,
 ) -> dict:
     """
-    Compute league-average stats from all teams
-    in team_season_stats for the given league.
+    Compute league-average stats from every team
+    in team_season_stats for one league and one season.
     Used to normalise team ratings.
 
     Every average is per game: rows are converted with :func:`to_per_game`
     first, which is what the fixed denominators in the rating formulas and
     the defaults in ``DEFAULT_LEAGUE_AVERAGES`` assume.
+
+    The league and the season are both mandatory: see
+    :func:`_league_season_rows`. A season that the league has no rows for
+    yields the neutral defaults, never an average taken across seasons or
+    across other leagues.
     """
     cache_key = ("league_avgs", league, season)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    db = _new_session()
-    if db is None:
+    rows, season = _league_season_rows(league, season)
+
+    if not rows:
         return dict(DEFAULT_LEAGUE_AVERAGES, teams=0, season=season)
-    try:
-        query = db.query(TeamSeasonStats).filter(
-            TeamSeasonStats.league == league
-        )
-        if season:
-            query = query.filter(TeamSeasonStats.season == season)
-        rows = query.all()
 
-        seen = set()
-        unique_rows = []
-        for r in rows:
-            key = _dedup_team_key(r.team.lower().strip())
-            if key not in seen:
-                seen.add(key)
-                unique_rows.append(r)
-        rows = unique_rows
+    per_game = [to_per_game(_row_to_stats_dict(row)) for row in rows]
 
-        if not rows:
-            return dict(DEFAULT_LEAGUE_AVERAGES, teams=0, season=season)
+    xg_vals    = [p["xg"]    for p in per_game if _safe(p.get("xg"))    > 0]
+    xga_vals   = [p["ga"]    for p in per_game if _safe(p.get("ga"))    > 0]
+    shots_vals = [p["shots"] for p in per_game if _safe(p.get("shots")) > 0]
+    sot_vals   = [p["sot"]   for p in per_game if _safe(p.get("sot"))   > 0]
+    saves_vals = [p["saves"] for p in per_game if _safe(p.get("saves")) > 0]
+    gca90_vals = [p["gca90"] for p in per_game if _safe(p.get("gca90")) > 0]
+    prgc_vals  = [p["prgc"]  for p in per_game if _safe(p.get("prgc"))  > 0]
+    prgp_vals  = [p["prgp"]  for p in per_game if _safe(p.get("prgp"))  > 0]
+    att3_vals  = [
+        p["touch_att3rd"] for p in per_game
+        if _safe(p.get("touch_att3rd")) > 0
+    ]
+    tklint_vals = [
+        p["tkl_int"] for p in per_game if _safe(p.get("tkl_int")) > 0
+    ]
 
-        per_game = [to_per_game(_row_to_stats_dict(row)) for row in rows]
+    def avg(lst, default=LEAGUE_AVG_XG):
+        return sum(lst) / len(lst) if lst else default
 
-        xg_vals    = [p["xg"]    for p in per_game if _safe(p.get("xg"))    > 0]
-        xga_vals   = [p["ga"]    for p in per_game if _safe(p.get("ga"))    > 0]
-        shots_vals = [p["shots"] for p in per_game if _safe(p.get("shots")) > 0]
-        sot_vals   = [p["sot"]   for p in per_game if _safe(p.get("sot"))   > 0]
-        saves_vals = [p["saves"] for p in per_game if _safe(p.get("saves")) > 0]
-        gca90_vals = [p["gca90"] for p in per_game if _safe(p.get("gca90")) > 0]
-        prgc_vals  = [p["prgc"]  for p in per_game if _safe(p.get("prgc"))  > 0]
-        prgp_vals  = [p["prgp"]  for p in per_game if _safe(p.get("prgp"))  > 0]
-        att3_vals  = [
-            p["touch_att3rd"] for p in per_game
-            if _safe(p.get("touch_att3rd")) > 0
-        ]
-        tklint_vals = [
-            p["tkl_int"] for p in per_game if _safe(p.get("tkl_int")) > 0
-        ]
-
-        def avg(lst, default=LEAGUE_AVG_XG):
-            return sum(lst) / len(lst) if lst else default
-
-        averages = {
-            "avg_xg":    avg(xg_vals),
-            "avg_xga":   avg(xga_vals),
-            "avg_shots": avg(shots_vals),
-            "avg_sot":   avg(sot_vals),
-            "avg_saves": avg(saves_vals),
-            "avg_gca90": avg(gca90_vals, DEFAULT_GCA90),
-            "avg_prgc":    avg(prgc_vals,   DEFAULT_LEAGUE_AVERAGES["avg_prgc"]),
-            "avg_prgp":    avg(prgp_vals,   DEFAULT_LEAGUE_AVERAGES["avg_prgp"]),
-            "avg_att3rd":  avg(att3_vals,   DEFAULT_LEAGUE_AVERAGES["avg_att3rd"]),
-            "avg_tkl_int": avg(tklint_vals, DEFAULT_LEAGUE_AVERAGES["avg_tkl_int"]),
-            "teams":     len(rows),
-            "season":    season,
-        }
-        _cache_set(cache_key, averages)
-        return averages
-
-    except Exception as exc:
-        print(f"[formula] ERROR loading league averages: {exc}")
-        return dict(DEFAULT_LEAGUE_AVERAGES, teams=0, season=season)
-    finally:
-        _close_session(db)
+    averages = {
+        "avg_xg":    avg(xg_vals),
+        "avg_xga":   avg(xga_vals),
+        "avg_shots": avg(shots_vals),
+        "avg_sot":   avg(sot_vals),
+        "avg_saves": avg(saves_vals),
+        "avg_gca90": avg(gca90_vals, DEFAULT_GCA90),
+        "avg_prgc":    avg(prgc_vals,   DEFAULT_LEAGUE_AVERAGES["avg_prgc"]),
+        "avg_prgp":    avg(prgp_vals,   DEFAULT_LEAGUE_AVERAGES["avg_prgp"]),
+        "avg_att3rd":  avg(att3_vals,   DEFAULT_LEAGUE_AVERAGES["avg_att3rd"]),
+        "avg_tkl_int": avg(tklint_vals, DEFAULT_LEAGUE_AVERAGES["avg_tkl_int"]),
+        "teams":     len(rows),
+        "season":    season,
+    }
+    _cache_set(cache_key, averages)
+    return averages
 
 
 def _empty_squad_summary() -> dict:
@@ -1252,7 +1350,16 @@ def load_league_squads(
 
     The league calibration pass needs a squad summary per team; doing that
     one team at a time would mean 20-100 extra round trips.
+
+    Scoped to one season like the team rows it accompanies: a missing season
+    is resolved from the league, so a squad is never merged across campaigns
+    (a player who changed club would otherwise strengthen two of them).
     """
+    if not season:
+        season = (league_seasons(league) or [None])[0]
+    if not season:
+        return {}
+
     db = _new_session()
     if db is None:
         return {}
@@ -1261,11 +1368,10 @@ def load_league_squads(
             db.query(PlayerSeasonStats)
             .filter(
                 PlayerSeasonStats.league == league,
+                PlayerSeasonStats.season == season,
                 PlayerSeasonStats.goals.isnot(None),
             )
         )
-        if season:
-            query = query.filter(PlayerSeasonStats.season == season)
         rows = (
             query
             .order_by(
@@ -1280,9 +1386,9 @@ def load_league_squads(
         return squads
     except Exception as exc:
         _warn_once(
-            f"league_squads:{league}",
+            f"league_squads:{league}:{season}",
             f"[formula] WARNING: could not load league squads for "
-            f"{league}: {exc}",
+            f"{league} {season}: {exc}",
         )
         return {}
     finally:
@@ -1699,6 +1805,11 @@ def compute_league_baselines(
     :func:`compute_corner_markets` estimates corners directly and is not
     rescaled by it.
 
+    The league *and* the season are both part of the scope: the means are
+    taken over the clubs of that one competition in that one campaign (see
+    :func:`_league_season_rows`), so a team's relative rating is always
+    measured against its own league.
+
     Returns neutral baselines (all multipliers 1.0) when the league has no
     rows, so the engine still predicts instead of failing.
     """
@@ -1707,6 +1818,9 @@ def compute_league_baselines(
     if cached is not None:
         return cached
 
+    # Resolve the season first so the baselines, the league averages and
+    # the squads below are all read from the same campaign.
+    rows, season = _league_season_rows(league, season)
     league_avgs = load_league_averages(league, season)
     fallback = {
         "mean_attack":   1.0,
@@ -1724,40 +1838,15 @@ def compute_league_baselines(
         "season":        season,
     }
 
-    db = _new_session()
-    if db is None:
-        return fallback
-    try:
-        query = db.query(TeamSeasonStats).filter(
-            TeamSeasonStats.league == league
-        )
-        if season:
-            query = query.filter(TeamSeasonStats.season == season)
-        rows = query.all()
-
-        seen = set()
-        unique_rows = []
-        for r in rows:
-            key = _dedup_team_key(r.team.lower().strip())
-            if key not in seen:
-                seen.add(key)
-                unique_rows.append(r)
-        rows = unique_rows
-
-        # Snapshot to plain dicts inside the session: the ORM instances
-        # would be detached once it closes.
-        team_rows = [(_row_to_stats_dict(row), row.team) for row in rows]
-    except Exception as exc:
-        print(f"[formula] ERROR loading league baselines: {exc}")
-        return fallback
-    finally:
-        _close_session(db)
+    # Snapshot to plain dicts: the ORM instances would be detached once the
+    # session inside _league_season_rows closes.
+    team_rows = [(_row_to_stats_dict(row), row.team) for row in rows]
 
     if not team_rows:
         _warn_once(
-            f"baselines:{league}",
+            f"baselines:{league}:{season}",
             f"[formula] WARNING: no team_season_stats rows for "
-            f"{league} — using neutral baselines",
+            f"{league} {season} — using neutral baselines",
         )
         return fallback
 
