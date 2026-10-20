@@ -222,6 +222,16 @@ jobs:
           echo "==> Checking training/inference feature parity..."
           python -m unittest tests.test_feature_parity -v
 
+      # Fails the run if the formula engine's league calibration ever stops
+      # being scoped to one league and one season: league_teams would report
+      # every club in team_season_stats instead of the league's, and every
+      # attack/defence rating would be normalised against the wrong mean.
+      - name: "[5/5] League-scope regression tests (formula engine)"
+        working-directory: backend
+        run: |
+          echo "==> Checking league baselines are league+season scoped..."
+          python -m unittest tests.test_formula_league_scope -v
+
       - name: "[5/5] Train + upload models (trainer.py)"
         working-directory: backend
         run: |
