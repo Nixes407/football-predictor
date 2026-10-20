@@ -60,6 +60,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 # Shared bucket manifest — the trainer uploads exactly what this file lists.
 import model_artifacts as artifacts  # noqa: E402  (needs the sys.path above)
+import fbref_scrape_runner  # noqa: E402  (background FBref collector on Render)
 
 # Feature definitions and assembly. The column lists are the SAME objects the
 # trainer fits on (``features/feature_columns.py``), and the feature *values*
@@ -428,6 +429,7 @@ def reload_models_from_supabase() -> dict[str, Any]:
         downloaded = _download_artifacts_to(staging_dir)
         _install_artifacts(staging_dir, downloaded)
         load_artifacts()
+        _refresh_fbref_caches()
 
         models_loaded = _loaded_model_names()
         # Every *required* object must have decoded in this run — but the
@@ -554,19 +556,50 @@ _fbref_df: pd.DataFrame | None = None
 _fbref_load_attempted = False
 
 
-def _load_fbref_snapshot() -> pd.DataFrame | None:
+_FBREF_RETRY_SECONDS = 5.0
+_fbref_last_check_ts = 0.0
+
+
+def _count_fbref_team_stats_rows() -> int:
+    """Return exact row count in ``fbref_team_stats``, or 0 when unavailable."""
+    try:
+        from database import FBrefTeamStats, SessionLocal
+
+        db = SessionLocal()
+        try:
+            return int(db.query(FBrefTeamStats).count())
+        finally:
+            db.close()
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _load_fbref_snapshot(force_reload: bool = False) -> pd.DataFrame | None:
     """Return the current ``fbref_team_stats`` rows, or None when unavailable.
 
     The builder date-filters these rows against the match date before they
     become features; doing the same at inference means a snapshot collected
-    after a team's last match still reaches the model. Attempted once per
-    process (per reload) so an unreachable database is not retried per request.
+    after a team's last match still reaches the model. Re-queries automatically
+    after ``_FBREF_RETRY_SECONDS`` whenever empty (and immediately on
+    ``force_reload=True``) so rows scraped after boot become active without a
+    server restart.
     """
-    global _fbref_df, _fbref_load_attempted
+    global _fbref_df, _fbref_load_attempted, _fbref_last_check_ts
 
-    if _fbref_load_attempted:
+    now_mono = time.monotonic()
+    if force_reload:
+        _fbref_load_attempted = False
+        _fbref_df = None
+        _fbref_last_check_ts = 0.0
+
+    if _fbref_df is not None and not _fbref_df.empty:
         return _fbref_df
+
+    if _fbref_load_attempted and (now_mono - _fbref_last_check_ts) < _FBREF_RETRY_SECONDS:
+        return _fbref_df
+
     _fbref_load_attempted = True
+    _fbref_last_check_ts = now_mono
     try:
         snapshot = feature_builder.load_fbref_stats()
         _fbref_df = (
@@ -583,6 +616,34 @@ def _load_fbref_snapshot() -> pd.DataFrame | None:
               f"FBref features come from features.csv")
         _fbref_df = None
     return _fbref_df
+
+
+def _refresh_fbref_caches() -> None:
+    """Reload ``fbref_team_stats`` snapshot and clear formula engine caches."""
+    global _elo_lookup_failures, _history_fbref_source
+    _elo_lookup_failures = 0
+    _elo_cache.clear()
+    _history_fbref_source = object()
+    _load_fbref_snapshot(force_reload=True)
+    try:
+        from models import formula_engine as _fe
+
+        if hasattr(_fe, "invalidate_cache"):
+            _fe.invalidate_cache()
+        elif hasattr(_fe, "_STATS_CACHE"):
+            _fe._STATS_CACHE.clear()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _on_fbref_scrape_state(next_state: str, err: str | None) -> None:
+    """Update router status tracking as the background FBref scrape progresses."""
+    global _pipeline_status, _pipeline_error
+    _pipeline_status = next_state
+    _pipeline_error = err or ""
+    _pipeline_log.append(
+        f"[fbref-scrape] {next_state}" + (f" — {err}" if err else "")
+    )
 
 
 _history_source = None
@@ -1196,6 +1257,10 @@ def _blend_predictions(
     blended["corners"]["over_10_5"] = round(_poisson_over(exp_total_corners, 10.5), 4)
     blended["corners"]["over_11_5"] = round(_poisson_over(exp_total_corners, 11.5), 4)
 
+    merged_fv = dict(ml_result.get("feature_vector_used") or {})
+    merged_fv.update(formula_result.get("feature_vector_used") or {})
+    blended["feature_vector_used"] = merged_fv
+
     blended["prediction_method"] = "blended"
     blended["xgb_1x2_active"] = xgb_active
     return blended
@@ -1474,6 +1539,9 @@ def diagnostics() -> dict:
                 for column in feature_builder.MATCH_HISTORY_COLUMNS)
     )
 
+    fbref_snap = _load_fbref_snapshot(force_reload=True)
+    fbref_rows = _count_fbref_team_stats_rows()
+
     return {
         "hardcoded_feature_cols": len(FEATURE_COLS),
         "model_feature_cols":     len(runtime_cols),
@@ -1496,8 +1564,9 @@ def diagnostics() -> dict:
         ),
         "elo_cache_entries":           len(_elo_cache),
         "fbref_source":                (
-            "database" if _fbref_df is not None else "features.csv"
+            "database" if (fbref_snap is not None or fbref_rows > 0) else "features.csv"
         ),
+        "fbref_team_stats_rows":       fbref_rows,
         "formula_engine": (
             get_engine_status()
             if _formula_engine_available and get_engine_status
@@ -1533,6 +1602,53 @@ def run_pipeline(secret: str = "") -> JSONResponse:  # noqa: ARG001 - legacy arg
 def run_pipeline_fast(secret: str = "") -> JSONResponse:  # noqa: ARG001 - legacy arg
     """Gone: FBref + builder + trainer now run in GitHub Actions."""
     return JSONResponse(status_code=410, content=_PIPELINE_MOVED_RESPONSE)
+
+
+@router.post(
+    "/admin/run-fbref-scrape",
+    responses={
+        403: {"description": "Invalid or missing PIPELINE_SECRET"},
+    },
+)
+def run_fbref_scrape(secret: str = "") -> dict[str, str]:
+    """Start ONLY ``data/fbref_collector.py`` in the background on Render.
+
+    GitHub Actions runners sit on AWS IPs that hit unsolvable Cloudflare
+    CAPTCHAs on FBref, whereas Render's environment runs headless Chrome via
+    ``build.sh``. Never runs ``builder.py`` or ``trainer.py`` (those remain in
+    GitHub Actions). Returns ``{"status": "started"}`` immediately.
+    """
+    expected = os.getenv("PIPELINE_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or missing secret key.",
+        )
+
+    return fbref_scrape_runner.start_fbref_scrape(
+        on_status_change=_on_fbref_scrape_state,
+        on_complete=_refresh_fbref_caches,
+    )
+
+
+@router.get(
+    "/admin/fbref-scrape-status",
+    responses={
+        403: {"description": "Invalid or missing PIPELINE_SECRET"},
+    },
+)
+def fbref_scrape_status(secret: str = "") -> dict[str, Any]:
+    """Poll status of the background FBref scrape and live DB row count."""
+    expected = os.getenv("PIPELINE_SECRET", "")
+    if not expected or secret != expected:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or missing secret key.",
+        )
+
+    return fbref_scrape_runner.get_fbref_scrape_status(
+        count_rows_fn=_count_fbref_team_stats_rows,
+    )
 
 
 @router.post(

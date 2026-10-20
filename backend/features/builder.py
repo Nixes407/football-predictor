@@ -184,6 +184,19 @@ def load_fbref_stats() -> pd.DataFrame:
     return df
 
 
+def normalise_season_label(value) -> str:
+    """Normalise 4-digit soccerdata season codes (``'2425'``) to ``'2024-2025'``."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip().replace("/", "-")
+    if len(text) == 4 and text.isdigit():
+        return f"20{text[:2]}-20{text[2:]}"
+    parts = text.split("-")
+    if len(parts) == 2 and len(parts[0]) == 2 and len(parts[1]) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        return f"20{parts[0]}-20{parts[1]}"
+    return text
+
+
 def join_fbref_features(
     features_df: pd.DataFrame,
     fbref_df: pd.DataFrame,
@@ -212,6 +225,7 @@ def join_fbref_features(
 
     stats = fbref_df.copy()
     stats["team"] = stats["team"].apply(normalise_team_name)
+    stats["season"] = stats["season"].apply(normalise_season_label)
     # Parse individually: legacy ISO strings may mix offsets and precision.
     # utc=True makes naive legacy values and timezone-aware values comparable.
     timestamps = stats.get(

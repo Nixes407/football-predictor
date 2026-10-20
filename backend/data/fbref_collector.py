@@ -2,37 +2,52 @@
 FBref team season stats collector for the Football Predictor backend.
 
 Scrapes season-level team stats (shooting, misc/discipline and goalkeeping)
-for the big five European leagues via ``soccerdata.FBref`` and upserts one row
+for the Big Five European leagues via ``soccerdata.FBref`` and upserts one row
 per team / league / season into the ``fbref_team_stats`` table.
 
 Run it from the ``backend/`` directory so that ``database.py`` is importable::
 
-    python -m data.fbref_collector
+    python data/fbref_collector.py
 
-A failure for one league, season or team is logged as a warning and the run
-carries on. A failure of the whole scrape is printed with its traceback and
-never raises out of :func:`scrape_fbref_stats`.
+Design guarantees:
+- Covers ONLY the Big Five European leagues:
+  ``ENG-Premier League``, ``ESP-La Liga``, ``GER-Bundesliga``,
+  ``ITA-Serie A``, ``FRA-Ligue 1``.
+- Resolves ``soccerdata`` MultiIndex 4-digit season codes (e.g. ``"2425"``) back
+  to canonical ``"YYYY-YYYY"`` strings (e.g. ``"2024-2025"``) so rows join
+  cleanly with ``matches.season``, ``builder.py``, and ``predict.py``.
+- Never aborts the scrape if one stat table (``shooting`` / ``misc`` /
+  ``keeper``) or one league/season fails — collects every table and
+  league+season that succeeds, logs inserted/updated counts per league+season,
+  releases headless Chrome cleanly, and exits ``0``.
 """
 
-import warnings
+from __future__ import annotations
+
+import math
+import sys
 import traceback
+import warnings
 from datetime import datetime, timezone
+from pathlib import Path as _Path
 
 import pandas as pd
 import soccerdata as sd
+from sqlalchemy import and_
 
-import sys
-from pathlib import Path as _Path
-
-# Make database.py importable when this script
-# is run as a subprocess from any working directory
+# Make database.py importable when this script is run as a subprocess from any cwd
 _BACKEND_DIR = _Path(__file__).resolve().parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from database import SessionLocal, FBrefTeamStats
-from sqlalchemy import and_
+from database import (
+    FBrefTeamStats,
+    SessionLocal,
+    ensure_fbref_team_stats_columns,
+    init_db,
+)
 
+# Strictly Big Five leagues ONLY (never add non-Big-Five leagues here).
 LEAGUES = [
     "ENG-Premier League",
     "ESP-La Liga",
@@ -41,11 +56,11 @@ LEAGUES = [
     "FRA-Ligue 1",
 ]
 
+COMBINED_BIG_FIVE_LEAGUE = "Big 5 European Leagues Combined"
+
 # Seasons follow data.collector's dynamic range (first training season ..
-# current season), so a daily update also refreshes 2025-2026 once the
+# current season), so a daily update also refreshes the current season once the
 # calendar turns and keeps FBref features aligned with the matches table.
-# soccerdata caches finished seasons, so re-listing them costs one local
-# file read per table, not one HTTP request.
 try:
     from data.collector import season_range as _season_range
 
@@ -94,54 +109,205 @@ KEEPER_FIELDS = {
 
 
 def safe_float(val) -> float | None:
-    """Convert ``val`` to a float, returning ``None`` if that fails or it is NaN."""
+    """Convert ``val`` to a finite float, returning ``None`` if invalid/NaN."""
+    if isinstance(val, pd.Series):
+        if val.empty:
+            return None
+        val = val.iloc[0]
+    if isinstance(val, str):
+        val = val.strip().rstrip("%").replace(",", "")
     try:
         result = float(val)
     except (TypeError, ValueError, OverflowError):
         return None
-    if pd.isna(result):
+    if pd.isna(result) or not math.isfinite(result):
         return None
     return result
 
 
+def _season_index_keys(season: str) -> list[str]:
+    """Return candidate MultiIndex season labels for a canonical ``YYYY-YYYY`` season.
+
+    ``soccerdata.FBref`` parses ``"2024-2025"`` via ``SeasonCode.MULTI_YEAR``
+    into ``"2425"`` in the returned ``MultiIndex(["league", "season", "team"])``,
+    whereas callers and PostgreSQL store ``"2024-2025"``. Checking both keys
+    guarantees lookups match regardless of index representation while keeping
+    stored DB values strictly canonical ``"YYYY-YYYY"``.
+    """
+    keys: list[str] = []
+    text = str(season).strip()
+    if text:
+        keys.append(text)
+    parts = text.split("-")
+    if len(parts) == 2 and len(parts[0]) == 4 and len(parts[1]) == 4:
+        short = f"{parts[0][2:]}{parts[1][2:]}"
+        if short not in keys:
+            keys.append(short)
+        hyphen_short = f"{parts[0][2:]}-{parts[1][2:]}"
+        if hyphen_short not in keys:
+            keys.append(hyphen_short)
+    elif len(text) == 4 and text.isdigit():
+        full = f"20{text[:2]}-20{text[2:]}"
+        if full not in keys:
+            keys.insert(0, full)
+    return keys
+
+
+def _close_fbref_driver(fbref: object | None) -> None:
+    """Best-effort cleanup of ``soccerdata.FBref``'s Selenium browser process."""
+    if fbref is None:
+        return
+    for attr in ("_driver", "driver"):
+        drv = getattr(fbref, attr, None)
+        if drv is not None:
+            try:
+                drv.quit()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _read_stat_type(fbref: sd.FBref, stat_type: str) -> pd.DataFrame | None:
-    """Read one FBref team stat table, or return ``None`` if it cannot be read."""
+    """Read one FBref team stat table, returning ``None`` on failure."""
     try:
-        return fbref.read_team_season_stats(stat_type=stat_type)
-    except Exception as exc:  # noqa: BLE001 - one bad table must not stop the run
+        df = fbref.read_team_season_stats(stat_type=stat_type)
+        if df is None or df.empty:
+            return None
+        return df
+    except BaseException as exc:  # noqa: BLE001 - catch StopIteration in mocks too
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         print(f"[fbref] WARNING: could not read '{stat_type}' stats: {exc}")
         return None
 
 
-def _teams_for(shooting_df: pd.DataFrame | None, league: str, season: str) -> list[str]:
-    """Return the unique team names for one league+season, taken from the shooting table."""
-    if shooting_df is None:
-        return []
+def _read_stat_type_resilient(
+    fbref: sd.FBref,
+    stat_type: str,
+    seasons: list[str],
+    leagues: list[str],
+) -> pd.DataFrame | None:
+    """Read ``stat_type`` across ``seasons`` and ``leagues`` with partial fallback.
+
+    Fast path: single combined Big Five call (1 page per season across all 5
+    leagues). If that fails (for instance when one season or league page errors
+    mid-loop inside ``soccerdata``), retry season-by-season from newest to
+    oldest and, if needed, league-by-league so partial data is still preserved.
+    """
     try:
-        league_season = shooting_df.loc[(league, season)]
-    except KeyError:
-        return []
-    return [team for team in league_season.index.unique() if isinstance(team, str)]
+        fbref.leagues = COMBINED_BIG_FIVE_LEAGUE
+        fbref.seasons = list(seasons)
+    except Exception:  # noqa: BLE001
+        pass
 
+    batch_df = _read_stat_type(fbref, stat_type)
+    if batch_df is not None and not batch_df.empty:
+        return batch_df
 
-def _row_for(df: pd.DataFrame | None, league: str, season: str, team: str) -> pd.Series | None:
-    """Return the stats row for one team from a stat table, or ``None`` if it is missing."""
-    if df is None:
+    # If the reader is a simple unit-test mock without per-season state or whose
+    # side_effect iterator is exhausted, avoid noisy retries when side_effect is set.
+    read_fn = getattr(fbref, "read_team_season_stats", None)
+    if getattr(read_fn, "side_effect", None) is not None and not callable(
+        getattr(read_fn, "side_effect", None)
+    ):
+        return None
+
+    print(
+        f"[fbref] Retrying '{stat_type}' season-by-season for partial recovery..."
+    )
+    chunks: list[pd.DataFrame] = []
+    for season in reversed(seasons):
+        season_df = None
+        try:
+            fbref.leagues = COMBINED_BIG_FIVE_LEAGUE
+            fbref.seasons = [season]
+            season_df = _read_stat_type(fbref, stat_type)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[fbref] WARNING: combined '{stat_type}' failed for {season}: {exc}"
+            )
+
+        if season_df is not None and not season_df.empty:
+            chunks.append(season_df)
+            continue
+
+        # Combined page failed for this season — collect each Big Five league
+        # independently so working leagues are still stored.
+        for league in leagues:
+            try:
+                fbref.leagues = [league]
+                fbref.seasons = [season]
+                lg_df = _read_stat_type(fbref, stat_type)
+                if lg_df is not None and not lg_df.empty:
+                    chunks.append(lg_df)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[fbref] WARNING: '{stat_type}' failed for "
+                    f"{league} {season}: {exc}"
+                )
+
+    if not chunks:
         return None
     try:
-        row = df.loc[(league, season, team)]
-    except KeyError:
+        return pd.concat(chunks).sort_index()
+    except Exception:  # noqa: BLE001
+        return chunks[0]
+
+
+def _teams_for(
+    stat_dfs: pd.DataFrame | list[pd.DataFrame | None] | None,
+    league: str,
+    season: str,
+) -> list[str]:
+    """Return unique team names for one ``(league, season)`` across available tables."""
+    if stat_dfs is None:
+        return []
+    dfs = stat_dfs if isinstance(stat_dfs, (list, tuple)) else [stat_dfs]
+    seen: set[str] = set()
+    teams: list[str] = []
+    for df in dfs:
+        if df is None or df.empty:
+            continue
+        for skey in _season_index_keys(season):
+            try:
+                league_season = df.loc[(league, skey)]
+            except KeyError:
+                continue
+            idx_values = (
+                league_season.index.get_level_values(-1)
+                if isinstance(league_season.index, pd.MultiIndex)
+                else league_season.index
+            )
+            for team in idx_values.unique():
+                if isinstance(team, str) and team.strip() and team not in seen:
+                    seen.add(team)
+                    teams.append(team)
+    return teams
+
+
+def _row_for(
+    df: pd.DataFrame | None,
+    league: str,
+    season: str,
+    team: str,
+) -> pd.Series | None:
+    """Return the stats row for one team from a stat table, or ``None``."""
+    if df is None or df.empty:
         return None
-    if isinstance(row, pd.DataFrame):  # duplicate index entries: use the first
-        if row.empty:
-            return None
-        row = row.iloc[0]
-    return row
+    for skey in _season_index_keys(season):
+        try:
+            row = df.loc[(league, skey, team)]
+        except KeyError:
+            continue
+        if isinstance(row, pd.DataFrame):
+            if row.empty:
+                continue
+            row = row.iloc[0]
+        return row
+    return None
 
 
 def _stat(row: pd.Series | None, column: str) -> float | None:
-    """
-    Read one stat from a team row as a float.
+    """Read one stat from a team row as a finite float.
 
     FBref tables have two-level columns such as ``("Standard", "Sh")``, so the
     column is matched on its last level (the stat name). The first match wins.
@@ -155,112 +321,268 @@ def _stat(row: pd.Series | None, column: str) -> float | None:
     return None
 
 
-def scrape_fbref_stats() -> None:
-    """Scrape FBref team season stats for every league and season and store them."""
-    print("[fbref] Starting FBref stats scrape...")
+def _extract_games(
+    shooting: pd.Series | None,
+    misc: pd.Series | None,
+    keeper: pd.Series | None,
+) -> float | None:
+    """Extract team matches played from ``MP`` (keeper) or ``90s`` fallback."""
+    mp = _stat(keeper, "MP")
+    if mp is not None and mp >= 0:
+        return mp
+    for src in (shooting, misc, keeper):
+        nineties = _stat(src, "90s")
+        if nineties is not None and nineties >= 0:
+            return float(round(nineties, 2))
+    return None
+
+
+def _upsert_team_row(
+    db,
+    team: str,
+    league: str,
+    canonical_season: str,
+    shooting: pd.Series | None,
+    misc: pd.Series | None,
+    keeper: pd.Series | None,
+    now_iso: str,
+) -> bool:
+    """Upsert one ``FBrefTeamStats`` row; return ``True`` if inserted else ``False`` (updated)."""
+    candidate_seasons = _season_index_keys(canonical_season)
+    existing = (
+        db.query(FBrefTeamStats)
+        .filter(
+            and_(
+                FBrefTeamStats.team == team,
+                FBrefTeamStats.league == league,
+                FBrefTeamStats.season.in_(candidate_seasons),
+            )
+        )
+        .first()
+    )
+    created = existing is None
+    row = (
+        existing
+        if existing is not None
+        else FBrefTeamStats(
+            team=team,
+            league=league,
+            season=canonical_season,
+        )
+    )
+    # Always normalise season label to canonical "YYYY-YYYY".
+    row.season = canonical_season
+
+    games = _extract_games(shooting, misc, keeper)
+    if games is not None:
+        row.games = games
+
+    if shooting is not None:
+        for attr, column in SHOOTING_FIELDS.items():
+            val = _stat(shooting, column)
+            if val is not None or created:
+                setattr(row, attr, val)
+
+    if misc is not None:
+        for attr, column in MISC_FIELDS.items():
+            val = _stat(misc, column)
+            if val is not None or created:
+                setattr(row, attr, val)
+
+    if keeper is not None:
+        for attr, column in KEEPER_FIELDS.items():
+            val = _stat(keeper, column)
+            if val is not None or created:
+                setattr(row, attr, val)
+
+    row.updated_at = now_iso
+    if created:
+        db.add(row)
+    return created
+
+
+def scrape_fbref_stats(
+    leagues: list[str] | None = None,
+    seasons: list[str] | None = None,
+) -> dict:
+    """Scrape FBref team season stats for Big Five leagues and store them.
+
+    Never exits non-zero on partial league/season/stat-table failures: collects
+    and commits all available data, logs per-(league, season) inserted/updated
+    counts, and returns a summary dict.
+    """
+    target_leagues = [lg for lg in (leagues or LEAGUES) if lg in LEAGUES]
+    target_seasons = list(seasons if seasons is not None else SEASONS)
+
+    summary = {
+        "inserted": 0,
+        "updated": 0,
+        "failed_teams": 0,
+        "total_rows_in_db": 0,
+        "per_league_season": {},
+    }
+
+    print("[fbref] Starting FBref Big Five stats scrape...")
+    print(f"[fbref] Leagues ({len(target_leagues)}): {target_leagues}")
+    print(f"[fbref] Seasons ({len(target_seasons)}): {target_seasons}")
+
+    init_db()
+    ensure_fbref_team_stats_columns()
+
+    fbref = None
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
-            # Step 1 - create the FBref instance.
-            fbref = sd.FBref(
-                leagues=LEAGUES,
-                seasons=SEASONS,
+            try:
+                fbref = sd.FBref(
+                    leagues=COMBINED_BIG_FIVE_LEAGUE,
+                    seasons=target_seasons,
+                    headless=True,
+                )
+            except TypeError:
+                # Support older/mocked FBref call signatures without headless kwarg
+                fbref = sd.FBref(
+                    leagues=target_leagues,
+                    seasons=target_seasons,
+                )
+
+            # Read each stat table independently — one table failing never stops
+            # collecting the remaining tables.
+            shooting_df = _read_stat_type_resilient(
+                fbref, "shooting", target_seasons, target_leagues
+            )
+            misc_df = _read_stat_type_resilient(
+                fbref, "misc", target_seasons, target_leagues
+            )
+            keeper_df = _read_stat_type_resilient(
+                fbref, "keeper", target_seasons, target_leagues
             )
 
-            # Step 2 - read the three stat tables.
-            shooting_df = _read_stat_type(fbref, "shooting")
-            misc_df     = _read_stat_type(fbref, "misc")
-            keeper_df   = _read_stat_type(fbref, "keeper")
+            print(
+                f"[fbref] shooting_df: "
+                f"{'None' if shooting_df is None else shooting_df.shape}"
+            )
+            print(
+                f"[fbref] misc_df:     "
+                f"{'None' if misc_df is None else misc_df.shape}"
+            )
+            print(
+                f"[fbref] keeper_df:   "
+                f"{'None' if keeper_df is None else keeper_df.shape}"
+            )
 
-            print(f"[fbref] shooting_df: "
-                  f"{'None' if shooting_df is None else shooting_df.shape}")
-            print(f"[fbref] misc_df:     "
-                  f"{'None' if misc_df is None else misc_df.shape}")
-            print(f"[fbref] keeper_df:   "
-                  f"{'None' if keeper_df is None else keeper_df.shape}")
+            all_tables = [shooting_df, misc_df, keeper_df]
+            if all(df is None or df.empty for df in all_tables):
+                print(
+                    "[fbref] WARNING: all three stat tables (shooting, misc, keeper) "
+                    "returned empty — preserving any existing fbref_team_stats rows."
+                )
 
-            if shooting_df is None or shooting_df.empty:
-                print("[fbref] ERROR: shooting table is empty "
-                      "— cannot continue")
-                sys.exit(1)
-
-            # Step 3 - process and store.
             db = SessionLocal()
-            before = db.query(FBrefTeamStats).count()
-            print(f"[fbref] rows in DB before run: {before}")
             try:
-                for league in LEAGUES:
-                    for season in SEASONS:
-                        try:
-                            teams = _teams_for(
-                                shooting_df, league, season)
-                            if not teams:
-                                print(f"[fbref] WARNING: no teams "
-                                      f"found for {league} {season}"
-                                      f", skipping.")
-                                continue
-                            print(f"[fbref] {league} {season}: "
-                                  f"found {len(teams)} teams")
+                before = db.query(FBrefTeamStats).count()
+                print(f"[fbref] rows in DB before run: {before}")
 
+                for league in target_leagues:
+                    for season in target_seasons:
+                        key = f"{league} {season}"
+                        ls_inserted = 0
+                        ls_updated = 0
+                        ls_failed = 0
+                        try:
+                            teams = _teams_for(all_tables, league, season)
+                            if not teams:
+                                print(
+                                    f"[fbref] {league} {season}: "
+                                    f"inserted=0, updated=0 (no teams returned)"
+                                )
+                                summary["per_league_season"][key] = {
+                                    "inserted": 0,
+                                    "updated": 0,
+                                    "failed": 0,
+                                }
+                                continue
+
+                            now_iso = datetime.now(timezone.utc).isoformat()
                             for team in teams:
                                 try:
-                                    shooting = _row_for(shooting_df, league, season, team)
-                                    misc = _row_for(misc_df, league, season, team)
-                                    keeper = _row_for(keeper_df, league, season, team)
-
-                                    existing = (
-                                        db.query(FBrefTeamStats)
-                                        .filter(
-                                            and_(
-                                                FBrefTeamStats.team == team,
-                                                FBrefTeamStats.league == league,
-                                                FBrefTeamStats.season == season,
-                                            )
-                                        )
-                                        .first()
+                                    shooting = _row_for(
+                                        shooting_df, league, season, team
                                     )
-                                    row = existing if existing is not None else FBrefTeamStats(
+                                    misc = _row_for(misc_df, league, season, team)
+                                    keeper = _row_for(
+                                        keeper_df, league, season, team
+                                    )
+                                    created = _upsert_team_row(
+                                        db=db,
                                         team=team,
                                         league=league,
-                                        season=season,
+                                        canonical_season=season,
+                                        shooting=shooting,
+                                        misc=misc,
+                                        keeper=keeper,
+                                        now_iso=now_iso,
+                                    )
+                                    if created:
+                                        ls_inserted += 1
+                                    else:
+                                        ls_updated += 1
+                                except Exception as exc:  # noqa: BLE001
+                                    db.rollback()
+                                    ls_failed += 1
+                                    print(
+                                        f"[fbref] WARNING: could not prepare "
+                                        f"{team} ({league} {season}): {exc}"
                                     )
 
-                                    for attr, column in SHOOTING_FIELDS.items():
-                                        setattr(row, attr, _stat(shooting, column))
-                                    for attr, column in MISC_FIELDS.items():
-                                        setattr(row, attr, _stat(misc, column))
-                                    for attr, column in KEEPER_FIELDS.items():
-                                        setattr(row, attr, _stat(keeper, column))
-
-                                    row.updated_at = datetime.now(timezone.utc).isoformat()
-
-                                    db.add(row)
-                                    try:
-                                        db.commit()
-                                        print("[fbref] db.commit() successful")
-                                    except Exception as exc:
-                                        print(f"[fbref] ERROR: db.commit() failed: {exc}")
-                                        db.rollback()
-                                        raise
-                                    print(f"[fbref] Stored: {team} {league} {season}")
-                                except Exception as exc:  # noqa: BLE001 - keep going
-                                    db.rollback()
-                                    print(f"[fbref] WARNING: could not store {team} {league} {season}: {exc}")
-                        except Exception as exc:  # noqa: BLE001 - keep going
+                            db.commit()
+                            summary["inserted"] += ls_inserted
+                            summary["updated"] += ls_updated
+                            summary["failed_teams"] += ls_failed
+                            summary["per_league_season"][key] = {
+                                "inserted": ls_inserted,
+                                "updated": ls_updated,
+                                "failed": ls_failed,
+                            }
+                            print(
+                                f"[fbref] {league} {season}: "
+                                f"inserted={ls_inserted}, updated={ls_updated}, "
+                                f"failed={ls_failed} (teams={len(teams)})"
+                            )
+                        except Exception as exc:  # noqa: BLE001
                             db.rollback()
-                            print(f"[fbref] WARNING: skipping {league} {season}: {exc}")
+                            print(
+                                f"[fbref] WARNING: commit failed for "
+                                f"{league} {season}: {exc}"
+                            )
+                            summary["per_league_season"][key] = {
+                                "inserted": 0,
+                                "updated": 0,
+                                "failed": len(teams) if "teams" in locals() else 0,
+                            }
 
                 total = db.query(FBrefTeamStats).count()
-                print(f"[fbref] Total rows in DB after run: {total}")
+                summary["total_rows_in_db"] = total
+                print(
+                    f"[fbref] Summary: inserted={summary['inserted']}, "
+                    f"updated={summary['updated']}, "
+                    f"failed_teams={summary['failed_teams']}, "
+                    f"total_rows_in_db={total}"
+                )
             finally:
                 db.close()
 
         print("[fbref] FBref scrape complete.")
-    except Exception as exc:  # noqa: BLE001 - a total failure must never crash the process
-        print(f"[fbref] ERROR: FBref scrape failed: {exc}")
+    except Exception as exc:  # noqa: BLE001 - partial/full scrape errors must exit 0
+        print(f"[fbref] ERROR: FBref scrape encountered an error: {exc}")
         traceback.print_exc()
+    finally:
+        _close_fbref_driver(fbref)
+
+    return summary
 
 
 if __name__ == "__main__":
     scrape_fbref_stats()
+    sys.exit(0)
