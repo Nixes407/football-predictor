@@ -60,7 +60,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 # Shared bucket manifest — the trainer uploads exactly what this file lists.
 import model_artifacts as artifacts  # noqa: E402  (needs the sys.path above)
-import fbref_scrape_runner  # noqa: E402  (background FBref collector on Render)
+import fbref_scrape_runner  # noqa: E402  (background StatsBomb->FBref aggregator on Render)
 
 # Feature definitions and assembly. The column lists are the SAME objects the
 # trainer fits on (``features/feature_columns.py``), and the feature *values*
@@ -1611,11 +1611,14 @@ def run_pipeline_fast(secret: str = "") -> JSONResponse:  # noqa: ARG001 - legac
     },
 )
 def run_fbref_scrape(secret: str = "") -> dict[str, str]:
-    """Start ONLY ``data/fbref_collector.py`` in the background on Render.
+    """Start ONLY ``data/statsbomb_aggregator.py`` in the background on Render.
 
-    GitHub Actions runners sit on AWS IPs that hit unsolvable Cloudflare
-    CAPTCHAs on FBref, whereas Render's environment runs headless Chrome via
-    ``build.sh``. Never runs ``builder.py`` or ``trainer.py`` (those remain in
+    FBref direct scraping is permanently disabled (no Chrome on Render's free
+    tier, unsolvable Cloudflare CAPTCHAs on GitHub Actions IPs). The aggregator
+    instead folds the match-level rows already collected in
+    ``statsbomb_match_stats`` into ``fbref_team_stats`` — same table, same
+    column names, no browser — so the model's 46 FBref features get real
+    values. Never runs ``builder.py`` or ``trainer.py`` (those remain in
     GitHub Actions). Returns ``{"status": "started"}`` immediately.
     """
     expected = os.getenv("PIPELINE_SECRET", "")
@@ -1638,7 +1641,7 @@ def run_fbref_scrape(secret: str = "") -> dict[str, str]:
     },
 )
 def fbref_scrape_status(secret: str = "") -> dict[str, Any]:
-    """Poll status of the background FBref scrape and live DB row count."""
+    """Poll status of the background StatsBomb aggregation and live DB row count."""
     expected = os.getenv("PIPELINE_SECRET", "")
     if not expected or secret != expected:
         raise HTTPException(

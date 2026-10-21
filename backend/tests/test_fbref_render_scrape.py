@@ -35,6 +35,7 @@ if str(BACKEND_DIR) not in sys.path:
 import database  # noqa: E402
 import fbref_scrape_runner  # noqa: E402
 from data import fbref_collector  # noqa: E402
+from data import statsbomb_aggregator  # noqa: E402
 from features import builder, inference  # noqa: E402
 from features.feature_columns import FBREF_STAT_COLUMNS, FEATURE_COLS  # noqa: E402
 from models import formula_engine  # noqa: E402
@@ -172,14 +173,14 @@ class FBrefRenderEndpointsTests(unittest.TestCase):
         self.assertIsNone(body["last_result"])
         self.assertEqual(body["fbref_team_stats_rows"], 1)
 
-    def test_non_blocking_scrape_runs_only_fbref_collector_and_updates_status(self):
+    def test_non_blocking_scrape_runs_only_statsbomb_aggregator_and_updates_status(self):
         gate = threading.Event()
         spawned_cmds: list[list[str]] = []
 
         class FakeProc:
             def __init__(self, cmd, **_kwargs):
                 spawned_cmds.append(list(cmd))
-                self.stdout = iter(["[fbref] Starting FBref Big Five stats scrape...\n"])
+                self.stdout = iter(["[sb-agg] Starting StatsBomb -> fbref_team_stats aggregation...\n"])
 
             def wait(self):
                 gate.wait(timeout=5)
@@ -238,14 +239,15 @@ class FBrefRenderEndpointsTests(unittest.TestCase):
 
         self.assertEqual(len(spawned_cmds), 1)
         self.assertTrue(
-            spawned_cmds[0][-1].endswith("data/fbref_collector.py"),
+            spawned_cmds[0][-1].endswith("data/statsbomb_aggregator.py"),
             spawned_cmds,
         )
+        self.assertNotIn("fbref_collector.py", " ".join(spawned_cmds[0]))
         self.assertNotIn("builder.py", " ".join(spawned_cmds[0]))
         self.assertNotIn("trainer.py", " ".join(spawned_cmds[0]))
         assert done_body is not None
         self.assertEqual(done_body["status"], "complete")
-        self.assertEqual(done_body["last_result"], "fbref_collector completed OK")
+        self.assertEqual(done_body["last_result"], "statsbomb_aggregator completed OK")
         self.assertEqual(done_body["fbref_team_stats_rows"], 2)
         self.assertEqual(predict_router._pipeline_status, "fbref_scrape_complete")
 
@@ -494,6 +496,7 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
             patch.object(database, "engine", self.engine),
             patch.object(database, "SessionLocal", self.Session),
             patch.object(fbref_collector, "SessionLocal", self.Session),
+            patch.object(statsbomb_aggregator, "SessionLocal", self.Session),
             patch.object(builder, "SessionLocal", self.Session),
             patch.object(formula_engine, "SessionLocal", self.Session),
         ]
@@ -503,38 +506,17 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
 
         formula_engine.invalidate_cache()
 
-    def test_same_day_scrape_populates_diagnostics_and_arsenal_vs_chelsea_features(self):
-        pl_clubs = [
-            "Arsenal", "Chelsea", "Liverpool", "Manchester City", "Tottenham",
-            "Newcastle Utd", "Aston Villa", "Brighton", "Fulham", "Brentford",
-            "Bournemouth", "Crystal Palace", "Everton", "West Ham", "Wolves",
-            "Nott'ham Forest", "Leicester City", "Ipswich Town", "Southampton", "Leeds United",
-        ]
-        shooting_df, misc_df, keeper_df = _make_multiindex_stat_frames(
-            {
-                ("ENG-Premier League", "2425"): pl_clubs,
-                ("ENG-Premier League", "2526"): pl_clubs,
-                ("ENG-Premier League", "2627"): pl_clubs,
-            }
-        )
-        fake_fbref = MagicMock()
-        fake_fbref.read_team_season_stats.side_effect = lambda stat_type: {
-            "shooting": shooting_df,
-            "misc": misc_df,
-            "keeper": keeper_df,
-        }[stat_type]
+    PL_CLUBS = [
+        "Arsenal", "Chelsea", "Liverpool", "Manchester City", "Tottenham",
+        "Newcastle Utd", "Aston Villa", "Brighton", "Fulham", "Brentford",
+        "Bournemouth", "Crystal Palace", "Everton", "West Ham", "Wolves",
+        "Nott'ham Forest", "Leicester City", "Ipswich Town", "Southampton", "Leeds United",
+    ]
 
-        # 1. Run collector right now (same UTC calendar day as prediction!)
-        with patch.object(fbref_collector.sd, "FBref", return_value=fake_fbref):
-            fbref_collector.scrape_fbref_stats(
-                leagues=["ENG-Premier League"],
-                seasons=["2024-2025", "2025-2026", "2026-2027"],
-            )
-
-        # 2. Seed FotMob-shaped team_season_stats rows (even with sh_shots=None on
-        # 2024-2025 and sh_shots populated on 2026-2027) so both paths are tested.
+    def _seed_fotmob_team_season_stats(self):
+        """Seed FotMob-shaped team_season_stats rows so the formula engine is ready."""
         with self.Session() as db:
-            for idx, club in enumerate(pl_clubs):
+            for idx, club in enumerate(self.PL_CLUBS):
                 db.add(
                     database.TeamSeasonStats(
                         team=club,
@@ -557,11 +539,40 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
                 )
             db.commit()
 
-        # 3. Verify builder reads the freshly scraped fbref_team_stats rows
-        loaded_fbref = builder.load_fbref_stats()
-        self.assertEqual(len(loaded_fbref), 60)
+    def _seed_statsbomb_match_rows(self):
+        """One home and one away match per club per season, 2-0 home wins."""
+        with self.Session() as db:
+            match_id = 1
+            for season, month in (
+                ("2024-2025", "2024-09"),
+                ("2025-2026", "2025-09"),
+                ("2026-2027", "2026-09"),
+            ):
+                clubs = self.PL_CLUBS
+                for i, home in enumerate(clubs):
+                    db.add(
+                        database.StatsBombMatchStats(
+                            match_id=match_id,
+                            competition="ENG-Premier League",
+                            season=season,
+                            date=f"{month}-{(i % 28) + 1:02d}",
+                            home_team=home,
+                            away_team=clubs[(i + 1) % len(clubs)],
+                            home_goals=2,
+                            away_goals=0,
+                            home_shots=15,
+                            away_shots=10,
+                            home_shots_ot=6,
+                            away_shots_ot=3,
+                            home_gk_saves=2,
+                            away_gk_saves=4,
+                        )
+                    )
+                    match_id += 1
+            db.commit()
 
-        # 4. Install lightweight trained ML models + features history into predict_router
+    def _install_dummy_ml_stack(self):
+        """Install lightweight trained ML models + features history into predict_router."""
         n_rows = 12
         history_df = pd.DataFrame(
             {
@@ -624,8 +635,9 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
 
         app = FastAPI()
         app.include_router(predict_router.router)
-        client = TestClient(app)
+        return TestClient(app)
 
+    def _assert_arsenal_vs_chelsea(self, client):
         # Check diagnostics contract
         diag = client.get("/predict/admin/diagnostics").json()
         self.assertEqual(diag["fbref_source"], "database")
@@ -654,6 +666,72 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
                 self.assertGreater(fv["home_fbref_shots"], 0.0)
                 self.assertGreater(fv["home_fbref_clean_sheets"], 0.0)
                 self.assertGreater(fv["home_shots_per_game"], 0.0)
+
+    def test_same_day_scrape_populates_diagnostics_and_arsenal_vs_chelsea_features(self):
+        shooting_df, misc_df, keeper_df = _make_multiindex_stat_frames(
+            {
+                ("ENG-Premier League", "2425"): self.PL_CLUBS,
+                ("ENG-Premier League", "2526"): self.PL_CLUBS,
+                ("ENG-Premier League", "2627"): self.PL_CLUBS,
+            }
+        )
+        fake_fbref = MagicMock()
+        fake_fbref.read_team_season_stats.side_effect = lambda stat_type: {
+            "shooting": shooting_df,
+            "misc": misc_df,
+            "keeper": keeper_df,
+        }[stat_type]
+
+        # 1. Run collector right now (same UTC calendar day as prediction!)
+        with patch.object(fbref_collector.sd, "FBref", return_value=fake_fbref):
+            fbref_collector.scrape_fbref_stats(
+                leagues=["ENG-Premier League"],
+                seasons=["2024-2025", "2025-2026", "2026-2027"],
+            )
+
+        # 2. Seed FotMob-shaped team_season_stats rows (even with sh_shots=None on
+        # 2024-2025 and sh_shots populated on 2026-2027) so both paths are tested.
+        self._seed_fotmob_team_season_stats()
+
+        # 3. Verify builder reads the freshly scraped fbref_team_stats rows
+        loaded_fbref = builder.load_fbref_stats()
+        self.assertEqual(len(loaded_fbref), 60)
+
+        # 4-5. Install models, then verify diagnostics + Arsenal vs Chelsea
+        client = self._install_dummy_ml_stack()
+        self._assert_arsenal_vs_chelsea(client)
+
+    def test_statsbomb_aggregator_populates_diagnostics_and_arsenal_vs_chelsea_features(self):
+        """The StatsBomb aggregator must satisfy the same acceptance checks as
+        the old FBref scrape: diagnostics reports "database", and Arsenal vs
+        Chelsea carries non-zero home_fbref_* features."""
+
+        # 1. Seed match-level statsbomb_match_stats rows and aggregate them
+        self._seed_statsbomb_match_rows()
+        summary = statsbomb_aggregator.run_aggregation()
+        self.assertEqual(summary["inserted"], 60)
+        self.assertEqual(summary["failed_groups"], 0)
+        self.assertEqual(
+            summary["per_league_season"]["ENG-Premier League 2026-2027"]["inserted"], 20
+        )
+
+        # 2. Seed FotMob-shaped team_season_stats rows for the formula engine
+        self._seed_fotmob_team_season_stats()
+
+        # 3. Verify builder reads the freshly aggregated fbref_team_stats rows
+        loaded_fbref = builder.load_fbref_stats()
+        self.assertEqual(len(loaded_fbref), 60)
+        arsenal_2627 = loaded_fbref[
+            (loaded_fbref["team"] == "Arsenal")
+            & (loaded_fbref["season"] == "2026-2027")
+        ].iloc[0]
+        self.assertEqual(arsenal_2627["shots"], 25.0)  # 15 home + 10 away
+        self.assertEqual(arsenal_2627["clean_sheets"], 1.0)
+        self.assertEqual(arsenal_2627["saves"], 6.0)  # 2 home + 4 away
+
+        # 4-5. Install models, then verify diagnostics + Arsenal vs Chelsea
+        client = self._install_dummy_ml_stack()
+        self._assert_arsenal_vs_chelsea(client)
 
 
 class WorkflowContractAndShellTests(unittest.TestCase):
