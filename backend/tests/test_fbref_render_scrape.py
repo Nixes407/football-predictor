@@ -409,6 +409,75 @@ class FBrefCollectorSchemaAndResilienceTests(unittest.TestCase):
             self.assertEqual(arsenal.yellow_cards, 18.0)
             self.assertEqual(arsenal.games, 10.0)
 
+    def test_fbref_valueerror_fallback_writes_rows(self):
+        """Root-cause regression: the FBref constructor raises ValueError when
+        ``leagues="Big 5 European Leagues Combined"`` (that key is not in
+        soccerdata's LEAGUE_DICT). The collector must fall back to scraping
+        each Big Five league individually and still write rows, exiting 0.
+        """
+        shooting_df, misc_df, keeper_df = _make_multiindex_stat_frames(
+            {("ENG-Premier League", "2627"): ["Arsenal", "Chelsea"]}
+        )
+
+        def fake_fbref(leagues=None, seasons=None, headless=False, **_kwargs):
+            # Mimic real soccerdata: combined-league key is invalid -> ValueError
+            # before any page is read; individual leagues are fine.
+            if isinstance(leagues, str) and leagues == "Big 5 European Leagues Combined":
+                raise ValueError("Invalid league 'Big 5 European Leagues Combined'")
+            m = MagicMock()
+            m._driver = MagicMock()
+            m.read_team_season_stats.side_effect = lambda stat_type: {
+                "shooting": shooting_df,
+                "misc": misc_df,
+                "keeper": keeper_df,
+            }[stat_type]
+            return m
+
+        with patch.object(fbref_collector.sd, "FBref", side_effect=fake_fbref):
+            summary = fbref_collector.scrape_fbref_stats(
+                leagues=["ENG-Premier League"],
+                seasons=["2026-2027"],
+            )
+
+        self.assertEqual(summary["inserted"], 2)
+        self.assertEqual(summary["failed_teams"], 0)
+        with self.Session() as db:
+            self.assertEqual(db.query(database.FBrefTeamStats).count(), 2)
+            arsenal = (
+                db.query(database.FBrefTeamStats)
+                .filter_by(team="Arsenal", league="ENG-Premier League", season="2026-2027")
+                .one()
+            )
+            self.assertIsNotNone(arsenal.shots)
+
+    def test_dry_run_prints_without_writing_db(self):
+        """--dry-run runs the full scrape logic but skips all DB writes and
+        prints what *would* have been written; the DB must remain untouched.
+        """
+        shooting_df, misc_df, keeper_df = _make_multiindex_stat_frames(
+            {("ENG-Premier League", "2627"): ["Arsenal", "Chelsea"]}
+        )
+        fake_fbref = MagicMock()
+        fake_fbref._driver = MagicMock()
+        fake_fbref.read_team_season_stats.side_effect = lambda stat_type: {
+            "shooting": shooting_df,
+            "misc": misc_df,
+            "keeper": keeper_df,
+        }[stat_type]
+
+        with patch.object(fbref_collector.sd, "FBref", return_value=fake_fbref):
+            summary = fbref_collector.scrape_fbref_stats(
+                leagues=["ENG-Premier League"],
+                seasons=["2026-2027"],
+                dry_run=True,
+            )
+
+        # Would-have-been counts are reported...
+        self.assertEqual(summary["inserted"], 2)
+        # ...but nothing is actually written to the database.
+        with self.Session() as db:
+            self.assertEqual(db.query(database.FBrefTeamStats).count(), 0)
+
 
 class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
     """End-to-end verification of the exact post-merge acceptance checks."""
