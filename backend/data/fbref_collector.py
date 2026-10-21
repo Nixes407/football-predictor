@@ -1,6 +1,15 @@
 """
 FBref team season stats collector for the Football Predictor backend.
 
+.. deprecated::
+    FBref direct scraping is disabled. Chrome is not available on Render's free
+    tier and GitHub Actions runners hit unsolvable Cloudflare CAPTCHAs, so
+    ``python data/fbref_collector.py`` now prints a deprecation notice and
+    exits 0 without scraping. Use ``data/statsbomb_aggregator.py`` — it fills
+    the same ``fbref_team_stats`` table from ``statsbomb_match_stats`` with no
+    browser and no CAPTCHA. The functions below remain importable for tests
+    and for one-off manual recovery.
+
 Scrapes season-level team stats (shooting, misc/discipline and goalkeeping)
 for the Big Five European leagues via ``soccerdata.FBref`` and upserts one row
 per team / league / season into the ``fbref_team_stats`` table.
@@ -428,6 +437,12 @@ def scrape_fbref_stats(
     target_leagues = [lg for lg in (leagues or LEAGUES) if lg in LEAGUES]
     target_seasons = list(seasons if seasons is not None else SEASONS)
 
+    print(
+        "[fbref] DEPRECATED: direct FBref scraping is disabled in production "
+        "(Chrome unavailable on Render, CAPTCHA on GitHub Actions). "
+        "Use data/statsbomb_aggregator.py instead."
+    )
+
     summary = {
         "inserted": 0,
         "updated": 0,
@@ -688,16 +703,12 @@ def scrape_fbref_stats(
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="FBref Big Five team-season stats collector"
+    # FBref direct scraping is permanently disabled: Chrome is not available on
+    # Render's free tier and GitHub Actions IPs hit unsolvable Cloudflare
+    # CAPTCHAs. The statsbomb_aggregator.py replacement needs no browser.
+    print(
+        "FBref direct scraping disabled (Chrome not available on Render, "
+        "CAPTCHA on GitHub Actions). Using StatsBomb aggregator instead. "
+        "Run statsbomb_aggregator.py"
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Run the full scrape but skip all DB writes; print what would be written.",
-    )
-    args = parser.parse_args()
-    scrape_fbref_stats(dry_run=args.dry_run)
     sys.exit(0)

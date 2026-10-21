@@ -254,6 +254,49 @@ class FBrefTeamStats(Base):
         return f"<FBrefTeamStats {self.team} {self.league} {self.season}>"
 
 
+class StatsBombMatchStats(Base):
+    """
+    Match-level stats written by ``data/statsbomb_collector.py`` and
+    ``data/understat_collector.py``.
+
+    The authoritative DDL is created by ``data/statsbomb_collector.py:
+    ensure_tables`` (``CREATE TABLE IF NOT EXISTS statsbomb_match_stats``);
+    this model mirrors it so ``Base.metadata.create_all`` can create the table
+    on fresh test/local databases and so ``data/statsbomb_aggregator.py`` can
+    document the columns it reads. The live production table may carry extra
+    columns — the aggregator discovers columns at runtime and maps whichever
+    are present.
+    """
+
+    __tablename__ = "statsbomb_match_stats"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)  # SERIAL
+    match_id = Column(Integer, unique=True, nullable=False)
+    competition = Column(Text, nullable=True)
+    season = Column(Text, nullable=True)
+    date = Column(Text, nullable=True)  # YYYY-MM-DD
+    home_team = Column(Text, nullable=True)
+    away_team = Column(Text, nullable=True)
+    home_goals = Column(Integer, nullable=True)
+    away_goals = Column(Integer, nullable=True)
+    home_xg = Column(Float, nullable=True)
+    away_xg = Column(Float, nullable=True)
+    home_shots = Column(Integer, nullable=True)
+    away_shots = Column(Integer, nullable=True)
+    home_shots_ot = Column(Integer, nullable=True)
+    away_shots_ot = Column(Integer, nullable=True)
+    home_pressures = Column(Integer, nullable=True)
+    away_pressures = Column(Integer, nullable=True)
+    home_prog_carr = Column(Integer, nullable=True)
+    away_prog_carr = Column(Integer, nullable=True)
+    home_gk_saves = Column(Integer, nullable=True)
+    away_gk_saves = Column(Integer, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=True)
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging helper
+        return f"<StatsBombMatchStats {self.match_id} {self.home_team} vs {self.away_team}>"
+
+
 class MatchResult(Base):
     """A match result with scorers, cards and the prediction graded against it."""
 
@@ -755,6 +798,7 @@ __all__ = [
     "MatchResult",
     "PlayerSeasonStats",
     "SessionLocal",
+    "StatsBombMatchStats",
     "TeamSeasonStats",
     "cleanup_non_team_rows",
     "engine",
