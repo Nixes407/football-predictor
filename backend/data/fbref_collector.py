@@ -264,14 +264,18 @@ def _teams_for(
     dfs = stat_dfs if isinstance(stat_dfs, (list, tuple)) else [stat_dfs]
     seen: set[str] = set()
     teams: list[str] = []
+    tried_keys: list[str] = []
+    found_keys: list[str] = []
     for df in dfs:
         if df is None or df.empty:
             continue
         for skey in _season_index_keys(season):
+            tried_keys.append(skey)
             try:
                 league_season = df.loc[(league, skey)]
             except KeyError:
                 continue
+            found_keys.append(skey)
             idx_values = (
                 league_season.index.get_level_values(-1)
                 if isinstance(league_season.index, pd.MultiIndex)
@@ -281,6 +285,12 @@ def _teams_for(
                 if isinstance(team, str) and team.strip() and team not in seen:
                     seen.add(team)
                     teams.append(team)
+    # Requirement (b): log the season-key normalization outcome so a
+    # 0-row scrape can be traced to a key-miss vs empty data.
+    print(
+        f"[fbref] {league} {season}: season keys tried={tried_keys} "
+        f"found={found_keys} teams={len(teams)}"
+    )
     return teams
 
 
@@ -404,12 +414,16 @@ def _upsert_team_row(
 def scrape_fbref_stats(
     leagues: list[str] | None = None,
     seasons: list[str] | None = None,
+    dry_run: bool = False,
 ) -> dict:
     """Scrape FBref team season stats for Big Five leagues and store them.
 
     Never exits non-zero on partial league/season/stat-table failures: collects
     and commits all available data, logs per-(league, season) inserted/updated
     counts, and returns a summary dict.
+
+    When ``dry_run`` is True the full scrape logic runs but no database writes
+    are performed; instead the rows that *would* have been written are printed.
     """
     target_leagues = [lg for lg in (leagues or LEAGUES) if lg in LEAGUES]
     target_seasons = list(seasons if seasons is not None else SEASONS)
@@ -425,9 +439,12 @@ def scrape_fbref_stats(
     print("[fbref] Starting FBref Big Five stats scrape...")
     print(f"[fbref] Leagues ({len(target_leagues)}): {target_leagues}")
     print(f"[fbref] Seasons ({len(target_seasons)}): {target_seasons}")
+    if dry_run:
+        print("[fbref] DRY-RUN mode enabled — no database writes will be performed")
 
-    init_db()
-    ensure_fbref_team_stats_columns()
+    if not dry_run:
+        init_db()
+        ensure_fbref_team_stats_columns()
 
     fbref = None
     try:
@@ -440,8 +457,15 @@ def scrape_fbref_stats(
                     seasons=target_seasons,
                     headless=True,
                 )
-            except TypeError:
-                # Support older/mocked FBref call signatures without headless kwarg
+            except (TypeError, ValueError):
+                # ``Big 5 European Leagues Combined`` is not in soccerdata's
+                # LEAGUE_DICT, so SeasonCode.from_league() rejects it and the
+                # FBref constructor raises ValueError before any page is read.
+                # The scrape would then abort and write zero rows while still
+                # exiting 0. Fall back to scraping each Big Five league
+                # individually (all are valid LEAGUE_DICT keys).
+                # TypeError keeps support for older/mocked FBref signatures
+                # without the ``headless`` kwarg.
                 fbref = sd.FBref(
                     leagues=target_leagues,
                     seasons=target_seasons,
@@ -472,6 +496,27 @@ def scrape_fbref_stats(
                 f"{'None' if keeper_df is None else keeper_df.shape}"
             )
 
+            # Requirement (a): log exactly what soccerdata returned so we can
+            # diagnose a scrape that exits 0 but writes nothing.
+            for label, df in (
+                ("shooting", shooting_df),
+                ("misc", misc_df),
+                ("keeper", keeper_df),
+            ):
+                if df is None:
+                    print(f"[fbref] {label}_df: None (no data returned by soccerdata)")
+                    continue
+                print(
+                    f"[fbref] {label}_df: shape={df.shape} "
+                    f"index_levels={df.index.names} "
+                    f"columns={[c[-1] if isinstance(c, tuple) else c for c in df.columns][:8]}..."
+                )
+                try:
+                    head = df.head(3)
+                    print(f"[fbref] {label}_df first 3 rows:\n{head.to_string()}")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[fbref] {label}_df: could not print head: {exc}")
+
             all_tables = [shooting_df, misc_df, keeper_df]
             if all(df is None or df.empty for df in all_tables):
                 print(
@@ -479,99 +524,158 @@ def scrape_fbref_stats(
                     "returned empty — preserving any existing fbref_team_stats rows."
                 )
 
-            db = SessionLocal()
-            try:
-                before = db.query(FBrefTeamStats).count()
-                print(f"[fbref] rows in DB before run: {before}")
+            if not dry_run:
+                db = SessionLocal()
+                try:
+                    before = db.query(FBrefTeamStats).count()
+                    print(f"[fbref] rows in DB before run: {before}")
 
-                for league in target_leagues:
-                    for season in target_seasons:
-                        key = f"{league} {season}"
-                        ls_inserted = 0
-                        ls_updated = 0
-                        ls_failed = 0
-                        try:
-                            teams = _teams_for(all_tables, league, season)
-                            if not teams:
+                    for league in target_leagues:
+                        for season in target_seasons:
+                            key = f"{league} {season}"
+                            ls_inserted = 0
+                            ls_updated = 0
+                            ls_failed = 0
+                            try:
+                                teams = _teams_for(all_tables, league, season)
+                                if not teams:
+                                    print(
+                                        f"[fbref] {league} {season}: "
+                                        f"inserted=0, updated=0 "
+                                        f"(no teams returned)"
+                                    )
+                                    summary["per_league_season"][key] = {
+                                        "inserted": 0,
+                                        "updated": 0,
+                                        "failed": 0,
+                                    }
+                                    continue
+
+                                # Requirement (c): exactly how many rows are
+                                # about to be inserted for this (league, season).
+                                print(
+                                    f"[fbref] {league} {season}: about to "
+                                    f"upsert {len(teams)} rows (teams={teams})"
+                                )
+                                now_iso = datetime.now(timezone.utc).isoformat()
+                                for team in teams:
+                                    try:
+                                        shooting = _row_for(
+                                            shooting_df, league, season, team
+                                        )
+                                        misc = _row_for(
+                                            misc_df, league, season, team
+                                        )
+                                        keeper = _row_for(
+                                            keeper_df, league, season, team
+                                        )
+                                        created = _upsert_team_row(
+                                            db=db,
+                                            team=team,
+                                            league=league,
+                                            canonical_season=season,
+                                            shooting=shooting,
+                                            misc=misc,
+                                            keeper=keeper,
+                                            now_iso=now_iso,
+                                        )
+                                        if created:
+                                            ls_inserted += 1
+                                        else:
+                                            ls_updated += 1
+                                    except Exception as exc:  # noqa: BLE001
+                                        db.rollback()
+                                        ls_failed += 1
+                                        print(
+                                            f"[fbref] WARNING: could not prepare "
+                                            f"{team} ({league} {season}): {exc}"
+                                        )
+
+                                db.commit()
+                                summary["inserted"] += ls_inserted
+                                summary["updated"] += ls_updated
+                                summary["failed_teams"] += ls_failed
+                                summary["per_league_season"][key] = {
+                                    "inserted": ls_inserted,
+                                    "updated": ls_updated,
+                                    "failed": ls_failed,
+                                }
+                                # Requirement (d): confirm the commit landed.
+                                committed = ls_inserted + ls_updated
+                                print(
+                                    f"[fbref] Committed {committed} rows for "
+                                    f"{league} {season} "
+                                    f"(inserted={ls_inserted}, "
+                                    f"updated={ls_updated}, "
+                                    f"failed={ls_failed})"
+                                )
                                 print(
                                     f"[fbref] {league} {season}: "
-                                    f"inserted=0, updated=0 (no teams returned)"
+                                    f"inserted={ls_inserted}, "
+                                    f"updated={ls_updated}, "
+                                    f"failed={ls_failed} "
+                                    f"(teams={len(teams)})"
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                db.rollback()
+                                print(
+                                    f"[fbref] WARNING: commit failed for "
+                                    f"{league} {season}: {exc}"
                                 )
                                 summary["per_league_season"][key] = {
                                     "inserted": 0,
                                     "updated": 0,
-                                    "failed": 0,
+                                    "failed": len(teams)
+                                    if "teams" in locals()
+                                    else 0,
                                 }
-                                continue
 
-                            now_iso = datetime.now(timezone.utc).isoformat()
-                            for team in teams:
-                                try:
-                                    shooting = _row_for(
-                                        shooting_df, league, season, team
-                                    )
-                                    misc = _row_for(misc_df, league, season, team)
-                                    keeper = _row_for(
-                                        keeper_df, league, season, team
-                                    )
-                                    created = _upsert_team_row(
-                                        db=db,
-                                        team=team,
-                                        league=league,
-                                        canonical_season=season,
-                                        shooting=shooting,
-                                        misc=misc,
-                                        keeper=keeper,
-                                        now_iso=now_iso,
-                                    )
-                                    if created:
-                                        ls_inserted += 1
-                                    else:
-                                        ls_updated += 1
-                                except Exception as exc:  # noqa: BLE001
-                                    db.rollback()
-                                    ls_failed += 1
-                                    print(
-                                        f"[fbref] WARNING: could not prepare "
-                                        f"{team} ({league} {season}): {exc}"
-                                    )
-
-                            db.commit()
-                            summary["inserted"] += ls_inserted
-                            summary["updated"] += ls_updated
-                            summary["failed_teams"] += ls_failed
-                            summary["per_league_season"][key] = {
-                                "inserted": ls_inserted,
-                                "updated": ls_updated,
-                                "failed": ls_failed,
-                            }
+                    total = db.query(FBrefTeamStats).count()
+                    summary["total_rows_in_db"] = total
+                    print(
+                        f"[fbref] Summary: inserted={summary['inserted']}, "
+                        f"updated={summary['updated']}, "
+                        f"failed_teams={summary['failed_teams']}, "
+                        f"total_rows_in_db={total}"
+                    )
+                finally:
+                    db.close()
+            else:
+                # Requirement (dry-run): print what *would* have been written,
+                # but do not touch the database.
+                for league in target_leagues:
+                    for season in target_seasons:
+                        key = f"{league} {season}"
+                        teams = _teams_for(all_tables, league, season)
+                        if not teams:
                             print(
-                                f"[fbref] {league} {season}: "
-                                f"inserted={ls_inserted}, updated={ls_updated}, "
-                                f"failed={ls_failed} (teams={len(teams)})"
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            db.rollback()
-                            print(
-                                f"[fbref] WARNING: commit failed for "
-                                f"{league} {season}: {exc}"
+                                f"[fbref] [dry-run] {league} {season}: "
+                                f"would insert 0 rows (no teams returned)"
                             )
                             summary["per_league_season"][key] = {
                                 "inserted": 0,
                                 "updated": 0,
-                                "failed": len(teams) if "teams" in locals() else 0,
+                                "failed": 0,
                             }
-
-                total = db.query(FBrefTeamStats).count()
-                summary["total_rows_in_db"] = total
+                            continue
+                        would_insert = len(teams)
+                        summary["inserted"] += would_insert
+                        summary["per_league_season"][key] = {
+                            "inserted": would_insert,
+                            "updated": 0,
+                            "failed": 0,
+                        }
+                        print(
+                            f"[fbref] [dry-run] {league} {season}: would upsert "
+                            f"{would_insert} rows (teams={teams})"
+                        )
+                summary["total_rows_in_db"] = None
                 print(
-                    f"[fbref] Summary: inserted={summary['inserted']}, "
-                    f"updated={summary['updated']}, "
-                    f"failed_teams={summary['failed_teams']}, "
-                    f"total_rows_in_db={total}"
+                    f"[fbref] [dry-run] Summary: would insert "
+                    f"{summary['inserted']} rows total across "
+                    f"{len(target_leagues)} leagues x "
+                    f"{len(target_seasons)} seasons"
                 )
-            finally:
-                db.close()
 
         print("[fbref] FBref scrape complete.")
     except Exception as exc:  # noqa: BLE001 - partial/full scrape errors must exit 0
@@ -584,5 +688,16 @@ def scrape_fbref_stats(
 
 
 if __name__ == "__main__":
-    scrape_fbref_stats()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="FBref Big Five team-season stats collector"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run the full scrape but skip all DB writes; print what would be written.",
+    )
+    args = parser.parse_args()
+    scrape_fbref_stats(dry_run=args.dry_run)
     sys.exit(0)
