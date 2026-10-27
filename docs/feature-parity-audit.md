@@ -258,6 +258,7 @@ artifacts stay compatible.
 | Elo reconstruction from the CSV alone uses each team's *pre-match* rating, one match behind the `elo_ratings` table | Only matters when the database is unreachable at inference | The authoritative DB lookup is preferred; the CSV path is the fallback. `/predict/admin/diagnostics` reports which one is active |
 | An older features.csv has no raw shot counts | 6 shot-derived features use the team's last stored value for one deployment cycle | Warnings in `check_features.py` and diagnostics; exact again after the next daily builder run |
 | A club whose real Elo history predates its first row in the CSV | Not visible to the CSV-only fallback (1500 is used) | Same DB-first rule as above |
+| `elo_ratings` is computed from the stored `matches` table (`data/elo.py`, K=32, start 1500), so a club's rating only reflects the matches this pipeline collected — it carries no pre-2021 history and no European-fixture form | Every team starts from 1500, so early-season ratings for a newly promoted club are provisional; the spread widens as the season progresses | This is what makes the table reproducible and dependency-free. The alternative (clubelo.com) resolved under half of the 11-league team set and silently stored zero rows. Set `COLLECT_CLUBELO=1` to enrich from it, but note its ratings sit on a different scale |
 | The frontend still sends `season: "2024-2025"` from its own dropdown | `season_encoded` is stale for UI-originated requests until the frontend is updated (out of scope: no frontend changes) | Server-side default is correct; `fixtures.py` (daily pipeline) no longer uses a hardcoded season |
 
 ## Regression test
@@ -290,8 +291,17 @@ curl -s "$API/predict/admin/diagnostics" | python -m json.tool
 #   "feature_columns_source": "features/feature_columns.py"
 #   "features_csv_has_match_history": true         <- next builder run republished the CSV
 #   "elo_lookup": "database"                       <- Elo read from elo_ratings
-#   "fbref_source": "database"
+#   "elo_cache_entries": 202                       <- teams with a rating (>100 for 11 leagues)
+#   "elo_lookup_failures": 0
+#   "elo_cache_error": null                        <- non-null names why the table read empty
+#   "fbref_source": "disabled"                     <- snapshot columns left the model contract
 #   "cols_match": true
+#
+# elo_lookup is only "database" when elo_ratings was actually read AND holds
+# ratings. A missing, unreachable or empty table reports
+# "features.csv_fallback" plus the reason in elo_cache_error — it used to
+# report "database" alongside elo_cache_entries: 0, which is how an empty
+# table passed for a healthy one.
 
 # 3. A prediction still answers, and now exposes the exact row it scored
 curl -s -X POST "$API/predict/match" -H 'Content-Type: application/json' \
