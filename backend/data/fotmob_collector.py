@@ -99,6 +99,7 @@ if str(_BACKEND) not in sys.path:
 from database import (
     SessionLocal, TeamSeasonStats, PlayerSeasonStats,
     cleanup_non_team_rows, ensure_team_corners_column,
+    purge_bel_jupiler_rows, upsert_team_season_stats,
 )
 from sqlalchemy import and_
 
@@ -113,8 +114,9 @@ FOTMOB_NAMES_FILE = _BACKEND / "data" / "fotmob_team_names.json"
 # Every id below was checked against FotMob's live API on 2026-10-14
 # (GET /api/data/leagues?id=... and /api/data/leagueseasondeepstats?id=...).
 # Ids that were used or proposed before and are wrong:
-#   BEL 57 -> NED Eredivisie, 55 -> ITA Serie A (Italian rows stored as BEL),
-#       62 -> no league (null). The Belgian First Division A is id 40.
+#   Belgian ids (40/57/55/62) are NOT supported: those ids point at other
+#   countries' competitions and were the source of mislabelled team rows.
+#   Never add a BEL league key back to FOTMOB_LEAGUES.
 #   NOR 107 -> no league (null). Eliteserien is id 59 and publishes
 #       calendar-year seasons ("2026", "2025") like MLS; asking for
 #       "2025/2026" silently returns the 2026 table.
@@ -167,12 +169,6 @@ FOTMOB_LEAGUES = {
     "NED-Eredivisie": {
         "id": 57,
         "ccode": "NLD",
-        "season": "2026/2027",
-        "prev_season": "2025/2026",
-    },
-    "BEL-Jupiler Pro League": {
-        "id": 40,
-        "ccode": "BEL",
         "season": "2026/2027",
         "prev_season": "2025/2026",
     },
@@ -900,27 +896,13 @@ def _parse_scores(scores) -> tuple[float | None, float | None]:
 
 
 def _upsert_team(db, team, league, season, attrs) -> None:
-    """Upsert mapped team stats without overwriting with missing values."""
-    existing = (
-        db.query(TeamSeasonStats)
-        .filter(and_(
-            TeamSeasonStats.team == team,
-            TeamSeasonStats.league == league,
-            TeamSeasonStats.season == season,
-        ))
-        .first()
-    )
-    if existing is None:
-        existing = TeamSeasonStats(team=team, league=league, season=season)
-        db.add(existing)
-    for key, value in attrs.items():
-        # SQLAlchemy permits arbitrary Python attributes: reject misspellings
-        # rather than silently losing a value on commit.
-        if key not in TeamSeasonStats.__table__.columns:
-            raise ValueError(f"Unknown TeamSeasonStats field: {key}")
-        value = _safe(value)
-        if value is not None:
-            setattr(existing, key, value)
+    """Upsert mapped team stats through the shared guarded database write.
+
+    The guard rejects blocked leagues before any DB work; the canonical
+    implementation also skips None values so a partial feed never clears a
+    stat another collector stored.
+    """
+    upsert_team_season_stats(db, team, league, season, attrs)
 
 
 def _upsert_player(db, player, team, league, season, position, attrs) -> None:
@@ -1935,26 +1917,12 @@ def collect_team_stats(client: _FotMobClient | None = None) -> int:
     if not ensure_team_corners_column():
         raise RuntimeError("team_season_stats.misc_corners is not ready")
 
-    # Clean up potentially corrupted Belgian data and any non-team/player rows
+    # Clean up potentially corrupted Belgian data and any non-team/player rows.
+    # The purge is the same one-time cleanup the API runs at startup; after the
+    # first clean run it is a no-op (and the guarded upsert below prevents any
+    # blocked league from being re-inserted).
     cleanup_non_team_rows()
-    db_clean = SessionLocal()
-    try:
-        deleted = db_clean.query(
-            TeamSeasonStats
-        ).filter(
-            TeamSeasonStats.league ==
-            "BEL-Jupiler Pro League"
-        ).delete()
-        db_clean.commit()
-        if deleted:
-            print(f"[fotmob] Cleaned up "
-                  f"{deleted} corrupted "
-                  f"Belgian league rows")
-    except Exception as exc:
-        db_clean.rollback()
-        print(f"[fotmob] WARNING: Belgian cleanup failed: {exc}")
-    finally:
-        db_clean.close()
+    purge_bel_jupiler_rows()
 
     print("[fotmob] Collecting team stats via the FotMob JSON API...")
     total = 0

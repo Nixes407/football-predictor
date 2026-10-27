@@ -1,4 +1,4 @@
-"""Tests for data/statsbomb_aggregator.py (StatsBomb -> fbref_team_stats).
+"""Tests for data/statsbomb_aggregator.py (StatsBomb -> reference stats table).
 
 Run from the repository root:
     python -m unittest discover -s backend/tests -v
@@ -416,7 +416,7 @@ class AggregatorDBTests(unittest.TestCase):
 
 
 class AggregatorToFeaturePipelineTests(unittest.TestCase):
-    """The aggregated rows must flow through builder -> inference unchanged."""
+    """Aggregated rows are reference-only: inference never emits their columns."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -430,13 +430,12 @@ class AggregatorToFeaturePipelineTests(unittest.TestCase):
             patch.object(database, "engine", self.engine),
             patch.object(database, "SessionLocal", self.Session),
             patch.object(agg, "SessionLocal", self.Session),
-            patch.object(builder, "SessionLocal", self.Session),
         ]
         for p in self._patches:
             p.start()
             self.addCleanup(p.stop)
 
-    def test_inference_features_carry_nonzero_fbref_values(self):
+    def test_inference_features_have_no_fbref_keys(self):
         with self.Session() as db:
             for i, (home, away) in enumerate(
                 [("Arsenal", "Chelsea"), ("Chelsea", "Arsenal")], start=1
@@ -464,26 +463,35 @@ class AggregatorToFeaturePipelineTests(unittest.TestCase):
         summary = agg.run_aggregation()
         self.assertEqual(summary["inserted"], 2)
 
-        fbref_df = builder.load_fbref_stats()
-        self.assertEqual(len(fbref_df), 2)
+        # The dormant aggregator still writes its reference rows...
+        with self.Session() as db:
+            rows = db.query(database.FBrefTeamStats).all()
+            self.assertEqual(len(rows), 2)
+            arsenal = next(row for row in rows if row.team == "Arsenal")
+            self.assertEqual(arsenal.shots, 25.0)
+            self.assertEqual(arsenal.clean_sheets, 0.0)  # both seeded matches conceded
+            self.assertEqual(arsenal.saves, 6.0)
 
+        # ...but the builder / inference path neither reads nor emits them.
         features = inference.build_inference_features(
-            builder.load_matches_from_db(),
-            builder.load_elo_from_db(),
-            fbref_df,
+            inference.empty_match_history(),
+            inference.empty_elo_history(),
             "Arsenal",
             "Chelsea",
             league="ENG-Premier League",
             season="2026-2027",
         )
-        self.assertGreater(features["home_fbref_shots"], 0.0)
-        self.assertGreater(features["away_fbref_shots"], 0.0)
-        self.assertGreater(features["home_fbref_shots_on_target"], 0.0)
-        self.assertGreater(features["home_fbref_saves"], 0.0)
-        self.assertGreater(features["home_fbref_games"], 0.0)
-        # Unmapped fields are the documented zeroes.
-        self.assertEqual(features["home_fbref_yellow_cards"], 0.0)
-        self.assertEqual(features["away_fbref_crosses"], 0.0)
+        self.assertFalse(any(
+            key.startswith(("home_fbref_", "away_fbref_"))
+            for key in features
+        ))
+        from features.feature_columns import FEATURE_COLS
+        self.assertTrue(
+            (set(FEATURE_COLS) - {"league_encoded", "season_encoded"})
+            <= set(features)
+        )
+        self.assertFalse(hasattr(builder, "load_fbref_stats"))
+        self.assertFalse(hasattr(builder, "join_fbref_features"))
 
 
 if __name__ == "__main__":

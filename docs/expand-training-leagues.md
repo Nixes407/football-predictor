@@ -65,6 +65,8 @@ dataset (all 4 target seasons, finished matches).
   collector only ingested the Big Five — so a `collector.py` run
   (`python data/collector.py`) is required before retraining; the upserts are
   idempotent (`ON CONFLICT DO NOTHING`).
+* The 46 snapshot columns described below were later removed from the ML
+  pipeline; `fbref_team_stats` is now reference-only.
 * `fbref_team_stats` is written by `fbref_collector.py` for **Big Five only**;
   none of the six new leagues have rows. This is expected and acceptable:
   `builder.join_fbref_features()` zero-fills the FBref columns, so the new

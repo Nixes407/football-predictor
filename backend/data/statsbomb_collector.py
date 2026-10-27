@@ -29,7 +29,7 @@ _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from database import SessionLocal
+from database import SessionLocal, is_blocked_league, upsert_team_season_stats
 from sqlalchemy import text
 
 
@@ -476,42 +476,32 @@ def compute_team_season_aggregates() -> None:
             )
         ).fetchall()
 
-        from database import TeamSeasonStats
-        from sqlalchemy import and_
-
         updated = 0
         for row in rows:
-            existing = (
-                db.query(TeamSeasonStats)
-                .filter(
-                    and_(
-                        TeamSeasonStats.team == row.team,
-                        TeamSeasonStats.league == row.competition,
-                        TeamSeasonStats.season == row.season,
-                    )
-                )
-                .first()
-            )
-            if existing is None:
-                existing = TeamSeasonStats(
-                    team=row.team,
-                    league=row.competition,
-                    season=row.season,
-                )
-                db.add(existing)
+            # Belgian Jupiler rows are never a valid competition here (or in
+            # team_season_stats); the shared guard is the single choke point.
+            if is_blocked_league(row.competition):
+                continue
 
-            # Map aggregates to TeamSeasonStats columns
-            existing.sh_xg = row.avg_xg
-            existing.sh_shots = row.avg_shots
-            existing.sh_sot = row.avg_sot
-            existing.sh_sh_per90 = row.avg_shots
-            existing.sh_sot_per90 = row.avg_sot
-            existing.def_press = row.avg_pressures
-            existing.pos_prgc = row.avg_prgc
-            existing.gk_saves = row.avg_gk_saves
-            existing.sh_goals = row.avg_goals
-            existing.gk_ga = row.avg_xga
-            updated += 1
+            # Map aggregates to TeamSeasonStats columns. None values are
+            # skipped by the canonical upsert, so a missing average never
+            # clears a value another collector stored.
+            attrs = {
+                "sh_xg": row.avg_xg,
+                "sh_shots": row.avg_shots,
+                "sh_sot": row.avg_sot,
+                "sh_sh_per90": row.avg_shots,
+                "sh_sot_per90": row.avg_sot,
+                "def_press": row.avg_pressures,
+                "pos_prgc": row.avg_prgc,
+                "gk_saves": row.avg_gk_saves,
+                "sh_goals": row.avg_goals,
+                "gk_ga": row.avg_xga,
+            }
+            if upsert_team_season_stats(
+                db, row.team, row.competition, row.season, attrs
+            ):
+                updated += 1
 
         db.commit()
         print(f"[sb] Updated {updated} team-season rows in team_season_stats")

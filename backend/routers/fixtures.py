@@ -213,22 +213,6 @@ UCL_TEAM_DOMESTIC_LEAGUE = {
     "AZ":                       "NED-Eredivisie",
     "AZ Alkmaar":               "NED-Eredivisie",
 
-    # Belgium
-    "Club Brugge":              "BEL-Jupiler Pro League",
-    "Club Brugge KV":           "BEL-Jupiler Pro League",
-    "Anderlecht":               "BEL-Jupiler Pro League",
-    "RSC Anderlecht":           "BEL-Jupiler Pro League",
-    "Genk":                     "BEL-Jupiler Pro League",
-    "KRC Genk":                 "BEL-Jupiler Pro League",
-    "Gent":                     "BEL-Jupiler Pro League",
-    "KAA Gent":                 "BEL-Jupiler Pro League",
-    "Union St.Gilloise":        "BEL-Jupiler Pro League",
-    "Union Saint-Gilloise":     "BEL-Jupiler Pro League",
-    "Royal Antwerp":            "BEL-Jupiler Pro League",
-    "Royal Antwerp FC":         "BEL-Jupiler Pro League",
-    "Antwerp":                  "BEL-Jupiler Pro League",
-    "Cercle Brugge":            "BEL-Jupiler Pro League",
-
     # Turkey
     "Fenerbahçe":               "TUR-Süper Lig",
     "Fenerbahce":               "TUR-Süper Lig",

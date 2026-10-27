@@ -1,15 +1,12 @@
-"""End-to-end tests for Render FBref scraping, status polling, workflow, and live inference."""
+"""Dormant admin endpoints, collector/aggregator schema, live inference and the daily workflow."""
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
 import sys
 import tempfile
 import threading
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import unittest
@@ -296,7 +293,6 @@ class FBrefCollectorSchemaAndResilienceTests(unittest.TestCase):
             patch.object(database, "engine", self.engine),
             patch.object(database, "SessionLocal", self.Session),
             patch.object(fbref_collector, "SessionLocal", self.Session),
-            patch.object(builder, "SessionLocal", self.Session),
         ]
         for p in self._patches:
             p.start()
@@ -482,7 +478,7 @@ class FBrefCollectorSchemaAndResilienceTests(unittest.TestCase):
 
 
 class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
-    """End-to-end verification of the exact post-merge acceptance checks."""
+    """Live prediction: real Elo, blended engine label, no snapshot columns."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -497,7 +493,6 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
             patch.object(database, "SessionLocal", self.Session),
             patch.object(fbref_collector, "SessionLocal", self.Session),
             patch.object(statsbomb_aggregator, "SessionLocal", self.Session),
-            patch.object(builder, "SessionLocal", self.Session),
             patch.object(formula_engine, "SessionLocal", self.Session),
         ]
         for p in self._patches:
@@ -537,6 +532,21 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
                         misc_crs=160.0 - idx * 2,
                     )
                 )
+            db.commit()
+
+    def _seed_elo_ratings(self):
+        """Store the two ratings under provider spellings, not fixture spellings."""
+        with self.Session() as db:
+            db.add_all([
+                database.EloRating(
+                    team="Arsenal FC", date=datetime(2026, 10, 20).date(), elo=2012.0,
+                    league="ENG-Premier League",
+                ),
+                database.EloRating(
+                    team="Chelsea AFC", date=datetime(2026, 10, 20).date(), elo=1888.0,
+                    league="ENG-Premier League",
+                ),
+            ])
             db.commit()
 
     def _seed_statsbomb_match_rows(self):
@@ -616,8 +626,12 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
                 "_le_league",
                 "_le_season",
                 "_features_df",
-                "_fbref_df",
-                "_fbref_load_attempted",
+                "_history_source",
+                "_history",
+                "_elo_latest_cache",
+                "_elo_cache",
+                "_elo_cache_loaded",
+                "_elo_lookup_failures",
             )
         }
         self.addCleanup(lambda: predict_router.__dict__.update(saved_globals))
@@ -631,19 +645,20 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
         predict_router._le_league = le_lg
         predict_router._le_season = le_sn
         predict_router._features_df = history_df
-        predict_router._refresh_fbref_caches()
+        predict_router._refresh_prediction_caches()
 
         app = FastAPI()
         app.include_router(predict_router.router)
         return TestClient(app)
 
     def _assert_arsenal_vs_chelsea(self, client):
-        # Check diagnostics contract
         diag = client.get("/predict/admin/diagnostics").json()
-        self.assertEqual(diag["fbref_source"], "database")
+        self.assertEqual(diag["active_engine"], "blended")
+        self.assertEqual(diag["hardcoded_feature_cols"], 62)
+        self.assertEqual(diag["fbref_cols_in_model"], 0)
+        self.assertGreater(diag["elo_cache_entries"], 0)
         self.assertEqual(diag["fbref_team_stats_rows"], 60)
 
-        # Check Arsenal vs Chelsea prediction across default (2026-2027) AND 2024-2025
         for req_payload in (
             {
                 "home_team": "Arsenal",
@@ -663,9 +678,15 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
                 pred = pred_res.json()
                 fv = pred["feature_vector_used"]
                 self.assertEqual(pred["prediction_method"], "blended")
-                self.assertGreater(fv["home_fbref_shots"], 0.0)
-                self.assertGreater(fv["home_fbref_clean_sheets"], 0.0)
+                # Real ratings from elo_ratings, not the 1500 hardcoded default.
+                self.assertEqual(fv["home_elo"], 2012.0)
+                self.assertEqual(fv["away_elo"], 1888.0)
                 self.assertGreater(fv["home_shots_per_game"], 0.0)
+                # No dead snapshot columns reach the model or the response.
+                self.assertFalse(any(
+                    key.startswith(("home_fbref_", "away_fbref_"))
+                    for key in fv
+                ))
 
     def test_same_day_scrape_populates_diagnostics_and_arsenal_vs_chelsea_features(self):
         shooting_df, misc_df, keeper_df = _make_multiindex_stat_frames(
@@ -682,31 +703,23 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
             "keeper": keeper_df,
         }[stat_type]
 
-        # 1. Run collector right now (same UTC calendar day as prediction!)
+        # The dormant collector still writes reference rows; the ML pipeline
+        # no longer reads them.
         with patch.object(fbref_collector.sd, "FBref", return_value=fake_fbref):
             fbref_collector.scrape_fbref_stats(
                 leagues=["ENG-Premier League"],
                 seasons=["2024-2025", "2025-2026", "2026-2027"],
             )
 
-        # 2. Seed FotMob-shaped team_season_stats rows (even with sh_shots=None on
-        # 2024-2025 and sh_shots populated on 2026-2027) so both paths are tested.
         self._seed_fotmob_team_season_stats()
+        self._seed_elo_ratings()
+        with self.Session() as db:
+            self.assertEqual(db.query(database.FBrefTeamStats).count(), 60)
 
-        # 3. Verify builder reads the freshly scraped fbref_team_stats rows
-        loaded_fbref = builder.load_fbref_stats()
-        self.assertEqual(len(loaded_fbref), 60)
-
-        # 4-5. Install models, then verify diagnostics + Arsenal vs Chelsea
         client = self._install_dummy_ml_stack()
         self._assert_arsenal_vs_chelsea(client)
 
     def test_statsbomb_aggregator_populates_diagnostics_and_arsenal_vs_chelsea_features(self):
-        """The StatsBomb aggregator must satisfy the same acceptance checks as
-        the old FBref scrape: diagnostics reports "database", and Arsenal vs
-        Chelsea carries non-zero home_fbref_* features."""
-
-        # 1. Seed match-level statsbomb_match_stats rows and aggregate them
         self._seed_statsbomb_match_rows()
         summary = statsbomb_aggregator.run_aggregation()
         self.assertEqual(summary["inserted"], 60)
@@ -715,34 +728,37 @@ class EndToEndArsenalVsChelseaPredictionTests(unittest.TestCase):
             summary["per_league_season"]["ENG-Premier League 2026-2027"]["inserted"], 20
         )
 
-        # 2. Seed FotMob-shaped team_season_stats rows for the formula engine
         self._seed_fotmob_team_season_stats()
+        self._seed_elo_ratings()
+        with self.Session() as db:
+            self.assertEqual(db.query(database.FBrefTeamStats).count(), 60)
+            arsenal = (
+                db.query(database.FBrefTeamStats)
+                .filter_by(team="Arsenal", season="2026-2027")
+                .one()
+            )
+            self.assertEqual(arsenal.shots, 25.0)
+            self.assertEqual(arsenal.saves, 6.0)
 
-        # 3. Verify builder reads the freshly aggregated fbref_team_stats rows
-        loaded_fbref = builder.load_fbref_stats()
-        self.assertEqual(len(loaded_fbref), 60)
-        arsenal_2627 = loaded_fbref[
-            (loaded_fbref["team"] == "Arsenal")
-            & (loaded_fbref["season"] == "2026-2027")
-        ].iloc[0]
-        self.assertEqual(arsenal_2627["shots"], 25.0)  # 15 home + 10 away
-        self.assertEqual(arsenal_2627["clean_sheets"], 1.0)
-        self.assertEqual(arsenal_2627["saves"], 6.0)  # 2 home + 4 away
-
-        # 4-5. Install models, then verify diagnostics + Arsenal vs Chelsea
         client = self._install_dummy_ml_stack()
         self._assert_arsenal_vs_chelsea(client)
 
 
 class WorkflowContractAndShellTests(unittest.TestCase):
-    """Validate .github/workflows/daily_fbref_update.yml structure and execute its polling bash loop."""
+    """The daily workflow keeps every non-FBref step, in the same order."""
 
     def setUp(self):
         self.workflow = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
         self.steps = self.workflow["jobs"]["collect-and-retrain"]["steps"]
+        self.step_names = [s.get("name", "") for s in self.steps]
+
+    def _idx(self, prefix: str) -> int:
+        for idx, name in enumerate(self.step_names):
+            if prefix in name:
+                return idx
+        self.fail(f"Step matching {prefix!r} missing from {self.step_names}")
 
     def test_workflow_never_runs_fbref_collector_on_github_actions_and_preserves_order(self):
-        step_names = [s.get("name", "") for s in self.steps]
         for step in self.steps:
             run_script = step.get("run", "")
             self.assertNotIn(
@@ -751,127 +767,55 @@ class WorkflowContractAndShellTests(unittest.TestCase):
                 f"GitHub Actions step {step.get('name')!r} must NOT execute fbref_collector.py",
             )
 
-        def _idx(prefix: str) -> int:
-            for idx, name in enumerate(step_names):
-                if prefix in name:
-                    return idx
-            self.fail(f"Step matching {prefix!r} missing from {step_names}")
-
-        self.assertLess(_idx("[1/5] Run StatsBomb"), _idx("[2/5] Run FotMob"))
-        self.assertLess(_idx("[2/5] Run FotMob"), _idx("[2/5] Run Understat"))
-        self.assertLess(_idx("[2/5] Run Understat"), _idx("[3/5] Run Match Collector"))
+        self.assertLess(self._idx("[1/5] Run StatsBomb"), self._idx("[2/5] Run FotMob"))
+        self.assertLess(self._idx("[2/5] Run FotMob"), self._idx("[2/5] Run Understat"))
         self.assertLess(
-            _idx("[3/5] Run Match Collector"),
-            _idx("[4/5] Trigger FBref scrape on Render"),
+            self._idx("[2/5] Run Understat"), self._idx("[3/5] Run Match Collector")
         )
         self.assertLess(
-            _idx("[4/5] Trigger FBref scrape on Render"),
-            _idx("[4/5] Wait for FBref scrape on Render"),
+            self._idx("[3/5] Run Match Collector"),
+            self._idx("[5/5] Build features (builder.py)"),
         )
         self.assertLess(
-            _idx("[4/5] Wait for FBref scrape on Render"),
-            _idx("[5/5] Build features (builder.py)"),
+            self._idx("[5/5] Build features (builder.py)"),
+            self._idx("[5/5] Train + upload models (trainer.py)"),
         )
         self.assertLess(
-            _idx("[5/5] Build features (builder.py)"),
-            _idx("[5/5] Train + upload models (trainer.py)"),
-        )
-        self.assertLess(
-            _idx("[5/5] Train + upload models (trainer.py)"),
-            _idx("[6/6] Notify Render to reload models"),
+            self._idx("[5/5] Train + upload models (trainer.py)"),
+            self._idx("[6/6] Notify Render to reload models"),
         )
 
-    def _run_wait_step_against_responses(self, responses: list[dict]) -> tuple[int, str, int]:
-        calls = {"count": 0}
+    def test_fbref_scrape_trigger_and_12_minute_poll_steps_are_gone(self):
+        joined_names = " ".join(self.step_names).lower()
+        self.assertNotIn("trigger fbref scrape", joined_names)
+        self.assertNotIn("wait for fbref scrape", joined_names)
+        for step in self.steps:
+            run_script = step.get("run", "")
+            self.assertNotIn("run-fbref-scrape", run_script)
+            self.assertNotIn("fbref-scrape-status", run_script)
+            self.assertNotIn("12 min", run_script)
+            self.assertNotIn("seq 1 24", run_script)
 
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
-                idx = min(calls["count"], len(responses) - 1)
-                calls["count"] += 1
-                payload = json.dumps(responses[idx]).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-
-            def log_message(self, *_args):
-                pass
-
-        server = HTTPServer(("127.0.0.1", 0), Handler)
-        port = server.server_address[1]
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            wait_step = next(
-                s for s in self.steps if "Wait for FBref scrape on Render" in s.get("name", "")
-            )
-            env = dict(os.environ)
-            env["RENDER_BACKEND"] = f"http://127.0.0.1:{port}"
-            env["PIPELINE_SECRET"] = "top-secret"
-            env["FBREF_POLL_INTERVAL_SECONDS"] = "0"
-            proc = subprocess.run(
-                ["bash", "-c", wait_step["run"]],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            return proc.returncode, proc.stdout + proc.stderr, calls["count"]
-        finally:
-            server.shutdown()
-            server.server_close()
-
-    def test_wait_step_exits_0_immediately_when_complete(self):
-        rc, out, polls = self._run_wait_step_against_responses(
-            [
-                {
-                    "status": "running",
-                    "last_run_at": "2026-10-20T21:00:00+00:00",
-                    "last_result": "fbref_collector running",
-                    "fbref_team_stats_rows": 120,
-                },
-                {
-                    "status": "complete",
-                    "last_run_at": "2026-10-20T21:03:00+00:00",
-                    "last_result": "fbref_collector completed OK",
-                    "fbref_team_stats_rows": 580,
-                },
-            ]
+    def test_all_required_pipeline_steps_are_present(self):
+        for prefix in (
+            "[1/5] Run StatsBomb", "[2/5] Run FotMob",
+            "[2/5] Run Understat", "[3/5] Run Match Collector",
+            "[3b/5] Run API-Football", "[5/5] Build features",
+            "[5/5] Feature parity", "[5/5] League-scope",
+            "[5/5] Train + upload", "[5/5] Verify uploaded",
+            "[6/6] Notify Render", "Verify models ready",
+            "Print final diagnostics",
+        ):
+            with self.subTest(step=prefix):
+                self.assertTrue(
+                    any(prefix in name for name in self.step_names),
+                    f"missing workflow step {prefix!r}",
+                )
+        reload_step = next(
+            s for s in self.steps
+            if "[6/6] Notify Render" in s.get("name", "")
         )
-        self.assertEqual(rc, 0)
-        self.assertEqual(polls, 2)
-        self.assertIn("fbref_team_stats_rows=580", out)
-
-    def test_wait_step_exits_0_with_warning_when_failed(self):
-        rc, out, polls = self._run_wait_step_against_responses(
-            [
-                {
-                    "status": "failed",
-                    "last_run_at": "2026-10-20T21:01:00+00:00",
-                    "last_result": "CAPTCHA detected",
-                    "fbref_team_stats_rows": 420,
-                }
-            ]
-        )
-        self.assertEqual(rc, 0)
-        self.assertEqual(polls, 1)
-        self.assertIn("::warning::", out)
-
-    def test_wait_step_exits_0_after_24_polls_timeout(self):
-        rc, out, polls = self._run_wait_step_against_responses(
-            [
-                {
-                    "status": "running",
-                    "last_run_at": "2026-10-20T21:00:00+00:00",
-                    "last_result": "fbref_collector running",
-                    "fbref_team_stats_rows": 200,
-                }
-            ]
-        )
-        self.assertEqual(rc, 0)
-        self.assertEqual(polls, 24)
-        self.assertIn("::warning::FBref scrape did not finish within 12 minutes", out)
+        self.assertIn("/predict/admin/reload-models", reload_step["run"])
 
 
 if __name__ == "__main__":

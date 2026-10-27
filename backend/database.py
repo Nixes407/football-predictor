@@ -15,6 +15,8 @@ do not exist yet, e.g. from a script or from the FastAPI startup hook.
 from __future__ import annotations
 
 import importlib.util
+import logging
+import math
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,6 +47,8 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 # environment variables always win: load_dotenv() does not override them.
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
+
+logger = logging.getLogger(__name__)
 
 # Used only when DATABASE_URL is not configured, so that importing this module
 # can never fail. Matches the value shipped in .env.example.
@@ -628,6 +632,107 @@ class PlayerSeasonStats(Base):
 
 
 # --------------------------------------------------------------------------- #
+# League guard / one-time cleanup
+# --------------------------------------------------------------------------- #
+
+#: Leagues that must never reach ``team_season_stats``. The Belgian Jupiler
+#: Pro League was never a supported competition: a bad BSA -> BEL fixture
+#: mapping wrote rows under that label and they were never purged.
+BLOCKED_LEAGUES = {"BEL-Jupiler Pro League"}
+
+
+def is_blocked_league(league: object) -> bool:
+    """True when ``league`` is a blocked label (or any Jupiler spelling)."""
+    if not isinstance(league, str):
+        return False
+    cleaned = " ".join(league.split()).casefold()
+    if cleaned in {name.casefold() for name in BLOCKED_LEAGUES}:
+        return True
+    # Catch stale variants such as "Jupiler Pro League" / "BEL-Jupiler".
+    return "jupiler" in cleaned
+
+
+def purge_bel_jupiler_rows(bind=None) -> int:
+    """One-time cleanup: remove any BEL-Jupiler Pro League rows from team_season_stats.
+
+    Safe to run on every start: after the first clean run it deletes 0 rows and
+    becomes a no-op. Only ever deletes the blocked league; other rows and all
+    stat columns are untouched.
+    """
+    target = engine if bind is None else bind
+    if target is None:
+        return 0
+    try:
+        if "team_season_stats" not in inspect(target).get_table_names():
+            return 0
+        with target.begin() as connection:
+            result = connection.exec_driver_sql(
+                "DELETE FROM team_season_stats "
+                "WHERE league = 'BEL-Jupiler Pro League'"
+            )
+            deleted = int(result.rowcount or 0)
+        if deleted > 0:
+            logger.info(
+                "Purged %d BEL-Jupiler Pro League rows from team_season_stats",
+                deleted,
+            )
+        return deleted
+    except Exception as exc:  # noqa: BLE001 - startup must not fail on cleanup
+        logger.warning("Could not purge BEL-Jupiler Pro League rows: %s", exc)
+        return 0
+
+
+def upsert_team_season_stats(
+    db,
+    team: str,
+    league: str,
+    season: str,
+    attrs: dict,
+) -> bool:
+    """Guarded upsert: the single write choke point for ``team_season_stats``.
+
+    Every collector routes its team rows through here. A blocked league is
+    rejected *before* any session/query/cursor work, so no Belgian Jupiler row
+    can be created or updated. ``None`` values in ``attrs`` never clear an
+    existing non-null column (a feed that lacks a stat must not erase the one
+    another collector stored). Returns True when a row was written.
+    """
+    if is_blocked_league(league):
+        logger.warning("Blocked attempt to upsert %s into team_season_stats", league)
+        return False
+
+    existing = (
+        db.query(TeamSeasonStats)
+        .filter(
+            TeamSeasonStats.team == team,
+            TeamSeasonStats.league == league,
+            TeamSeasonStats.season == season,
+        )
+        .first()
+    )
+    if existing is None:
+        existing = TeamSeasonStats(team=team, league=league, season=season)
+        db.add(existing)
+
+    columns = TeamSeasonStats.__table__.columns
+    for key, value in (attrs or {}).items():
+        if value is None:
+            continue
+        # A NaN/inf from a pandas aggregate is "unknown", not a real stat:
+        # writing it would corrupt the column (and Postgres rejects NaN in
+        # some float contexts), so preserve whatever is already stored.
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        if key not in columns:
+            # SQLAlchemy allows arbitrary Python attributes; silently keeping
+            # one would lose the value on commit.
+            logger.warning("Ignoring unknown TeamSeasonStats field %r", key)
+            continue
+        setattr(existing, key, value)
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Schema management
 # --------------------------------------------------------------------------- #
 
@@ -800,7 +905,11 @@ __all__ = [
     "SessionLocal",
     "StatsBombMatchStats",
     "TeamSeasonStats",
+    "BLOCKED_LEAGUES",
     "cleanup_non_team_rows",
+    "is_blocked_league",
+    "purge_bel_jupiler_rows",
+    "upsert_team_season_stats",
     "engine",
     "ensure_fbref_team_stats_columns",
     "ensure_team_corners_column",

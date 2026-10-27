@@ -78,7 +78,7 @@ FotMob stats + fixtures for all:
 
 - `backend/routers/predict.py` — prediction endpoints
 
-- `backend/features/feature_columns.py` — THE feature lists (108/17/18/17), shared by trainer and API; never redefine them elsewhere
+- `backend/features/feature_columns.py` — THE feature lists (62/13/14/13 after the 46 all-zero FBref columns were removed), shared by trainer and API; never redefine them elsewhere
 
 - `backend/features/inference.py` — builds a live fixture's feature row with the builder's own functions (see `docs/feature-parity-audit.md`)
 

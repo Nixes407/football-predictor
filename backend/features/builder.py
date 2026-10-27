@@ -1,118 +1,136 @@
 """
 Feature engineering pipeline for the Football Predictor.
 
-Built in stages. Extended in Phase 3 part 2.
+Model inputs are rolling form, venue form, Elo, H2H and the specialist
+rates. No team-season snapshot table is read here: those columns were
+always zero for live fixtures and were removed from the model contract.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
+import unicodedata
 
 import joblib
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from sklearn.preprocessing import LabelEncoder
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from database import session_scope
-from database import SessionLocal, FBrefTeamStats
 
 # The model input columns live in ONE module, shared with the trainer and the
-# API. ``FBREF_STAT_COLUMNS`` is re-exported here because the FBref join (and
-# its tests) is defined in terms of it.
+# API. The match-history aliases are re-exported here for inference.
 try:  # imported as ``features.builder`` (trainer, API, tests)
     from features.feature_columns import (  # noqa: F401 - re-exported
-        FBREF_STAT_COLUMNS,
         MATCH_HISTORY_ALIASES,
         MATCH_HISTORY_COLUMNS,
     )
 except ImportError:  # pragma: no cover - ``python features/builder.py``
     from feature_columns import (  # type: ignore[no-redef]
-        FBREF_STAT_COLUMNS,
         MATCH_HISTORY_ALIASES,
         MATCH_HISTORY_COLUMNS,
     )
 
 
-# Key columns that identify one team's season in fbref_team_stats.
-FBREF_KEY_COLUMNS = ["team", "league", "season"]
-
-# Collection metadata is loaded for the availability cutoff, never as a feature.
-FBREF_COLUMNS = FBREF_KEY_COLUMNS + FBREF_STAT_COLUMNS + ["updated_at"]
-
-# Canonical team names keyed by known variants. Team names in the matches
-# table (Football-Data.co.uk) differ from those in fbref_team_stats (FBref),
-# so both sides are mapped to this canonical form before joining.
-TEAM_NAME_MAP: dict[str, str] = {
-    # English
-    "Man United":          "Manchester Utd",
-    "Manchester United":   "Manchester Utd",
-    "Man Utd":             "Manchester Utd",
-    "Man City":            "Manchester City",
-    "Wolves":              "Wolverhampton Wanderers",
-    "Spurs":               "Tottenham Hotspur",
-    "Tottenham":           "Tottenham Hotspur",
-    "Brighton":            "Brighton & Hove Albion",
-    "Newcastle":           "Newcastle Utd",
-    "Newcastle United":    "Newcastle Utd",
-    "West Ham":            "West Ham United",
-    "Nott'm Forest":       "Nottingham Forest",
-    "Nottm Forest":        "Nottingham Forest",
-    "Leicester":           "Leicester City",
-    "Sheffield Utd":       "Sheffield United",
-    "Leeds":               "Leeds United",
-    "Brentford":           "Brentford",
-    "Fulham":              "Fulham",
-    "Luton":               "Luton Town",
-    "Burnley":             "Burnley",
-    "Bournemouth":         "Bournemouth",
-    "Ipswich":             "Ipswich Town",
-    "Southampton":         "Southampton",
-    "Everton":             "Everton",
-    "Chelsea":             "Chelsea",
-    "Arsenal":             "Arsenal",
-    "Liverpool":           "Liverpool",
-    "Aston Villa":         "Aston Villa",
-    "Crystal Palace":      "Crystal Palace",
-    # Spanish
-    "Almeria":             "Almería",
-    "Atletico Madrid":     "Atlético Madrid",
-    "Betis":               "Real Betis",
-    "Cadiz":               "Cádiz",
-    "Espanol":             "Espanyol",
-    "Leganes":             "Leganés",
-    # German
-    "Greuther Furth":      "Greuther Fürth",
-    "Koln":                "Köln",
-    "FC Koln":             "Köln",
-    "Dusseldorf":          "Düsseldorf",
-    "Nurnberg":            "Nürnberg",
-    "Hannover":            "Hannover 96",
-    "Bochum":              "VfL Bochum",
-    "M'gladbach":          "Mönchengladbach",
-    "Mainz":               "Mainz 05",
-    # Italian
-    "Inter":               "Internazionale",
-    "Inter Milan":         "Internazionale",
-    "AC Milan":            "Milan",
-    "Hellas Verona":       "Verona",
-    # French
-    "Paris SG":            "Paris S-G",
-    "PSG":                 "Paris S-G",
-    "St Etienne":          "Saint-Étienne",
-    "Saint-Etienne":       "Saint-Étienne",
-    "Marseille":           "Marseille",
-}
+#: Suffixes providers append to club names. Elo is a rolling rating: the
+#: lookup must find ``Arsenal`` even when the stored row says ``Arsenal FC``.
+_ELO_NAME_SUFFIXES = frozenset(
+    {"afc", "fc", "cf", "sc", "ac", "sk", "kv", "bk", "if", "cfc"}
+)
 
 
-def normalise_team_name(name: str) -> str:
-    """Map known team name variants to a canonical form."""
+def normalise_elo_team_name(name: object) -> str:
+    """Comparable key for team names in ``elo_ratings`` / ``matches``.
+
+    Lower-cases, strips accents and punctuation, and drops club-type suffixes
+    (``FC``, ``AFC``, ...) so a fixture's ``Arsenal`` matches a stored
+    ``Arsenal FC``. Read path only: never renames a row in the database.
+    """
     if not isinstance(name, str):
-        return name
-    return TEAM_NAME_MAP.get(name, name)
+        return ""
+    decomposed = unicodedata.normalize("NFKD", name.strip().casefold())
+    plain = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    words = re.findall(r"[a-z0-9]+", plain)
+    # Club-type tokens can be a prefix ("AFC Ajax", "FC Barcelona") or a
+    # suffix ("Arsenal FC"); compare on what is left of the actual name.
+    stripped = [word for word in words if word not in _ELO_NAME_SUFFIXES]
+    return " ".join(stripped or words)
+
+
+#: Accepted spellings of the three elo_ratings columns we read. The deployed
+#: table is introspected at query time so a renamed column no longer turns
+#: every lookup into a silent 1500 fallback.
+_ELO_COLUMN_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "team":   ("team", "team_name", "club", "name"),
+    "rating": ("elo", "elo_rating", "rating", "rating_value"),
+    "date":   ("date", "rating_date", "updated_at", "created_at"),
+}
+_ELO_COLUMN_DEFAULTS = {"team": "team", "rating": "elo", "date": "date"}
+
+
+def _elo_column_names(session) -> dict[str, str]:
+    """Resolve the real ``elo_ratings`` column names (schema-drift safe)."""
+    try:
+        available = {
+            column["name"].casefold(): column["name"]
+            for column in inspect(session.bind).get_columns("elo_ratings")
+        }
+    except Exception:  # noqa: BLE001 - fall back to the documented schema
+        return dict(_ELO_COLUMN_DEFAULTS)
+    resolved: dict[str, str] = {}
+    for role, candidates in _ELO_COLUMN_CANDIDATES.items():
+        for candidate in candidates:
+            if candidate in available:
+                resolved[role] = available[candidate]
+                break
+        resolved.setdefault(role, _ELO_COLUMN_DEFAULTS[role])
+    return resolved
+
+
+def _quote_identifier(name: str) -> str:
+    """Quote a column name discovered from the live schema (SQL-injection safe)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def load_latest_elo_ratings() -> dict[str, float]:
+    """Return ``{normalised team name: latest rating}`` for every rated team.
+
+    No season, league or match-date filter: Elo is a rolling rating, so the
+    most recent stored value is always the correct one. Used to warm the API's
+    Elo cache at startup and as the name-insensitive fallback of
+    :func:`get_latest_elo_before`. Strictly read-only.
+    """
+    with session_scope() as session:
+        cols = _elo_column_names(session)
+        q_team = _quote_identifier(cols["team"])
+        q_rating = _quote_identifier(cols["rating"])
+        q_date = _quote_identifier(cols["date"])
+        rows = session.execute(text(
+            f"SELECT latest.{q_team}, latest.{q_rating} "
+            f"FROM elo_ratings latest "
+            f"JOIN (SELECT {q_team}, MAX({q_date}) AS last_date "
+            f"      FROM elo_ratings GROUP BY {q_team}) recent "
+            f"  ON latest.{q_team} = recent.{q_team} "
+            f" AND latest.{q_date} = recent.last_date"
+        )).fetchall()
+
+    ratings: dict[str, float] = {}
+    for team, value in rows:
+        key = normalise_elo_team_name(team)
+        if not key or value is None:
+            continue
+        try:
+            rating = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(rating):
+            ratings[key] = rating
+    return ratings
 
 
 def load_matches_from_db() -> pd.DataFrame:
@@ -149,134 +167,6 @@ def load_elo_from_db() -> pd.DataFrame:
     except Exception as exc:
         print(f"[builder] WARNING: could not load elo ratings: {exc}")
         return pd.DataFrame()
-
-
-def load_fbref_stats() -> pd.DataFrame:
-    """
-    Load all rows from the fbref_team_stats table.
-
-    Returns a DataFrame with the columns in FBREF_COLUMNS. If the table is
-    empty or cannot be read, a warning is printed and an empty DataFrame with
-    those columns is returned.
-    """
-    empty = pd.DataFrame(columns=FBREF_COLUMNS)
-    db = None
-    try:
-        db = SessionLocal()
-        rows = db.query(FBrefTeamStats).all()
-        records = [
-            {col: getattr(row, col) for col in FBREF_COLUMNS}
-            for row in rows
-        ]
-    except Exception as exc:
-        print(f"[builder] WARNING: could not load fbref stats: {exc}")
-        return empty
-    finally:
-        if db is not None:
-            db.close()
-
-    if not records:
-        print("[builder] WARNING: fbref_team_stats table is empty")
-        return empty
-
-    df = pd.DataFrame(records, columns=FBREF_COLUMNS)
-    print(f"[builder] Loaded {len(df)} FBref team-season rows from DB")
-    return df
-
-
-def normalise_season_label(value) -> str:
-    """Normalise 4-digit soccerdata season codes (``'2425'``) to ``'2024-2025'``."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return ""
-    text = str(value).strip().replace("/", "-")
-    if len(text) == 4 and text.isdigit():
-        return f"20{text[:2]}-20{text[2:]}"
-    parts = text.split("-")
-    if len(parts) == 2 and len(parts[0]) == 2 and len(parts[1]) == 2 and parts[0].isdigit() and parts[1].isdigit():
-        return f"20{parts[0]}-20{parts[1]}"
-    return text
-
-
-def join_fbref_features(
-    features_df: pd.DataFrame,
-    fbref_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """Left-join only FBref values known by each match date.
-
-    ``updated_at`` is the collector's ISO UTC collection timestamp, not a
-    model input. Missing/invalid/future timestamps fail closed to zero stats;
-    never drop a training row. Matches have date-only precision, so midnight
-    UTC is the conservative cutoff (not the end of the match day).
-
-    The source table overwrites one row per team/league/season. It cannot
-    reconstruct earlier snapshots: when the stored snapshot is too new, its
-    stats must be excluded, not backdated to a guessed season-end date.
-    """
-    result = features_df.copy()
-    all_stat_cols = [
-        f"{role}_fbref_{col}"
-        for role in ("home", "away")
-        for col in FBREF_STAT_COLUMNS
-    ]
-    # Always emit the trainer's full schema, even with no available FBref data.
-    result = result.drop(columns=all_stat_cols, errors="ignore")
-    if fbref_df.empty:
-        return result.assign(**{col: 0.0 for col in all_stat_cols})
-
-    stats = fbref_df.copy()
-    stats["team"] = stats["team"].apply(normalise_team_name)
-    stats["season"] = stats["season"].apply(normalise_season_label)
-    # Parse individually: legacy ISO strings may mix offsets and precision.
-    # utc=True makes naive legacy values and timezone-aware values comparable.
-    timestamps = stats.get(
-        "updated_at", pd.Series(index=stats.index, dtype=object)
-    )
-    stats["updated_at"] = pd.to_datetime(
-        timestamps.map(lambda value: pd.to_datetime(value, errors="coerce", utc=True)),
-        errors="coerce", utc=True,
-    )
-    stats = stats.loc[stats["updated_at"].notna()].copy()
-    # Canonicalise BEFORE deduplication: provider aliases can collapse to one
-    # key. Keep the latest known snapshot, rather than arbitrary input order.
-    stats = stats.sort_values("updated_at", kind="stable").drop_duplicates(
-        subset=FBREF_KEY_COLUMNS, keep="last"
-    )
-    stats[FBREF_STAT_COLUMNS] = stats.reindex(columns=FBREF_STAT_COLUMNS).apply(
-        pd.to_numeric, errors="coerce"
-    )
-    match_dates = pd.to_datetime(
-        features_df["date"], errors="coerce", utc=True
-    ).reset_index(drop=True)
-
-    for role in ("home", "away"):
-        team_col = f"{role}_team"
-        collected_col = f"_{role}_fbref_updated_at"
-        stat_cols = [f"{role}_fbref_{col}" for col in FBREF_STAT_COLUMNS]
-        result[team_col] = result[team_col].apply(normalise_team_name)
-        team_stats = stats[FBREF_COLUMNS].rename(columns={
-            "team": team_col,
-            "updated_at": collected_col,
-            **{col: f"{role}_fbref_{col}" for col in FBREF_STAT_COLUMNS},
-        })
-        result = result.merge(
-            team_stats, on=[team_col, "league", "season"], how="left",
-            validate="many_to_one",
-        )
-        # A WHERE on the whole left-joined frame would drop historical matches.
-        # Mask only this side's stats: updated_at <= match_date is required.
-        available = (
-            result[collected_col].notna()
-            & match_dates.notna()
-            & (result[collected_col] <= match_dates)
-        )
-        result.loc[~available, stat_cols] = 0.0
-        result[stat_cols] = result[stat_cols].fillna(0.0)
-        result = result.drop(columns=[collected_col])
-
-    if len(result) != len(features_df):
-        raise ValueError(f"join changed row count {len(features_df)} -> {len(result)}")
-    result.index = features_df.index
-    return result
 
 
 def get_pre_match_elo(
@@ -426,37 +316,51 @@ def get_latest_elo_before(
     before_date: pd.Timestamp,
     raise_on_error: bool = False,
 ) -> float | None:
-    """Latest EloRating for ``team`` dated strictly before ``before_date``.
+    """Latest Elo for ``team`` from the authoritative ``elo_ratings`` table.
 
-    Direct database read, used at inference time to resolve the two ratings a
-    live fixture needs. The features CSV only stores each team's *pre-match*
-    rating, so reconstructing Elo from it would systematically score a team
-    with the rating it held one match earlier. ``None`` means "no rating
-    known"; the caller then falls back to the reconstructed history and
-    finally to 1500. A database error also returns None unless
-    ``raise_on_error`` is set, which lets the API tell the two apart.
+    ``before_date`` is accepted for API/backtest compatibility but is NOT a
+    filter: Elo is a rolling rating, so the most recently stored value is
+    always the right one. The old exact-name ``team = :team AND date < :date``
+    query returned no row whenever the stored spelling differed (``Arsenal``
+    vs ``Arsenal FC``) or the newest rating was dated on/after the cutoff —
+    which silently produced the hard-coded 1500 fallback and an empty cache.
+
+    ``None`` means "no rating known"; the caller then uses the CSV
+    reconstruction and finally the 1500 default. A database error also returns
+    None unless ``raise_on_error`` is set, which lets the API tell the two
+    apart. This function never writes to the database.
     """
     try:
         with session_scope() as session:
+            cols = _elo_column_names(session)
+            q_team = _quote_identifier(cols["team"])
+            q_rating = _quote_identifier(cols["rating"])
+            q_date = _quote_identifier(cols["date"])
             row = session.execute(
                 text(
-                    "SELECT elo FROM elo_ratings "
-                    "WHERE team = :team AND date < :date "
-                    "ORDER BY date DESC LIMIT 1"
+                    f"SELECT {q_rating} FROM elo_ratings "
+                    f"WHERE {q_team} = :team AND {q_rating} IS NOT NULL "
+                    f"ORDER BY {q_date} DESC LIMIT 1"
                 ),
-                {"team": team, "date": pd.Timestamp(before_date).date()},
+                {"team": team},
             ).fetchone()
+        value = row[0] if row else None
+        if value is None:
+            # Exact-name miss (casing, accents, "FC"/"AFC" suffix): resolve
+            # against the latest rating of every stored team instead.
+            value = load_latest_elo_ratings().get(normalise_elo_team_name(team))
     except Exception as exc:  # noqa: BLE001 - caller falls back
         if raise_on_error:
             raise
         print(f"[builder] WARNING: could not read Elo for {team}: {exc}")
         return None
-    if row is None or row[0] is None:
+    if value is None:
         return None
     try:
-        return float(row[0])
+        rating = float(value)
     except (TypeError, ValueError):
         return None
+    return rating if np.isfinite(rating) else None
 
 
 def compute_elo_features(
@@ -1050,18 +954,6 @@ def build_and_save_features(
     joblib.dump(le_league, enc_dir / "league_encoder.joblib")
     joblib.dump(le_season, enc_dir / "season_encoder.joblib")
     print(f"[builder] Encoders saved to {enc_dir}")
-
-    # Preserve every training row, but only expose a team's FBref snapshot
-    # when its collection timestamp is on or before that row's match date.
-    fbref_df = load_fbref_stats()
-    try:
-        features_df = join_fbref_features(features_df, fbref_df)
-        print(f"[builder] Added {2 * len(FBREF_STAT_COLUMNS)} date-filtered "
-              "FBref features (home + away)")
-    except Exception as exc:
-        print(f"[builder] WARNING: FBref join failed, using zero FBref "
-              f"features: {exc}")
-        features_df = join_fbref_features(features_df, pd.DataFrame())
 
     # Save features CSV
     out_path = Path(output_path)

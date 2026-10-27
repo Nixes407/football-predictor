@@ -36,7 +36,7 @@ _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from database import SessionLocal, TeamSeasonStats
+from database import SessionLocal, TeamSeasonStats, upsert_team_season_stats
 from sqlalchemy import and_
 
 
@@ -391,28 +391,8 @@ def _upsert_team(
     season: str,
     attrs: dict,
 ) -> None:
-    """Insert or update one TeamSeasonStats row."""
-    existing = (
-        db.query(TeamSeasonStats)
-        .filter(
-            and_(
-                TeamSeasonStats.team == team,
-                TeamSeasonStats.league == league,
-                TeamSeasonStats.season == season,
-            )
-        )
-        .first()
-    )
-    if existing is None:
-        existing = TeamSeasonStats(team=team, league=league, season=season)
-        db.add(existing)
-    for k, v in attrs.items():
-        # None means "this feed does not carry that stat" — writing it
-        # would wipe the value another collector (FBref / API-Football)
-        # stored in the same row.
-        if v is None:
-            continue
-        setattr(existing, k, v)
+    """Insert or update one TeamSeasonStats row via the guarded write."""
+    upsert_team_season_stats(db, team, league, season, attrs)
 
 
 # ═══════════════════════════════════════════

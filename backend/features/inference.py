@@ -1,19 +1,17 @@
-"""
-Inference-time feature assembly, built on the *training* implementation.
+"""Inference-time feature assembly, built on the *training* implementation.
 
 ``routers/predict.py`` has to score a fixture that has not been played yet, so
 it cannot read a pre-computed feature row: it must rebuild the same rolling
-windows, venue splits, Elo values, H2H record and FBref snapshot that
-``features/builder.py`` produced for every training row.
+windows, venue splits, Elo values and H2H record that ``features/builder.py``
+produced for every training row.
 
 This module is the bridge. It
 
 1. reconstructs the match history from the saved features CSV
    (:func:`match_history_from_features`) — the API process has that frame and
    nothing else;
-2. reconstructs the Elo history (:func:`elo_history_from_features`) and, when
-   the database is unreachable, the FBref snapshots
-   (:func:`fbref_history_from_features`);
+2. reconstructs the Elo history (:func:`elo_history_from_features`) as a
+   fallback for when the database cannot answer;
 3. calls ``builder.compute_match_features`` — the very function the training
    pipeline calls — with the fixture date as the cutoff.
 
@@ -34,10 +32,8 @@ import pandas as pd
 
 try:  # imported as ``features.inference``
     from features import builder
-    from features.feature_columns import FBREF_STAT_COLUMNS
 except ImportError:  # pragma: no cover - run from inside backend/features
     import builder  # type: ignore[no-redef]
-    from feature_columns import FBREF_STAT_COLUMNS
 
 
 # --------------------------------------------------------------------------- #
@@ -206,64 +202,6 @@ def elo_history_from_features(features_df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def fbref_history_from_features(features_df: pd.DataFrame) -> pd.DataFrame:
-    """Reconstruct ``fbref_team_stats`` rows from the features CSV.
-
-    Fallback for when the database is unreachable: each row carries both
-    teams' FBref snapshots (already date-filtered by the builder), so the most
-    recent row held for a team/league/season is the newest snapshot the CSV
-    knows about. ``updated_at`` is set to that row's date so
-    :func:`builder.join_fbref_features` applies the same availability rule it
-    applies to database rows.
-
-    A snapshot collected *after* a team's last match is invisible here (its
-    stored values are 0) — that is why the API prefers a live
-    ``fbref_team_stats`` read and only falls back to this.
-    """
-    empty = pd.DataFrame(
-        columns=["team", "league", "season", "updated_at", *FBREF_STAT_COLUMNS]
-    )
-    if features_df is None or len(features_df) == 0:
-        return empty
-
-    site_columns = [c for c in ("date", "league", "season")
-                    if c in features_df.columns]
-    if len(site_columns) < 3:
-        return empty
-
-    frames = []
-    for role, team_column in (("home", "home_team"), ("away", "away_team")):
-        if team_column not in features_df.columns:
-            continue
-        stat_columns = {
-            f"{role}_fbref_{stat}": stat
-            for stat in FBREF_STAT_COLUMNS
-            if f"{role}_fbref_{stat}" in features_df.columns
-        }
-        if not stat_columns:
-            continue
-        frame = features_df[site_columns + [team_column] + list(stat_columns)].copy()
-        frame = frame.rename(columns={
-            team_column: "team",
-            "date": "updated_at",
-            **stat_columns,
-        })
-        frames.append(frame)
-
-    if not frames:
-        return empty
-
-    fbref = pd.concat(frames, ignore_index=True)
-    fbref["updated_at"] = pd.to_datetime(fbref["updated_at"], errors="coerce", utc=True)
-    for stat in FBREF_STAT_COLUMNS:
-        if stat not in fbref.columns:
-            fbref[stat] = np.nan
-        fbref[stat] = pd.to_numeric(fbref[stat], errors="coerce")
-    fbref = fbref.dropna(subset=["team", "league", "season", "updated_at"])
-    fbref = fbref.sort_values("updated_at", kind="stable")
-    return fbref.reset_index(drop=True)
-
-
 # --------------------------------------------------------------------------- #
 # Categorical encoding
 # --------------------------------------------------------------------------- #
@@ -322,7 +260,6 @@ def _numeric(value: Any, default: float = 0.0) -> float:
 def build_inference_features(
     matches_df: pd.DataFrame,
     elo_df: pd.DataFrame,
-    fbref_df: pd.DataFrame,
     home_team: str,
     away_team: str,
     before_date: Any = None,
@@ -336,10 +273,8 @@ def build_inference_features(
     matches from strictly earlier days are used. Pass it explicitly to
     reproduce a historical row (the parity test does).
 
-    ``league``/``season`` are the fixture's strings, needed to look up the
-    FBref team-season snapshot. When they are unknown the FBref features are
-    0.0 — the same value the builder writes for a fixture whose snapshot is
-    not available.
+    ``league``/``season`` are accepted for API compatibility but are not model
+    inputs; the categorical encoder is applied by the router.
 
     ``elo_lookup(team, before_date)`` resolves a rating from the authoritative
     ``elo_ratings`` table. The caller should pass one whenever it can: the
@@ -364,34 +299,4 @@ def build_inference_features(
         matches_df, elo_df, home_team, away_team, cutoff,
         elo_lookup=elo_lookup,
     )
-
-    # Live fixtures (before_date is None) may use an FBref snapshot scraped
-    # earlier on the same UTC day; historical parity calls pass before_date
-    # explicitly and keep the exact midnight cutoff used by builder.py.
-    fbref_cutoff = (
-        pd.Timestamp.now(tz="UTC")
-        if before_date is None
-        else cutoff
-    )
-
-    fixture = pd.DataFrame([{
-        "date": fbref_cutoff,
-        "home_team": home_team,
-        "away_team": away_team,
-        "league": league,
-        "season": season,
-    }])
-    if fbref_df is not None and len(fbref_df) > 0 and league and season:
-        joined = builder.join_fbref_features(fixture, fbref_df)
-        row = joined.iloc[0]
-        for column in joined.columns:
-            if "fbref" in column:
-                features[column] = _numeric(row[column])
-    else:
-        # Still emit the full schema, all zero, exactly like the builder does
-        # when fbref_team_stats is empty.
-        for role in ("home", "away"):
-            for stat in FBREF_STAT_COLUMNS:
-                features[f"{role}_fbref_{stat}"] = 0.0
-
     return {name: _numeric(value) for name, value in features.items()}

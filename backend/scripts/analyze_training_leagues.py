@@ -8,9 +8,9 @@ wider league set:
    season (default: first training season .. current season, i.e. 2021-2022
    onward including the in-progress one) for every league in the trainer's
    ``TRAINING_LEAGUES``?
-2. Does ``fbref_team_stats`` contain rows for those leagues?  Missing FBref
-   coverage is NOT fatal: the feature builder zero-fills the FBref columns,
-   so those leagues train on ELO + rolling-results features only.
+2. Does ``fbref_team_stats`` contain rows for those leagues?  This is
+   historical coverage only: the ML pipeline no longer reads that table or
+   emits any of its columns. Training uses Elo + rolling-results features.
 
 The script reads whatever ``DATABASE_URL`` points at (``backend/.env`` is
 loaded automatically by ``backend/database.py``), so it works against the
@@ -230,15 +230,15 @@ def print_report(report: dict[str, Any]) -> None:
     if report.get("fbref_coverage_error"):
         print(f"  ERROR: {report['fbref_coverage_error']}")
     elif not report["fbref"]:
-        print("  (table is empty — every league trains without FBref features)")
+        print("  (table is empty — no reference rows stored)")
     else:
         for league, n in sorted(report["fbref"].items()):
             print(f"  {league:<28} rows={n['rows']:<6} latest={n['latest_updated_at']}")
     no_fb = report.get("leagues_without_fbref") or []
     if no_fb:
         print()
-        print("leagues WITHOUT fbref_team_stats rows (acceptable: they fall back "
-              "to ELO + rolling results):")
+        print("leagues WITHOUT fbref_team_stats rows (informational only — "
+              "no model input depends on them):")
         for league in no_fb:
             print(f"  - {league}")
     print("=" * 74)
