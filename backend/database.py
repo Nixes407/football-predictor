@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import math
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -716,6 +717,11 @@ def upsert_team_season_stats(
     columns = TeamSeasonStats.__table__.columns
     for key, value in (attrs or {}).items():
         if value is None:
+            continue
+        # A NaN/inf from a pandas aggregate is "unknown", not a real stat:
+        # writing it would corrupt the column (and Postgres rejects NaN in
+        # some float contexts), so preserve whatever is already stored.
+        if isinstance(value, float) and not math.isfinite(value):
             continue
         if key not in columns:
             # SQLAlchemy allows arbitrary Python attributes; silently keeping

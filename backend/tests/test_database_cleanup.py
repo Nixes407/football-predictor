@@ -121,6 +121,11 @@ class BelJupilerPurgeTests(unittest.TestCase):
                 db, "Arsenal", "ENG-Premier League", "2026-2027",
                 {"sh_xg": None},
             )
+            # NaN from a pandas aggregate must not clobber the stored value.
+            database.upsert_team_season_stats(
+                db, "Arsenal", "ENG-Premier League", "2026-2027",
+                {"sh_xg": float("nan")},
+            )
             db.commit()
 
         self.assertEqual(self._rows(), [("Arsenal", "ENG-Premier League", 21.0)])
