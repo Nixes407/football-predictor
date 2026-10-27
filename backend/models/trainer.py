@@ -1226,7 +1226,7 @@ def train_over95_corners_model(
     Train and evaluate the dedicated Over 9.5 corners binary classifier.
 
     Uses OVER95_CORNERS_FEATURE_COLS (6 new corner-specific rolling rates +
-    the existing corner form, FBref attacking volume, Elo and league columns)
+    the existing corner form, Elo and league columns)
     and target_over95_corners. Same 65/15/20 chronological split.
     Pipeline: SimpleImputer(median) -> StandardScaler -> LogisticRegression.
     Saves to {model_dir}/over95_corners_model_v1.joblib

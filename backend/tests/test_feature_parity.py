@@ -9,12 +9,12 @@ this module pins them together:
 * a synthetic match history is turned into a features frame by the *builder*;
 * the same frame, cut off at a fixture date, is turned into a feature vector by
   *predict*;
-* every one of the 108 / 17 / 18 / 17 model inputs is asserted equal.
+* every one of the 62 / 13 / 14 / 13 model inputs is asserted equal;
+* no team-season snapshot column appears on either side.
 
 No database and no network are touched: the builder's feature functions are
-pure, the frame the API would download is passed in directly, and the FBref
-snapshot is injected as a DataFrame (which is exactly what
-``load_artifacts`` caches in production).
+pure and the frame the API would download is passed in directly. The Elo
+database tests use a throwaway in-memory SQLite database.
 
 Run from ``backend/``::
 
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -34,11 +35,15 @@ from sklearn.preprocessing import LabelEncoder
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+import database  # noqa: E402
 from features import builder  # noqa: E402
 from features.feature_columns import (  # noqa: E402
     BTTS_FEATURE_COLS,
     EXPECTED_FEATURE_COUNTS,
-    FBREF_STAT_COLUMNS,
     FEATURE_COLS,
     OVER25_FEATURE_COLS,
     OVER95_CORNERS_FEATURE_COLS,
@@ -130,43 +135,20 @@ def synthetic_elo(matches: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def synthetic_fbref() -> pd.DataFrame:
-    """A team-season snapshot available before every synthetic match."""
-    records = []
-    for team in TEAMS:
-        for league in LEAGUES:
-            for season in SEASONS:
-                records.append({
-                    "team": team,
-                    "league": league,
-                    "season": season,
-                    "updated_at": "2023-07-01T00:00:00+00:00",
-                    **{
-                        stat: float(10 + position)
-                        for position, stat in enumerate(FBREF_STAT_COLUMNS)
-                    },
-                })
-    return pd.DataFrame(records)
-
-
 def training_frame():
-    """``(features frame, (league_encoder, season_encoder), fbref rows, elo)``.
+    """``(features frame, (league_encoder, season_encoder), elo)``.
 
     Everything ``build_and_save_features`` would produce, without the database.
     """
     matches = synthetic_matches()
     elo = synthetic_elo(matches)
-    fbref = synthetic_fbref()
-
     features = builder.build_features(matches, elo)
 
     leagues = LabelEncoder()
     seasons = LabelEncoder()
     features["league_encoded"] = leagues.fit_transform(features["league"].astype(str))
     features["season_encoded"] = seasons.fit_transform(features["season"].astype(str))
-
-    saved = builder.join_fbref_features(features, fbref)
-    return saved, (leagues, seasons), fbref, elo
+    return features, (leagues, seasons), elo
 
 
 # --------------------------------------------------------------------------- #
@@ -177,21 +159,30 @@ def training_frame():
 class FeatureColumnContractTests(unittest.TestCase):
     """The published column lists and their lengths cannot drift."""
 
-    def test_counts_are_unchanged(self):
-        self.assertEqual(len(FEATURE_COLS), 108)
-        self.assertEqual(len(BTTS_FEATURE_COLS), 17)
-        self.assertEqual(len(OVER25_FEATURE_COLS), 18)
-        self.assertEqual(len(OVER95_CORNERS_FEATURE_COLS), 17)
+    def test_feature_cols_count(self):
+        self.assertEqual(len(FEATURE_COLS), 62)
+        self.assertEqual(len(BTTS_FEATURE_COLS), 13)
+        self.assertEqual(len(OVER25_FEATURE_COLS), 14)
+        self.assertEqual(len(OVER95_CORNERS_FEATURE_COLS), 13)
         validate_feature_column_counts()
+
+    def test_no_fbref_in_feature_cols(self):
+        for columns in (
+            FEATURE_COLS, BTTS_FEATURE_COLS, OVER25_FEATURE_COLS,
+            OVER95_CORNERS_FEATURE_COLS,
+        ):
+            for column in columns:
+                self.assertFalse(column.startswith("home_fbref_"))
+                self.assertFalse(column.startswith("away_fbref_"))
 
     def test_expected_counts_map_is_the_contract(self):
         self.assertEqual(
             EXPECTED_FEATURE_COUNTS,
             {
-                "FEATURE_COLS": 108,
-                "BTTS_FEATURE_COLS": 17,
-                "OVER25_FEATURE_COLS": 18,
-                "OVER95_CORNERS_FEATURE_COLS": 17,
+                "FEATURE_COLS": 62,
+                "BTTS_FEATURE_COLS": 13,
+                "OVER25_FEATURE_COLS": 14,
+                "OVER95_CORNERS_FEATURE_COLS": 13,
             },
         )
 
@@ -225,7 +216,7 @@ class FeatureColumnContractTests(unittest.TestCase):
     def test_features_csv_carries_the_match_history(self):
         # Inference replays the rolling windows from these columns; dropping
         # them from the builder output silently degrades the shot features.
-        features, _, _, _ = training_frame()
+        features, _, _ = training_frame()
         for column in builder.MATCH_HISTORY_COLUMNS:
             self.assertIn(column, features.columns)
         self.assertEqual(
@@ -246,24 +237,24 @@ class InferenceParityTests(unittest.TestCase):
         (
             cls.features,
             (cls.league_encoder, cls.season_encoder),
-            cls.fbref,
             cls.elo,
         ) = training_frame()
 
     def setUp(self):
         # The API normally fills these in load_artifacts(); inject the fixture
-        # snapshot instead so no database is contacted.
+        # frame so no database is contacted.
         self._saved = {
             name: getattr(predict, name)
             for name in (
-                "_features_df", "_fbref_df", "_fbref_load_attempted",
-                "_history_source", "_history_fbref_source", "_history",
+                "_features_df", "_history_source", "_history",
+                "_elo_cache", "_elo_lookup_failures", "_elo_cache_loaded",
+                "_elo_latest_cache",
             )
         }
-        predict._fbref_df = self.fbref
-        predict._fbref_load_attempted = True
+        predict._elo_latest_cache = {}
         predict._elo_cache = {}
         predict._elo_lookup_failures = 0
+        predict._elo_cache_loaded = True
 
         # In production this reads elo_ratings — the same table the builder
         # read. Substituting the fixture history keeps the test DB-free while
@@ -289,7 +280,6 @@ class InferenceParityTests(unittest.TestCase):
         frame = self.features.loc[self.features["date"] < before_date]
         predict._features_df = frame.sort_values("date").reset_index(drop=True)
         predict._history_source = None
-        predict._history_fbref_source = None
         predict._history = {}
         return predict._features_df
 
@@ -426,21 +416,21 @@ class InferenceRobustnessTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        (cls.features, _, cls.fbref, cls.elo) = training_frame()
+        (cls.features, _, cls.elo) = training_frame()
 
     def setUp(self):
         self._saved = {
             name: getattr(predict, name)
             for name in (
-                "_features_df", "_fbref_df", "_fbref_load_attempted",
-                "_history_source", "_history_fbref_source", "_history",
-                "_elo_cache", "_elo_lookup_failures",
+                "_features_df", "_history_source", "_history",
+                "_elo_cache", "_elo_lookup_failures", "_elo_cache_loaded",
+                "_elo_latest_cache",
             )
         }
-        predict._fbref_load_attempted = True
-        predict._fbref_df = None
+        predict._elo_latest_cache = {}
         predict._elo_cache = {}
         predict._elo_lookup_failures = 0
+        predict._elo_cache_loaded = True
 
         patcher = mock.patch.object(
             predict,
@@ -462,7 +452,6 @@ class InferenceRobustnessTests(unittest.TestCase):
             else frame.sort_values("date").reset_index(drop=True)
         )
         predict._history_source = None
-        predict._history_fbref_source = None
         predict._history = {}
         return predict._features_df
 
@@ -500,7 +489,7 @@ class InferenceRobustnessTests(unittest.TestCase):
                 msg=f"{column} should still match without raw shot counts",
             )
 
-    def test_fbref_falls_back_to_the_csv_snapshot(self):
+    def test_no_fbref_keys_in_inference_vector(self):
         target = self.features.iloc[-1]
         cutoff = target["date"]
         csv = self.set_csv(self.features.loc[self.features["date"] < cutoff])
@@ -512,12 +501,27 @@ class InferenceRobustnessTests(unittest.TestCase):
             league=target["league"], season=target["season"],
             before_date=cutoff,
         )
-        # The synthetic snapshot predates every match, so the CSV-carried
-        # values and the (unavailable) database values are the same.
-        for column in ("home_fbref_games", "away_fbref_crosses"):
-            self.assertAlmostEqual(
-                float(target[column]), vector[column], delta=TOLERANCE
+        self.assertFalse(any(
+            key.startswith(("home_fbref_", "away_fbref_"))
+            for key in vector
+        ))
+        self.assertEqual(set(vector), set(FEATURE_COLS))
+        self.assertEqual(len(vector), 62)
+
+    def test_elo_fallback(self):
+        """Required regression: 0 Elo rows still gives the 1500 default."""
+        csv = self.set_csv(pd.DataFrame())
+        with mock.patch.object(
+            predict, "_elo_rating_lookup", return_value=None
+        ):
+            predict._elo_cache = {}
+            vector = predict._build_feature_vector(
+                "Unknown Home", "Unknown Away", 0, 0, csv, FEATURE_COLS,
+                before_date=pd.Timestamp("2024-01-01"),
             )
+        self.assertEqual(vector["home_elo"], 1500.0)
+        self.assertEqual(vector["away_elo"], 1500.0)
+        self.assertEqual(vector["elo_difference"], 0.0)
 
     def test_empty_frame_still_returns_the_full_schema(self):
         # Degenerate case (no features CSV at all): the vector keeps the
@@ -597,7 +601,6 @@ class InferenceRobustnessTests(unittest.TestCase):
         features = inference.build_inference_features(
             history,
             inference.elo_history_from_features(self.features),
-            self.fbref,
             target["home_team"],
             target["away_team"],
             before_date=cutoff,
@@ -610,6 +613,118 @@ class InferenceRobustnessTests(unittest.TestCase):
             float(target["home_form_wins_5"]),
             delta=TOLERANCE,
         )
+
+
+class EloLookupDatabaseTests(unittest.TestCase):
+    """Task 2 regressions: name variants, rolling ratings, cache population.
+
+    Uses a throwaway in-memory SQLite ``elo_ratings`` table; nothing is written
+    to any production database and no Elo write logic is exercised.
+    """
+
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        database.Base.metadata.create_all(
+            self.engine, tables=[database.EloRating.__table__]
+        )
+        self.Session = sessionmaker(bind=self.engine)
+        self._saved = {
+            name: getattr(predict, name)
+            for name in (
+                "_elo_latest_cache", "_elo_cache", "_elo_cache_loaded",
+                "_elo_lookup_failures",
+            )
+        }
+        predict._elo_latest_cache = {}
+        predict._elo_cache = {}
+        predict._elo_cache_loaded = False
+        predict._elo_lookup_failures = 0
+        for patcher in (
+            mock.patch.object(database, "engine", self.engine),
+            mock.patch.object(database, "SessionLocal", self.Session),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self._restore_globals)
+        self.addCleanup(self.engine.dispose)
+
+    def _restore_globals(self):
+        for name, value in self._saved.items():
+            setattr(predict, name, value)
+
+    def seed(self, *rows):
+        with self.Session() as db:
+            for team, day, rating in rows:
+                db.add(database.EloRating(
+                    team=team, date=date.fromisoformat(day), elo=rating
+                ))
+            db.commit()
+
+    def test_name_variants_and_rolling_rating_are_found(self):
+        self.seed(
+            ("Arsenal FC", "2023-01-01", 1900.0),
+            ("Arsenal FC", "2026-10-26", 2012.0),
+            ("Chelsea AFC", "2026-10-25", 1888.0),
+        )
+        # before_date is deliberately older than every stored row: the old
+        # "date < :date" query returned nothing and produced 1500.
+        cutoff = pd.Timestamp("2024-01-01")
+        self.assertEqual(builder.get_latest_elo_before("Arsenal", cutoff), 2012.0)
+        self.assertEqual(builder.get_latest_elo_before("Chelsea", cutoff), 1888.0)
+        self.assertIsNone(builder.get_latest_elo_before("Unknown FC", cutoff))
+
+    def test_prefix_and_suffix_club_tokens_normalise_to_one_key(self):
+        self.assertEqual(
+            builder.normalise_elo_team_name("  Arsenal FC "),
+            builder.normalise_elo_team_name("Arsenal"),
+        )
+        self.assertEqual(
+            builder.normalise_elo_team_name("AFC Ajax"),
+            builder.normalise_elo_team_name("Ajax"),
+        )
+        self.assertEqual(
+            builder.normalise_elo_team_name("Atlético Madrid"),
+            builder.normalise_elo_team_name("Atletico Madrid"),
+        )
+
+    def test_warm_cache_populates_diagnostics_and_short_circuits_lookups(self):
+        self.seed(
+            ("Arsenal FC", "2026-10-26", 2012.0),
+            ("Chelsea FC", "2026-10-25", 1888.0),
+        )
+        self.assertEqual(predict.warm_elo_cache(force=True), 2)
+        self.assertEqual(
+            predict._elo_lookup("Arsenal", pd.Timestamp("2024-01-01")), 2012.0
+        )
+        self.assertEqual(
+            predict._elo_lookup("Chelsea", pd.Timestamp("2024-01-01")), 1888.0
+        )
+        # Both were served from the startup cache, no per-team DB query needed.
+        self.assertEqual(predict._elo_cache, {})
+
+        with mock.patch.object(
+            predict, "get_engine_status", return_value={"ready": True}
+        ), mock.patch.object(
+            predict, "_count_fbref_team_stats_rows", return_value=0
+        ):
+            payload = predict.diagnostics()
+        self.assertEqual(payload["elo_cache_entries"], 2)
+        self.assertEqual(payload["active_engine"], "blended")
+
+    def test_no_elo_rows_still_falls_back_to_1500(self):
+        cutoff = pd.Timestamp("2024-01-01")
+        self.assertIsNone(builder.get_latest_elo_before("Arsenal", cutoff))
+        features = builder.compute_elo_features(
+            pd.DataFrame(), "Arsenal", "Chelsea", cutoff,
+            elo_lookup=lambda team, before: None,
+        )
+        self.assertEqual(features, {
+            "home_elo": 1500.0, "away_elo": 1500.0, "elo_difference": 0.0,
+        })
 
 
 if __name__ == "__main__":

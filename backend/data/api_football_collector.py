@@ -25,7 +25,9 @@ _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from database import SessionLocal, TeamSeasonStats, PlayerSeasonStats
+from database import (
+    SessionLocal, TeamSeasonStats, PlayerSeasonStats, upsert_team_season_stats,
+)
 from sqlalchemy import and_
 
 API_KEY  = os.environ.get("API_FOOTBALL_KEY", "")
@@ -40,7 +42,6 @@ LEAGUE_MAP = {
     "FRA-Ligue 1":        61,
     "POR-Primeira Liga":  94,
     "NED-Eredivisie":     88,
-    "BEL-Jupiler Pro League": 144,
     "TUR-Süper Lig":      203,
     "NOR-Eliteserien":    103,
     "AUT-Bundesliga":     218,
@@ -61,7 +62,6 @@ SEASON_MAP = {
     "FRA-Ligue 1":        [2025, 2026],
     "POR-Primeira Liga":  [2025, 2026],
     "NED-Eredivisie":     [2025, 2026],
-    "BEL-Jupiler Pro League": [2025, 2026],
     "TUR-Süper Lig":      [2025, 2026],
     "NOR-Eliteserien":    [2025, 2026],
     "AUT-Bundesliga":     [2025, 2026],
@@ -80,8 +80,6 @@ SEASON_LABEL = {
     (88,  2025): "2025-2026", (88,  2026): "2026-2027",
     (253, 2025): "2025",      (253, 2026): "2026",
     (2,   2025): "2025-2026", (2,   2026): "2026-2027",
-    (144, 2025): "2025-2026",
-    (144, 2026): "2026-2027",
     (203, 2025): "2025-2026",
     (203, 2026): "2026-2027",
     (103, 2025): "2025",
@@ -91,7 +89,7 @@ SEASON_LABEL = {
 }
 
 # Leagues whose injuries and recent form are fetched. The newer leagues
-# (BEL, TUR, NOR, AUT, MLS) are left out to stay inside the request budget;
+# (TUR, NOR, AUT, MLS) are left out to stay inside the request budget;
 # their form still comes from the standings read by collect_team_stats.
 INJURY_LEAGUES = {
     "ENG-Premier League",
@@ -310,19 +308,8 @@ def _apply_attrs(existing, attrs) -> None:
 
 
 def _upsert_team(db, team, league, season, attrs):
-    existing = (
-        db.query(TeamSeasonStats)
-        .filter(and_(
-            TeamSeasonStats.team   == team,
-            TeamSeasonStats.league == league,
-            TeamSeasonStats.season == season,
-        )).first()
-    )
-    if existing is None:
-        existing = TeamSeasonStats(
-            team=team, league=league, season=season)
-        db.add(existing)
-    _apply_attrs(existing, attrs)
+    """Guarded TeamSeasonStats upsert (all collectors share the same path)."""
+    upsert_team_season_stats(db, team, league, season, attrs)
 
 
 def _upsert_player(db, player, team,
@@ -573,26 +560,16 @@ def collect_team_form() -> int:
                     fd = recent.count("D")
                     fl = recent.count("L")
 
-                    existing = (
-                        db.query(TeamSeasonStats)
-                        .filter(and_(
-                            TeamSeasonStats.team   == team_name,
-                            TeamSeasonStats.league == league_name,
-                            TeamSeasonStats.season == season_l,
-                        )).first()
-                    )
-                    if existing is None:
-                        existing = TeamSeasonStats(
-                            team=team_name,
-                            league=league_name,
-                            season=season_l,
-                        )
-                        db.add(existing)
-
-                    existing.gk_w = float(fw)
-                    existing.gk_d = float(fd)
-                    existing.gk_l = float(fl)
-                    updated += 1
+                    # Same guarded write as every other team-season feed.
+                    if upsert_team_season_stats(
+                        db, team_name, league_name, season_l,
+                        {
+                            "gk_w": float(fw),
+                            "gk_d": float(fd),
+                            "gk_l": float(fl),
+                        },
+                    ):
+                        updated += 1
 
             db.commit()
             print(f"[form] {league_name}: updated")

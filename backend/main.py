@@ -12,6 +12,7 @@ Run locally from the `backend/` directory:
 """
 
 import os
+import threading
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -90,10 +91,21 @@ async def lifespan(app: FastAPI):
     print("  Docs available at       : /docs")
     print("=" * 60)
 
-    from database import init_db
-    from routers.predict import startup_reload_models
+    from database import init_db, purge_bel_jupiler_rows
+    from routers.predict import startup_reload_models, warm_elo_cache
 
     init_db()
+    # One-time cleanup of mislabelled Belgian rows. Idempotent: after the first
+    # clean start this deletes 0 rows (see database.purge_bel_jupiler_rows).
+    purged = purge_bel_jupiler_rows()
+    print(f"[startup] Purged {purged} BEL-Jupiler Pro League rows from "
+          "team_season_stats")
+    # Populate the read-only Elo cache from elo_ratings so live predictions
+    # never silently fall back to 1500 when the per-team query misses. Done in
+    # a daemon thread: an unreachable database must not delay the port bind.
+    threading.Thread(
+        target=warm_elo_cache, name="startup-elo-cache", daemon=True
+    ).start()
     # Background thread: downloads model artifacts only, then loads them.
     startup_reload_models()
 

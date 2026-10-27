@@ -10,20 +10,23 @@ numbers from wrong or zeroed inputs without raising anything.
 
 Import them from here. Never redefine them elsewhere.
 
-Counts are part of the contract: 108 / 17 / 18 / 17. ``tests/test_feature_parity.py``
+Counts are part of the contract: 62 / 13 / 14 / 13. ``tests/test_feature_parity.py``
 asserts both the counts and that builder-side rows and predict-side vectors
 agree column by column.
+
+The 46 all-zero team-season snapshot columns were removed from every model
+list: FEATURE_COLS lost 46 (108 -> 62) and each specialist list lost 4
+(BTTS 17 -> 13, Over 2.5 18 -> 14, Over 9.5 corners 17 -> 13). Nothing in the
+ML pipeline reads that snapshot any more.
 """
 
 from __future__ import annotations
 
 # --------------------------------------------------------------------------- #
-# FBref team-season stats
+# Deprecated stat names
 # --------------------------------------------------------------------------- #
 
-#: Stat columns copied from ``fbref_team_stats`` into the feature frame, once
-#: per side (``home_fbref_*`` / ``away_fbref_*``). This order is also the order
-#: the columns appear in :data:`FEATURE_COLS`.
+# Deprecated — FBref features removed from ML pipeline. Kept for reference only.
 FBREF_STAT_COLUMNS = [
     "games", "shots",
     "shots_on_target", "shot_accuracy",
@@ -39,13 +42,6 @@ FBREF_STAT_COLUMNS = [
     "pk_saved",
 ]
 
-
-#: The 46 FBref features, in ``FEATURE_COLS`` order (home block, then away).
-FBREF_FEATURE_COLS: list[str] = [
-    f"{role}_fbref_{stat}"
-    for role in ("home", "away")
-    for stat in FBREF_STAT_COLUMNS
-]
 
 # --------------------------------------------------------------------------- #
 # Match history carried by the features CSV
@@ -79,7 +75,7 @@ MATCH_HISTORY_ALIASES: dict[str, tuple[str, ...]] = {
 
 
 # --------------------------------------------------------------------------- #
-# Main 1X2 / goals / corners model: 108 features
+# Main 1X2 / goals / corners model: 62 features
 # --------------------------------------------------------------------------- #
 
 #: Match-derived features (rolling form, venue form, Elo, H2H).
@@ -123,7 +119,6 @@ BASE_FEATURE_COLS = [
 FEATURE_COLS: list[str] = (
     BASE_FEATURE_COLS
     + ["league_encoded", "season_encoded"]
-    + FBREF_FEATURE_COLS
 )
 
 # --------------------------------------------------------------------------- #
@@ -136,8 +131,6 @@ BTTS_FEATURE_COLS = [
     "home_scored_rate_5", "away_scored_rate_5",
     "home_form_gf_5", "away_form_gf_5",
     "home_form_ga_5", "away_form_ga_5",
-    "home_fbref_goals_against", "away_fbref_goals_against",
-    "home_fbref_clean_sheets", "away_fbref_clean_sheets",
     "home_elo", "away_elo",
     "league_encoded",
 ]
@@ -148,8 +141,6 @@ OVER25_FEATURE_COLS = [
     "home_form_gf_5", "away_form_gf_5",
     "home_form_ga_5", "away_form_ga_5",
     "home_form_gf_10", "away_form_gf_10",
-    "home_fbref_goals_against", "away_fbref_goals_against",
-    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
     "home_elo", "away_elo",
     "elo_difference", "league_encoded",
 ]
@@ -168,8 +159,6 @@ OVER95_CORNERS_FEATURE_COLS = [
     "home_over95_corners_rate_5", "away_over95_corners_rate_5",
     "home_home_corners_5", "away_away_corners_5",
     "home_form_corners_5", "away_form_corners_5",
-    "home_fbref_shots_on_target", "away_fbref_shots_on_target",
-    "home_fbref_crosses", "away_fbref_crosses",
     "home_elo", "away_elo",
     "league_encoded",
 ]
@@ -183,10 +172,10 @@ OVER95_CORNERS_FEATURE_COLS = [
 #: existing artifacts would no longer match, so both the trainer and the API
 #: raise on import instead of silently scoring a different vector.
 EXPECTED_FEATURE_COUNTS: dict[str, int] = {
-    "FEATURE_COLS": 108,
-    "BTTS_FEATURE_COLS": 17,
-    "OVER25_FEATURE_COLS": 18,
-    "OVER95_CORNERS_FEATURE_COLS": 17,
+    "FEATURE_COLS": 62,
+    "BTTS_FEATURE_COLS": 13,
+    "OVER25_FEATURE_COLS": 14,
+    "OVER95_CORNERS_FEATURE_COLS": 13,
 }
 
 
@@ -225,3 +214,5 @@ def validate_feature_column_counts() -> None:
 
 
 validate_feature_column_counts()
+
+assert len(FEATURE_COLS) == 62, f"Expected 62 FEATURE_COLS, got {len(FEATURE_COLS)}"

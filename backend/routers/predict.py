@@ -247,18 +247,17 @@ def load_artifacts() -> None:
     global _home_corners, _away_corners, _btts_model, _over25_model
     global _over95_corners_model
     global _le_league, _le_season, _features_df
-    global _fbref_df, _fbref_load_attempted, _history_source, _history_fbref_source
-    global _history, _elo_cache, _elo_lookup_failures
+    global _history_source, _history, _elo_cache, _elo_lookup_failures
+    global _elo_cache_loaded, _elo_latest_cache
 
-    # A reload ships a new features.csv and possibly new FBref rows; drop the
-    # reconstructed histories so the next prediction rebuilds them.
-    _fbref_df = None
-    _fbref_load_attempted = False
+    # A reload ships a new features.csv; drop the reconstructed histories and
+    # the Elo cache so the next prediction rebuilds them from fresh data.
     _history_source = None
-    _history_fbref_source = None
     _history = {}
+    _elo_latest_cache = {}
     _elo_cache = {}
     _elo_lookup_failures = 0
+    _elo_cache_loaded = False
 
     models_dir = BACKEND_DIR / "models"
     data_dir   = BACKEND_DIR / "data"
@@ -429,7 +428,7 @@ def reload_models_from_supabase() -> dict[str, Any]:
         downloaded = _download_artifacts_to(staging_dir)
         _install_artifacts(staging_dir, downloaded)
         load_artifacts()
-        _refresh_fbref_caches()
+        _refresh_prediction_caches()
 
         models_loaded = _loaded_model_names()
         # Every *required* object must have decoded in this run — but the
@@ -545,23 +544,21 @@ def _encode_label(encoder, value: str, fallback: int = 0) -> int:
 # --------------------------------------------------------------------------- #
 # The features a live fixture is scored on are built by the builder's own
 # functions (see features/inference.py): the same rolling windows, venue
-# splits, Elo lookup, H2H window and FBref snapshot as every training row.
-# Reading the "latest feature row" of a team out of features.csv — what this
-# module used to do — produced stale and opponent-independent values.
-
-#: fbref_team_stats snapshot, loaded once per artifact reload. Read lazily: a
-#: slow or unreachable database must not delay the port bind, and an empty
-#: result falls back to the FBref columns the features CSV already carries.
-_fbref_df: pd.DataFrame | None = None
-_fbref_load_attempted = False
-
-
-_FBREF_RETRY_SECONDS = 5.0
-_fbref_last_check_ts = 0.0
+# splits, Elo lookup and H2H window as every training row. Reading the
+# "latest feature row" of a team out of features.csv — what this module used
+# to do — produced stale and opponent-independent values.
+#
+# No team-season snapshot table is read here. Those columns were zero for
+# every live fixture and are no longer part of the model contract; the table
+# itself is still maintained by the dormant admin endpoints below.
 
 
 def _count_fbref_team_stats_rows() -> int:
-    """Return exact row count in ``fbref_team_stats``, or 0 when unavailable."""
+    """Return exact row count in ``fbref_team_stats``, or 0 when unavailable.
+
+    Only used by the dormant admin scrape-status endpoint below. No prediction
+    path reads this table.
+    """
     try:
         from database import FBrefTeamStats, SessionLocal
 
@@ -574,57 +571,16 @@ def _count_fbref_team_stats_rows() -> int:
         return 0
 
 
-def _load_fbref_snapshot(force_reload: bool = False) -> pd.DataFrame | None:
-    """Return the current ``fbref_team_stats`` rows, or None when unavailable.
-
-    The builder date-filters these rows against the match date before they
-    become features; doing the same at inference means a snapshot collected
-    after a team's last match still reaches the model. Re-queries automatically
-    after ``_FBREF_RETRY_SECONDS`` whenever empty (and immediately on
-    ``force_reload=True``) so rows scraped after boot become active without a
-    server restart.
-    """
-    global _fbref_df, _fbref_load_attempted, _fbref_last_check_ts
-
-    now_mono = time.monotonic()
-    if force_reload:
-        _fbref_load_attempted = False
-        _fbref_df = None
-        _fbref_last_check_ts = 0.0
-
-    if _fbref_df is not None and not _fbref_df.empty:
-        return _fbref_df
-
-    if _fbref_load_attempted and (now_mono - _fbref_last_check_ts) < _FBREF_RETRY_SECONDS:
-        return _fbref_df
-
-    _fbref_load_attempted = True
-    _fbref_last_check_ts = now_mono
-    try:
-        snapshot = feature_builder.load_fbref_stats()
-        _fbref_df = (
-            snapshot if snapshot is not None and len(snapshot) > 0 else None
-        )
-        if _fbref_df is None:
-            print("[predict] NOTE: no fbref_team_stats rows — FBref features "
-                  "come from features.csv")
-        else:
-            print(f"[predict] Loaded {len(_fbref_df)} FBref team-season rows "
-                  f"for inference")
-    except Exception as exc:  # noqa: BLE001 - degrade, never fail a request
-        print(f"[predict] WARNING: could not read fbref_team_stats ({exc}) — "
-              f"FBref features come from features.csv")
-        _fbref_df = None
-    return _fbref_df
-
-
-def _refresh_fbref_caches() -> None:
-    """Reload ``fbref_team_stats`` snapshot and clear formula engine caches."""
-    global _elo_lookup_failures, _history_fbref_source
+def _refresh_prediction_caches() -> None:
+    """Drop cached histories / Elo ratings / formula stats after a reload."""
+    global _elo_lookup_failures, _history_source, _history
+    global _elo_cache, _elo_cache_loaded, _elo_latest_cache
     _elo_lookup_failures = 0
-    _elo_cache.clear()
-    _history_fbref_source = object()
-    _load_fbref_snapshot(force_reload=True)
+    _history_source = None
+    _history = {}
+    _elo_latest_cache = {}
+    _elo_cache = {}
+    _elo_cache_loaded = False
     try:
         from models import formula_engine as _fe
 
@@ -634,6 +590,11 @@ def _refresh_fbref_caches() -> None:
             _fe._STATS_CACHE.clear()
     except Exception:  # noqa: BLE001
         pass
+
+
+# Backwards-compatible callback name for the dormant /admin/run-fbref-scrape
+# endpoint. It no longer loads a stats snapshot — only caches are reset.
+_refresh_fbref_caches = _refresh_prediction_caches
 
 
 def _on_fbref_scrape_state(next_state: str, err: str | None) -> None:
@@ -647,44 +608,33 @@ def _on_fbref_scrape_state(next_state: str, err: str | None) -> None:
 
 
 _history_source = None
-_history_fbref_source = None
 _history: dict[str, pd.DataFrame] = {}
 
 
 def _inference_history(df: pd.DataFrame | None = None) -> dict[str, pd.DataFrame]:
-    """Match / Elo / FBref history rebuilt from the loaded features CSV.
+    """Match / Elo history rebuilt from the loaded features CSV.
 
     ``df`` defaults to the loaded ``_features_df``. Cached until the artifacts
-    are reloaded (or a different frame is passed in): rebuilding three frames
+    are reloaded (or a different frame is passed in): rebuilding both frames
     per request would waste time for no benefit.
     """
-    global _history_source, _history_fbref_source, _history
+    global _history_source, _history
 
     source = _features_df if df is None else df
-    fbref_df = _load_fbref_snapshot()
     if source is None or source.empty:
-        # No match history, but the FBref snapshot is independent of it: a
-        # first-ever fixture still gets its team-season stats.
         return {
             "matches": feature_inference.empty_match_history(),
             "elo": feature_inference.empty_elo_history(),
-            "fbref": fbref_df if fbref_df is not None else pd.DataFrame(),
         }
 
-    if _history_source is source and _history_fbref_source is fbref_df:
+    if _history_source is source:
         return _history
 
     _history = {
         "matches": feature_inference.match_history_from_features(source),
         "elo": feature_inference.elo_history_from_features(source),
-        "fbref": (
-            fbref_df
-            if fbref_df is not None
-            else feature_inference.fbref_history_from_features(source)
-        ),
     }
     _history_source = source
-    _history_fbref_source = fbref_df
     return _history
 
 
@@ -753,20 +703,52 @@ def _apply_legacy_shot_fallback(
     return features
 
 
-#: Cache of ``(team, cutoff date) -> rating`` for the Elo lookup. A daily
-#: prediction run asks for the same two teams many times (one call per model
-#: plus one per fixture), so the database is asked once per team per day.
+#: Startup-warmed cache of ``normalised team name -> latest rating``. Elo is a
+#: rolling rating, so these entries are date-independent and are the first
+#: thing a live lookup consults (diagnostics reports them as cache entries).
+_elo_latest_cache: dict[str, float] = {}
+_elo_cache_loaded = False
+#: Per-team lookup results, keyed by ``(team, cutoff date)``. Kept separate
+#: from the warm cache because a historical/backtest lookup is date-sensitive.
 _elo_cache: dict[tuple[str, str], float | None] = {}
 _ELO_CACHE_LIMIT = 4096
 _elo_lookup_failures = 0
 _ELO_MAX_FAILURES = 3
 
 
-def _elo_rating_lookup(team: str, before_date: Any) -> float | None:
-    """Latest ``elo_ratings`` value for ``team`` strictly before ``before_date``.
+def warm_elo_cache(force: bool = False) -> int:
+    """Load the latest rating of every team into the process-local cache.
 
+    Elo is a rolling rating, so no season/league/match-date filter is applied.
+    The query is strictly read-only; a failure is non-fatal because the
+    per-team lookup still works. Returns the number of cached entries.
+    """
+    global _elo_latest_cache, _elo_cache_loaded, _elo_lookup_failures
+
+    if _elo_cache_loaded and not force:
+        return len(_elo_latest_cache)
+    try:
+        ratings = feature_builder.load_latest_elo_ratings()
+    except Exception as exc:  # noqa: BLE001 - never fail startup / diagnostics
+        print(f"[predict] WARNING: could not warm Elo cache ({exc}); "
+              "falling back to per-team lookups")
+        _elo_cache_loaded = True
+        return len(_elo_latest_cache)
+    _elo_latest_cache = dict(ratings)
+    _elo_cache_loaded = True
+    _elo_lookup_failures = 0
+    print(f"[predict] Loaded {len(_elo_latest_cache)} Elo ratings from database")
+    return len(_elo_latest_cache)
+
+
+def _elo_rating_lookup(team: str, before_date: Any) -> float | None:
+    """Latest ``elo_ratings`` value for ``team``.
+
+    Elo is a rolling rating: the builder returns the most recent stored value
+    rather than filtering by ``before_date`` (kept for API compatibility).
     Kept as its own function so the parity test can substitute the synthetic
-    rating history for the database (no DB access in tests).
+    rating history for the database (no DB access in tests). Returns None for
+    a genuine miss; ``raise_on_error`` keeps connection errors distinguishable.
     """
     return feature_builder.get_latest_elo_before(
         team, before_date, raise_on_error=True
@@ -776,19 +758,23 @@ def _elo_rating_lookup(team: str, before_date: Any) -> float | None:
 def _elo_lookup(team: str, before_date: Any) -> float | None:
     """Cached, fail-safe wrapper around :func:`_elo_rating_lookup`.
 
-    Returns None when the database cannot answer, which makes the caller fall
-    back to the reconstructed history and then to the builder's 1500 default.
-    After a few consecutive failures the lookup stops trying for this process
-    (a reload resets it), so a broken database connection cannot add latency
-    to every prediction.
+    A cache hit (populated at startup from the authoritative table) wins. On a
+    miss the per-team query resolves name variants and schema drift; only a
+    *raised* exception counts as a database failure, and after a few of those
+    the lookup stops trying for this process (a reload resets it) so a broken
+    connection cannot add latency to every prediction.
     """
     global _elo_lookup_failures
 
-    if _elo_lookup_failures >= _ELO_MAX_FAILURES:
-        return None
+    normalised = feature_builder.normalise_elo_team_name(team)
+    if normalised in _elo_latest_cache:
+        return _elo_latest_cache[normalised]
+
     key = (team, str(before_date))
     if key in _elo_cache:
         return _elo_cache[key]
+    if _elo_lookup_failures >= _ELO_MAX_FAILURES:
+        return None
     try:
         value = _elo_rating_lookup(team, before_date)
     except Exception as exc:  # noqa: BLE001 - fall back to the reconstructed history
@@ -824,7 +810,6 @@ def _inference_feature_row(
         features = feature_inference.build_inference_features(
             history["matches"],
             history["elo"],
-            history["fbref"],
             home_team,
             away_team,
             before_date=before_date,
@@ -865,7 +850,7 @@ def _build_feature_vector(
     Every value comes from the builder's own feature functions, so a live
     fixture and the equivalent historical training row agree exactly (see
     ``tests/test_feature_parity.py``). ``league``/``season`` are the fixture's
-    strings, used for the FBref team-season lookup; ``before_date`` overrides
+    strings, kept for API parity; ``before_date`` overrides
     today's cutoff (tests and backfills only).
     """
     features = _inference_feature_row(
@@ -914,7 +899,7 @@ def _model_feature_vector(
     """Feature vector for a specialist classifier, built by the builder.
 
     ``required`` columns must exist in the CSV and be computable: they are what
-    makes the classifier's inputs meaningful. Everything else (FBref, form) may
+    makes the classifier's inputs meaningful. Everything else (form, Elo) may
     legitimately be absent and is then 0.0 — the same value the builder writes
     for a team with no such history.
 
@@ -951,7 +936,7 @@ def _build_btts_feature_vector(
     league: str | None = None,
     season: str | None = None,
 ) -> dict[str, float] | None:
-    """Build the 17-feature vector expected by the BTTS classifier."""
+    """Build the 13-feature vector expected by the BTTS classifier."""
     return _model_feature_vector(
         "BTTS", BTTS_FEATURE_COLS, BTTS_REQUIRED_COLS,
         home_team, away_team, league_encoded, df,
@@ -1000,7 +985,7 @@ def _build_over25_feature_vector(
     league: str | None = None,
     season: str | None = None,
 ) -> dict[str, float] | None:
-    """Build the 18-feature vector expected by the Over 2.5 classifier."""
+    """Build the 14-feature vector expected by the Over 2.5 classifier."""
     return _model_feature_vector(
         "Over 2.5", OVER25_FEATURE_COLS, OVER25_REQUIRED_COLS,
         home_team, away_team, league_encoded, df,
@@ -1049,7 +1034,7 @@ def _build_over95_corners_feature_vector(
     league: str | None = None,
     season: str | None = None,
 ) -> dict[str, float] | None:
-    """Build the 17-feature vector expected by the Over 9.5 corners model."""
+    """Build the 13-feature vector expected by the Over 9.5 corners model."""
     return _model_feature_vector(
         "Over 9.5 corners", OVER95_CORNERS_FEATURE_COLS,
         OVER95_CORNERS_REQUIRED_COLS,
@@ -1519,17 +1504,24 @@ def diagnostics() -> dict:
     and whether they match.
     No secret required — read only.
     """
+    # A diagnostics call is the cheapest way to see whether elo_ratings is
+    # reachable: refresh the read-only cache so elo_cache_entries reflects the
+    # table rather than whatever happened to be queried since the last reload.
+    warm_elo_cache(force=True)
+
     runtime_cols = _get_runtime_feature_cols()
 
     features_df_cols = []
-    fbref_in_csv = []
+    legacy_fbref_in_csv = []
     if _features_df is not None:
         features_df_cols = list(_features_df.columns)
-        fbref_in_csv = [c for c in features_df_cols
-                        if 'fbref' in c]
+        # Legacy CSVs may still carry the removed columns; reporting them here
+        # makes a stale artifact obvious. They are never model inputs now.
+        legacy_fbref_in_csv = [c for c in features_df_cols
+                              if "fbref" in c]
 
-    fbref_in_model = [c for c in runtime_cols
-                      if 'fbref' in c]
+    legacy_fbref_in_model = [c for c in runtime_cols
+                             if "fbref" in c]
 
     # Which assembly path a live request takes, so a deployment can be checked
     # without issuing a prediction: both should report "builder".
@@ -1539,17 +1531,16 @@ def diagnostics() -> dict:
                 for column in feature_builder.MATCH_HISTORY_COLUMNS)
     )
 
-    fbref_snap = _load_fbref_snapshot(force_reload=True)
     fbref_rows = _count_fbref_team_stats_rows()
 
     return {
         "hardcoded_feature_cols": len(FEATURE_COLS),
         "model_feature_cols":     len(runtime_cols),
         "features_csv_cols":      len(features_df_cols),
-        "fbref_cols_in_model":    len(fbref_in_model),
-        "fbref_cols_in_csv":      len(fbref_in_csv),
-        "model_fbref_sample":     fbref_in_model[:5],
-        "csv_fbref_sample":       fbref_in_csv[:5],
+        "fbref_cols_in_model":    len(legacy_fbref_in_model),
+        "fbref_cols_in_csv":      len(legacy_fbref_in_csv),
+        "model_fbref_sample":     legacy_fbref_in_model[:5],
+        "csv_fbref_sample":       legacy_fbref_in_csv[:5],
         "cols_match":             (
             set(runtime_cols) == set(FEATURE_COLS)
         ),
@@ -1562,22 +1553,23 @@ def diagnostics() -> dict:
             "database" if _elo_lookup_failures < _ELO_MAX_FAILURES
             else "features.csv_fallback"
         ),
-        "elo_cache_entries":           len(_elo_cache),
-        "fbref_source":                (
-            "database" if (fbref_snap is not None or fbref_rows > 0) else "features.csv"
+        "elo_cache_entries":           (
+            len(_elo_latest_cache) + len(_elo_cache)
         ),
+        # The snapshot table is still maintained by the dormant admin
+        # endpoints, but it no longer feeds any model input.
+        "fbref_source":                "disabled",
         "fbref_team_stats_rows":       fbref_rows,
         "formula_engine": (
             get_engine_status()
             if _formula_engine_available and get_engine_status
             else {"ready": False, "reason": "not loaded"}
         ),
-        "active_engine": (
-            "formula"
-            if _formula_engine_available and get_engine_status
-            and get_engine_status().get("ready")
-            else "ml_models"
-        ),
+        # PR #75 made the blended engine the only production path: /match
+        # returns "engine": "blended" whenever both engines are available.
+        # This label used to report "formula" from formula-engine readiness,
+        # which contradicted the prediction response.
+        "active_engine": "blended",
     }
 
 
@@ -1617,8 +1609,8 @@ def run_fbref_scrape(secret: str = "") -> dict[str, str]:
     tier, unsolvable Cloudflare CAPTCHAs on GitHub Actions IPs). The aggregator
     instead folds the match-level rows already collected in
     ``statsbomb_match_stats`` into ``fbref_team_stats`` — same table, same
-    column names, no browser — so the model's 46 FBref features get real
-    values. Never runs ``builder.py`` or ``trainer.py`` (those remain in
+    column names, no browser. The table is now reference-only and feeds no
+    model feature. Never runs ``builder.py`` or ``trainer.py`` (those remain in
     GitHub Actions). Returns ``{"status": "started"}`` immediately.
     """
     expected = os.getenv("PIPELINE_SECRET", "")

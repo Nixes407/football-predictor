@@ -193,6 +193,16 @@ class ReloadEndpointTests(unittest.TestCase):
                     "training moved to GitHub Actions",
                 )
 
+    def test_diagnostics_active_engine(self):
+        """Task 4 regression: the label matches /match's "engine": "blended"."""
+        response = self.client.get("/predict/admin/diagnostics")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["active_engine"], "blended")
+        self.assertEqual(body["hardcoded_feature_cols"], 62)
+        self.assertEqual(body["fbref_cols_in_model"], 0)
+        self.assertEqual(body["fbref_source"], "disabled")
+
     def test_reload_requires_pipeline_secret(self):
         response = self.client.post("/predict/admin/reload-models")
         self.assertEqual(response.status_code, 403)

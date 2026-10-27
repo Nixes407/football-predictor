@@ -2,6 +2,13 @@
 
 Date: 2026-10-20 · Branch: `arena/589b84c6-football-predictor` · Step 8
 
+> **Update (FBref feature removal):** the 46 all-zero team-season snapshot
+> columns were removed from every model list. `FEATURE_COLS` is now 62 and the
+> specialist lists are 13 / 14 / 13. Everything below about the FBref join,
+> its date cut-off and its CSV/DB snapshot reconciliation describes the old
+> contract and is kept for history only; neither the builder nor inference
+> reads `fbref_team_stats` any more.
+
 ## Why this audit exists
 
 The models are trained on rows produced by `backend/features/builder.py` and
@@ -219,7 +226,7 @@ import-time contract check. `models/trainer.py` and `routers/predict.py` import
 the same objects — the copies in both modules are gone.
 
 `validate_feature_column_counts()` runs on import of the trainer and of the API
-and raises if a list is ever edited to something other than 108 / 17 / 18 / 17
+and raises if a list is ever edited to something other than 62 / 13 / 14 / 13 (formerly 108 / 17 / 18 / 17)
 or contains a duplicate, so a half-finished edit cannot reach production.
 
 Nothing about the *values* of the training features changed: the builder's
@@ -260,7 +267,7 @@ artifacts stay compatible.
 * builds a synthetic 48-match, 2-league history and turns it into a features
   frame with the **builder**;
 * cuts that frame at each fixture date and scores it with **predict**;
-* asserts every one of the 108 / 17 / 18 / 17 inputs matches within `1e-6`,
+* asserts every one of the 62 / 13 / 14 / 13 (formerly 108 / 17 / 18 / 17) inputs matches within `1e-6`,
   for every synthetic match — not just a cherry-picked one;
 * pins the column lists to the shared module and their counts;
 * covers the legacy-CSV fallback, the FBref CSV fallback, the 1500 Elo

@@ -22,7 +22,9 @@ _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
-from database import SessionLocal, TeamSeasonStats, PlayerSeasonStats
+from database import (
+    SessionLocal, TeamSeasonStats, PlayerSeasonStats, upsert_team_season_stats,
+)
 from sqlalchemy import and_
 
 
@@ -476,22 +478,8 @@ def _season_label(
 
 def _upsert_team(
     db, team, league, season, attrs):
-    existing = (
-        db.query(TeamSeasonStats)
-        .filter(and_(
-            TeamSeasonStats.team   == team,
-            TeamSeasonStats.league == league,
-            TeamSeasonStats.season == season,
-        )).first()
-    )
-    if existing is None:
-        existing = TeamSeasonStats(
-            team=team, league=league,
-            season=season)
-        db.add(existing)
-    for k, v in attrs.items():
-        if v is not None:
-            setattr(existing, k, v)
+    """Guarded TeamSeasonStats upsert (all collectors share the same path)."""
+    upsert_team_season_stats(db, team, league, season, attrs)
 
 
 def _upsert_player(
