@@ -142,8 +142,13 @@ deployment-time calibration.
 ```bash
 cd backend
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
-# 1. backfill matches + elo for the 11 leagues (idempotent upserts):
+# 1. backfill matches for the 11 leagues (idempotent upserts):
 .venv/bin/python data/collector.py
+# 1b. rebuild elo_ratings from those matches and confirm it is not empty
+#     (collector.py already does this; the explicit run is the loud check —
+#     it exits 1 if zero ratings were written):
+.venv/bin/python data/elo.py
+.venv/bin/python scripts/test_elo_lookup.py
 # 2. verify availability & fbref coverage before/after:
 .venv/bin/python scripts/analyze_training_leagues.py --json /tmp/availability.json
 # 3. rebuild features and retrain + upload all 9 models to Supabase Storage:

@@ -296,9 +296,28 @@ Implement after formula engine is fully stable.
 
    wrote 14,759 player rows).
 
-3. ELO ratings show 1500 for all teams
+3. ELO ratings show 1500 for all teams — FIXED
 
-   ClubElo name mismatch — not a blocker
+   This was recorded as "ClubElo name mismatch — not a blocker". It was the
+   blocker: `elo_ratings` was empty, so every prediction used the 1500 default
+   and `/predict/admin/diagnostics` reported `elo_cache_entries: 0`. The read
+   path was never the problem. The only writer was the clubelo.com scrape in
+   `data/collector.collect_elo_ratings()`, which counts every per-team failure
+   (network error, or a football-data.co.uk spelling clubelo.com cannot
+   resolve) as "skipped" and then returns `records: 0` with exit code 0 — and
+   its workflow step was `continue-on-error: true` on top of that, so an empty
+   table shipped as a green run.
+
+   Ratings are now computed from the `matches` table by `data/elo.py` (standard
+   Elo: K=32, start 1500, `expected = 1/(1+10^((opp-own)/400))`), run by the
+   `[4/5] Update Elo ratings from match results` workflow step after the match
+   collector and before `builder.py`. That step is deliberately allowed to fail
+   the run. The ClubElo scrape is retained but opt-in via `COLLECT_CLUBELO=1`.
+
+   Rebuild by hand with `cd backend && python data/elo.py`, then check with
+   `python scripts/test_elo_lookup.py` (prints PASS/FAIL). Diagnostics now also
+   reports `elo_cache_error`, so a missing or empty table can no longer
+   masquerade as `elo_lookup: "database"`.
 
 4. Some Championship/new league teams may still
 

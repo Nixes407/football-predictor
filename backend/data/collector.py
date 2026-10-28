@@ -1,8 +1,6 @@
 """
 Data collector for the Football Predictor backend.
 
-Two collectors, both built on `soccerdata <https://soccerdata.readthedocs.io>`_:
-
 ``collect_match_history()``
     Pulls match results, shots, corners, cards, fouls and closing bookmaker odds
     from football-data.co.uk (via ``soccerdata.MatchHistory``) for the Big Five
@@ -11,9 +9,18 @@ Two collectors, both built on `soccerdata <https://soccerdata.readthedocs.io>`_:
     football-data.co.uk's all-time "extra leagues" CSVs (goals and odds only).
     All of it is stored in the ``matches`` table.
 
-``collect_elo_ratings()``
-    Pulls the full ClubElo rating history for every team found in ``matches``
-    (via ``soccerdata.ClubElo``) and stores it in the ``elo_ratings`` table.
+Elo ratings
+    ``elo_ratings`` is filled by :mod:`data.elo`, which replays the stored
+    ``matches`` through the standard Elo recursion (K=32, start 1500). That
+    runs automatically at the end of ``run_collection()``, so collecting
+    matches always leaves the ratings table populated — it is a pure function
+    of results already in the database, with no extra network dependency.
+
+    ``collect_elo_ratings()`` (below) is the older ClubElo scraper. It is kept
+    as an *optional* enrichment behind ``COLLECT_CLUBELO=1``: clubelo.com
+    resolves only part of this project's team set under its own spellings, and
+    it used to swallow every miss into a ``skipped`` counter, so a run that
+    stored zero ratings exited 0 and looked successful. See ``data/elo.py``.
 
 Everything is written with SQLAlchemy Core / ORM expressions -- no raw SQL and
 no ``pandas.DataFrame.to_sql()``. Writes are chunked upserts:
@@ -24,6 +31,7 @@ no ``pandas.DataFrame.to_sql()``. Writes are chunked upserts:
 Run it from the ``backend/`` directory::
 
     python data/collector.py
+    COLLECT_CLUBELO=1 python data/collector.py   # also scrape clubelo.com
 
 Team names are read from football-data.co.uk. ClubElo does not know every one of
 them, and mismatches are skipped with a warning rather than aborting the run.
@@ -35,6 +43,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import os
 import sys
 from collections import Counter, defaultdict
 from datetime import date, datetime
@@ -699,31 +708,18 @@ def _build_elo_rows(frame, team: str, league: str | None, start_date: date | Non
 
 
 def _upsert_elo(rows: Iterable[dict[str, Any]]) -> int:
-    """Insert or refresh Elo rows on the ``(team, date)`` unique key."""
-    rows = list(rows)
-    if not rows:
-        return 0
+    """Insert or refresh Elo rows on the ``(team, date)`` unique key.
 
-    # A single INSERT cannot touch the same conflict key twice, so keep the last
-    # value seen for each (team, date) pair.
-    unique: dict[tuple[str, date], dict[str, Any]] = {}
-    for row in rows:
-        unique[(row["team"], row["date"])] = row
-    payload = list(unique.values())
+    Delegates to :func:`data.elo.upsert_elo_rows`, the one Elo writer both
+    sources share. That helper is dialect-aware: this function used to build a
+    ``postgresql`` INSERT unconditionally, which cannot compile on any other
+    backend and left the whole write path untestable off Postgres. It also
+    deduplicates ``(team, date)`` and refuses non-finite ratings, so a scraped
+    NaN can never blank a stored value.
+    """
+    from data.elo import upsert_elo_rows
 
-    with session_scope() as session:
-        for chunk in _chunked(payload):
-            statement = pg_insert(EloRating).values(list(chunk))
-            statement = statement.on_conflict_do_update(
-                index_elements=["team", "date"],
-                set_={
-                    "elo": statement.excluded.elo,
-                    "league": statement.excluded.league,
-                },
-            )
-            session.execute(statement)
-
-    return len(payload)
+    return upsert_elo_rows(list(rows))
 
 
 def collect_elo_ratings(start_date: date | None = None) -> dict[str, int]:
@@ -733,6 +729,22 @@ def collect_elo_ratings(start_date: date | None = None) -> dict[str, int]:
     ``start_date`` optionally limits the history that is stored (the full
     history is stored by default). Teams unknown to ClubElo are skipped with a
     warning instead of aborting the run.
+
+    OPTIONAL SOURCE — not part of the default pipeline any more. Ratings the
+    model consumes are computed from stored match results by
+    :func:`data.elo.update_elo_from_matches`; see that module for why. Two
+    reasons this is opt-in rather than removed:
+
+    * clubelo.com only resolves a subset of the 11-league team set under its
+      own spellings, and every miss is counted as ``skipped`` — the function
+      returns ``records: 0`` and exit code 0, so a run that stored nothing
+      looked identical to a successful one;
+    * its ratings live on a different scale (Liverpool ~2047) from the
+      computed ones (a team starts at 1500). Merging both into ``elo_ratings``
+      would make ``elo_difference`` compare numbers that are not comparable.
+
+    Set ``COLLECT_CLUBELO=1`` to run it as a manual enrichment; it upserts
+    through the same writer and never blanks an existing rating.
     """
     totals = {"teams": 0, "records": 0, "skipped": 0, "failed": 0}
     if not _check_dependencies():
@@ -810,6 +822,12 @@ def _print_summary() -> None:
             elo_count = session.execute(
                 select(func.count()).select_from(EloRating)
             ).scalar_one()
+            elo_teams = session.execute(
+                select(func.count(func.distinct(EloRating.team)))
+            ).scalar_one()
+            elo_min, elo_max = session.execute(
+                select(func.min(EloRating.elo), func.max(EloRating.elo))
+            ).one()
             leagues = list(
                 session.execute(
                     select(Match.league).distinct().order_by(Match.league)
@@ -829,11 +847,27 @@ def _print_summary() -> None:
     )
     print(f"  Total matches in DB    : {match_count}")
     print(f"  Total elo records in DB: {elo_count}")
+    print(f"  Teams with an elo rating: {elo_teams}")
+    if elo_count:
+        print(f"  Elo rating range       : {elo_min:.1f} to {elo_max:.1f}")
     print(f"  Leagues covered        : {len(leagues)}")
     for league in leagues:
         print(f"      - {league}")
     print(f"  Date range covered     : {date_range}")
     print("=" * 70)
+    if match_count and not elo_count:
+        # This is the exact state that shipped the 1500-fallback bug: matches
+        # present, no ratings, pipeline reporting success. Say so loudly.
+        print("[summary] ERROR: matches are stored but elo_ratings is EMPTY.")
+        print("          Every prediction would use the 1500 default and")
+        print("          elo_cache_entries would report 0. Run")
+        print("          `python data/elo.py` to rebuild the ratings.")
+        print("=" * 70)
+
+
+def _clubelo_enabled() -> bool:
+    """True when the optional ClubElo enrichment should also run."""
+    return os.getenv("COLLECT_CLUBELO", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def run_collection() -> None:
@@ -847,7 +881,24 @@ def run_collection() -> None:
     print("#" * 70)
 
     collect_match_history()
-    collect_elo_ratings()
+
+    # Elo is computed from the matches just collected, not scraped: the
+    # ClubElo writer silently stored zero rows whenever api.clubelo.com was
+    # unreachable or a football-data.co.uk spelling did not resolve, which left
+    # elo_ratings empty and every prediction on the 1500 default. See
+    # data/elo.py for the full diagnosis.
+    try:
+        from data.elo import update_elo_from_matches
+
+        update_elo_from_matches()
+    except Exception as exc:  # noqa: BLE001 - never abort collection on Elo
+        print(f"[elo] ERROR: could not update Elo ratings from matches: {exc}")
+
+    if _clubelo_enabled():
+        collect_elo_ratings()
+    else:
+        print("[elo] Skipping the optional ClubElo scrape "
+              "(set COLLECT_CLUBELO=1 to enable it).")
 
     _print_summary()
 

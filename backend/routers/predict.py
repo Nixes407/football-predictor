@@ -248,7 +248,7 @@ def load_artifacts() -> None:
     global _over95_corners_model
     global _le_league, _le_season, _features_df
     global _history_source, _history, _elo_cache, _elo_lookup_failures
-    global _elo_cache_loaded, _elo_latest_cache
+    global _elo_cache_loaded, _elo_latest_cache, _elo_cache_error
 
     # A reload ships a new features.csv; drop the reconstructed histories and
     # the Elo cache so the next prediction rebuilds them from fresh data.
@@ -258,6 +258,7 @@ def load_artifacts() -> None:
     _elo_cache = {}
     _elo_lookup_failures = 0
     _elo_cache_loaded = False
+    _elo_cache_error = None
 
     models_dir = BACKEND_DIR / "models"
     data_dir   = BACKEND_DIR / "data"
@@ -574,13 +575,14 @@ def _count_fbref_team_stats_rows() -> int:
 def _refresh_prediction_caches() -> None:
     """Drop cached histories / Elo ratings / formula stats after a reload."""
     global _elo_lookup_failures, _history_source, _history
-    global _elo_cache, _elo_cache_loaded, _elo_latest_cache
+    global _elo_cache, _elo_cache_loaded, _elo_latest_cache, _elo_cache_error
     _elo_lookup_failures = 0
     _history_source = None
     _history = {}
     _elo_latest_cache = {}
     _elo_cache = {}
     _elo_cache_loaded = False
+    _elo_cache_error = None
     try:
         from models import formula_engine as _fe
 
@@ -714,6 +716,11 @@ _elo_cache: dict[tuple[str, str], float | None] = {}
 _ELO_CACHE_LIMIT = 4096
 _elo_lookup_failures = 0
 _ELO_MAX_FAILURES = 3
+#: Last error raised while warming the cache, or None. A warm failure used to
+#: be swallowed into a log line only, so a missing/unreachable ``elo_ratings``
+#: table still reported ``elo_lookup: "database"`` with 0 entries and nothing
+#: in the response explained why. Diagnostics surfaces this string instead.
+_elo_cache_error: str | None = None
 
 
 def warm_elo_cache(force: bool = False) -> int:
@@ -721,15 +728,24 @@ def warm_elo_cache(force: bool = False) -> int:
 
     Elo is a rolling rating, so no season/league/match-date filter is applied.
     The query is strictly read-only; a failure is non-fatal because the
-    per-team lookup still works. Returns the number of cached entries.
+    per-team lookup still works. Returns the number of cached entries — the
+    number of *teams that actually have a rating*, which is what diagnostics
+    reports as ``elo_cache_entries``.
+
+    An exception is still caught (the app must keep serving) but it is now
+    recorded in :data:`_elo_cache_error` rather than discarded, so a missing
+    table is visible in ``/predict/admin/diagnostics`` instead of looking like
+    a healthy database that happens to hold nothing.
     """
     global _elo_latest_cache, _elo_cache_loaded, _elo_lookup_failures
+    global _elo_cache_error
 
     if _elo_cache_loaded and not force:
         return len(_elo_latest_cache)
     try:
         ratings = feature_builder.load_latest_elo_ratings()
     except Exception as exc:  # noqa: BLE001 - never fail startup / diagnostics
+        _elo_cache_error = f"{type(exc).__name__}: {exc}"
         print(f"[predict] WARNING: could not warm Elo cache ({exc}); "
               "falling back to per-team lookups")
         _elo_cache_loaded = True
@@ -737,6 +753,16 @@ def warm_elo_cache(force: bool = False) -> int:
     _elo_latest_cache = dict(ratings)
     _elo_cache_loaded = True
     _elo_lookup_failures = 0
+    _elo_cache_error = None
+    if not _elo_latest_cache:
+        # Not an exception, but equally fatal to the model input: the table is
+        # reachable and holds nothing, so every team resolves to the 1500
+        # default. Name it so the empty table cannot pass for a healthy one.
+        _elo_cache_error = (
+            "elo_ratings is reachable but contains no ratings — run "
+            "`python data/elo.py` to rebuild them from the matches table"
+        )
+        print(f"[predict] WARNING: {_elo_cache_error}")
     print(f"[predict] Loaded {len(_elo_latest_cache)} Elo ratings from database")
     return len(_elo_latest_cache)
 
@@ -1549,13 +1575,26 @@ def diagnostics() -> dict:
         "feature_assembly":            "builder",
         "feature_columns_source":      "features/feature_columns.py",
         "features_csv_has_match_history": history_columns_present,
+        # "database" only when elo_ratings was actually read successfully.
+        # The warm used to swallow its exception without touching
+        # _elo_lookup_failures, so a missing or unreachable table still
+        # reported "database" alongside 0 entries and nothing said why.
         "elo_lookup":                  (
-            "database" if _elo_lookup_failures < _ELO_MAX_FAILURES
+            "database"
+            if _elo_cache_error is None
+            and _elo_lookup_failures < _ELO_MAX_FAILURES
             else "features.csv_fallback"
         ),
-        "elo_cache_entries":           (
-            len(_elo_latest_cache) + len(_elo_cache)
-        ),
+        # The number of teams that actually have a rating in elo_ratings.
+        # This used to add len(_elo_cache), which counts per-team lookup slots
+        # *including misses cached as None* — so two failed Arsenal/Chelsea
+        # lookups could report "2 entries" over a completely empty table and
+        # hide the very failure it was meant to expose.
+        "elo_cache_entries":           len(_elo_latest_cache),
+        "elo_lookup_failures":         _elo_lookup_failures,
+        # Null when the table read cleanly and holds ratings; otherwise the
+        # reason (swallowed exception, or a reachable-but-empty table).
+        "elo_cache_error":             _elo_cache_error,
         # The snapshot table is still maintained by the dormant admin
         # endpoints, but it no longer feeds any model input.
         "fbref_source":                "disabled",
