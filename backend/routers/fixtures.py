@@ -1,6 +1,7 @@
 """Endpoints for daily football fixtures and their stored predictions."""
 
 import json
+import math
 import sys
 import threading
 import time
@@ -48,6 +49,7 @@ from routers.predict import (
     _poisson_btts,
     _poisson_over,
     _result_model,
+    compute_first_goal_probs,
     formula_predict,
 )
 
@@ -1431,6 +1433,17 @@ def _row_to_dict(row: DailyMatch) -> dict:
     _with_derived_markets(values)
     for name in PREDICTION_FIELDS:
         data[name] = values.get(name)
+
+    # Daily fixtures store their own (possibly blended) expected goals. Derive
+    # this additive market without changing or writing any stored fields. An
+    # absent or invalid rate is not evidence of a guaranteed 0-0 draw.
+    home_goals = values["pred_home_goals"]
+    away_goals = values["pred_away_goals"]
+    if all(
+        rate is not None and math.isfinite(rate) and rate >= 0
+        for rate in (home_goals, away_goals)
+    ):
+        data["first_goal"] = compute_first_goal_probs(home_goals, away_goals)
 
     data["prediction_computed_at"] = row.prediction_computed_at
     data["has_prediction"] = (

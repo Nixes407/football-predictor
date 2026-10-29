@@ -1,13 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getApiBase } from '../lib/apiBase';
-
-const LEAGUE_FLAGS = {
-  'ENG-Premier League': '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'ESP-La Liga':        '🇪🇸',
-  'GER-Bundesliga':     '🇩🇪',
-  'ITA-Serie A':        '🇮🇹',
-  'FRA-Ligue 1':        '🇫🇷',
-};
+import { canonicalLeague, leagueFlag, leagueName } from '../lib/leagues';
 
 function formatDate(dateStr) {
   const d = new Date(dateStr);
@@ -53,7 +46,7 @@ function MatchCard({ match }) {
     <div className="glass-card rounded-xl p-4 mb-3">
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs text-gray-400">
-          {match.league} {LEAGUE_FLAGS[match.league] || ''}
+          {leagueFlag(match.league)} {leagueName(match.league)}
         </span>
         <ResultBadge correct={match.pred_correct} />
       </div>
@@ -129,7 +122,7 @@ export default function HistoryTab() {
   }
 
   const byLeague = results.reduce((acc, m) => {
-    const k = m.league || 'Unknown';
+    const k = canonicalLeague(m.league) || 'Unknown';
     if (!acc[k]) acc[k] = [];
     acc[k].push(m);
     return acc;
@@ -197,7 +190,7 @@ export default function HistoryTab() {
         <div key={league} className="mb-6">
           <h3 className="text-sm font-semibold text-gray-400
             uppercase tracking-wider mb-3">
-            {LEAGUE_FLAGS[league] || ''} {league}
+            {leagueFlag(league)} {leagueName(league)}
           </h3>
           {matches.map((m, i) => (
             <MatchCard key={i} match={m} />

@@ -2,7 +2,7 @@ const STEPS = [
   {
     emoji: '1️⃣',
     title: 'Data Collection',
-    text: '6,776 matches across 5 top European leagues, 4 seasons of historical data',
+    text: 'Historical match data across tracked leagues and seasons',
   },
   {
     emoji: '2️⃣',
@@ -12,12 +12,12 @@ const STEPS = [
   {
     emoji: '3️⃣',
     title: 'Machine Learning',
-    text: '5 specialist models trained: Match Result (1X2), Home Goals, Away Goals, Home Corners, Away Corners',
+    text: 'Specialist models predict match results and expected goals',
   },
   {
     emoji: '4️⃣',
     title: 'Daily Predictions',
-    text: 'Every day at midnight UTC, fixtures are fetched and predictions computed automatically for all 5 leagues',
+    text: 'Fixtures are fetched and predictions computed for tracked leagues',
   },
 ];
 
@@ -27,15 +27,16 @@ const LEAGUES = [
   { flag: '🇩🇪', name: 'Bundesliga', country: 'Germany' },
   { flag: '🇮🇹', name: 'Serie A', country: 'Italy' },
   { flag: '🇫🇷', name: 'Ligue 1', country: 'France' },
+  { flag: '🇧🇷', name: 'Brazilian Série A', country: 'Brazil' },
 ];
 
 const MARKETS = [
   '🏆 Match Result (1X2)',
   '⚽ Total Goals',
-  '📐 Total Corners',
   '🔄 Both Teams To Score',
+  '📈 Over 1.5 Goals',
   '📈 Over/Under 2.5 Goals',
-  '🔲 Over/Under 9.5 Corners',
+  '⚽ Team to Score First',
 ];
 
 export default function AboutTab() {
@@ -64,7 +65,7 @@ export default function AboutTab() {
 
       {/* ── Card 2: Leagues Covered ── */}
       <div className="glass p-6">
-        <h3 className="text-xl font-bold mb-5">🌍 Leagues Covered</h3>
+        <h3 className="text-xl font-bold mb-5">🌍 Featured Leagues</h3>
         <div className="space-y-3">
           {LEAGUES.map((league) => (
             <div

@@ -32,7 +32,7 @@ export default function Home() {
         <title>Football Predictor — ML Match Predictions</title>
         <meta
           name="description"
-          content="Machine-learning football predictions for the top 5 European leagues"
+          content="Machine-learning football predictions for leagues around the world"
         />
       </Head>
 

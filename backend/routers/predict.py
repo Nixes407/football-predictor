@@ -13,6 +13,8 @@ pipeline has been run.
 from __future__ import annotations
 
 import copy
+import logging
+import math
 import os
 import shutil
 import sys
@@ -30,6 +32,45 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from scipy.stats import poisson
 from supabase import create_client
+
+
+def compute_first_goal_probs(
+    lambda_home: float, lambda_away: float,
+) -> dict[str, float]:
+    """First-goal probabilities from two independent Poisson processes."""
+    if lambda_home <= 0 and lambda_away <= 0:
+        return {"home": 0.0, "away": 0.0, "no_goal": 1.0}
+
+    total_rate = lambda_home + lambda_away
+    p_no_goal = math.exp(-total_rate)
+    p_at_least_one = 1.0 - p_no_goal
+    if (
+        math.isinf(total_rate)
+        and math.isfinite(lambda_home)
+        and math.isfinite(lambda_away)
+    ):
+        # The sum of two finite rates can overflow. Scaling both by the same
+        # factor preserves the requested rate ratios without overflowing.
+        scale = max(lambda_home, lambda_away)
+        home_scaled, away_scaled = lambda_home / scale, lambda_away / scale
+        home_share = home_scaled / (home_scaled + away_scaled)
+        away_share = away_scaled / (home_scaled + away_scaled)
+    else:
+        home_share = lambda_home / total_rate
+        away_share = lambda_away / total_rate
+    probabilities = {
+        "home": round(p_at_least_one * home_share, 4),
+        "away": round(p_at_least_one * away_share, 4),
+        "no_goal": round(p_no_goal, 4),
+    }
+    if not math.isclose(
+        sum(probabilities.values()), 1.0, rel_tol=0.0, abs_tol=0.001
+    ):
+        logging.getLogger(__name__).warning(
+            "First-goal probabilities do not sum to one: %s", probabilities
+        )
+    return probabilities
+
 
 try:
     from models.formula_engine import (
@@ -1392,10 +1433,8 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
                 "corners": {
                     "expected_home":  round(exp_home_corners, 3),
                     "expected_away":  round(exp_away_corners, 3),
-                    # The frontend reads expected_total / over_9_5 / over_11_5 and the
-                    # formula engine publishes all three; the ML path used to omit
-                    # them, which left those rows blank for every non-formula
-                    # prediction (and left no over_9_5 for fixtures.py to store).
+                    # Keep these existing markets for API consumers and
+                    # fixture storage, even though the UI no longer shows them.
                     "expected_total": round(exp_total_corners, 3),
                     "over_8_5":       round(over_corners_8_5, 4),
                     "over_9_5":       round(over_corners_9_5, 4),
@@ -1503,6 +1542,16 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         final_result["xgb_1x2_active"] = bool(
             ml_result.get("xgb_1x2_active", False) if ml_result else False
         )
+
+    # Formula scorelines use the formula rates, even in a blended response.
+    # Those rates are exposed (rounded to three decimals) in the feature
+    # vector. ML-only responses have no scorelines, so use their goal rates.
+    rate_source = formula_result if formula_result is not None else final_result
+    goal_rates = rate_source["goals"]
+    formula_features = rate_source.get("feature_vector_used") or {}
+    lambda_home = formula_features.get("lambda_home", goal_rates["expected_home"])
+    lambda_away = formula_features.get("lambda_away", goal_rates["expected_away"])
+    final_result["first_goal"] = compute_first_goal_probs(lambda_home, lambda_away)
 
     return final_result
 

@@ -1,9 +1,19 @@
+import FirstGoalSection from './FirstGoalSection';
+import { leagueFlag, leagueName } from '../lib/leagues';
+
+/**
+ * @typedef {Object} PredictionResponse
+ * @property {string} home_team
+ * @property {string} away_team
+ * @property {{home: number, away: number, no_goal: number}} first_goal
+ */
+
+/** @param {{data: (PredictionResponse & Record<string, any>) | null}} props */
 export default function PredictionResult({ data }) {
   if (!data) return null;
 
   const result   = data.result   || {};
   const goals    = data.goals    || {};
-  const corners  = data.corners  || {};
   const ratings  = data.ratings  || {};
   const homeR    = ratings.home  || {};
   const awayR    = ratings.away  || {};
@@ -49,7 +59,7 @@ export default function PredictionResult({ data }) {
           {data.home_team} vs {data.away_team}
         </h2>
         <p className="text-sm text-gray-400">
-          {data.league} | {data.season}
+          {leagueFlag(data.league)} {leagueName(data.league)} | {data.season}
         </p>
         {isFormula && data.predicted_result && (
           <div className="mt-2 flex justify-center gap-3
@@ -117,12 +127,6 @@ export default function PredictionResult({ data }) {
                 {dec(goals.expected_away)}
               </span>
             </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">BTTS</span>
-              <span className="text-white font-medium">
-                {prob(goals.btts)}
-              </span>
-            </div>
           </div>
           <div className="space-y-2">
             <div className="flex justify-between text-sm">
@@ -143,73 +147,21 @@ export default function PredictionResult({ data }) {
                 {prob(goals.over_3_5)}
               </span>
             </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-gray-400">BTTS</span>
+              <span className="text-white font-medium">
+                {prob(goals.btts)}
+              </span>
+            </div>
           </div>
         </div>
       </div>
 
-      {/* Corners */}
-      <div className="glass-card rounded-2xl p-5">
-        <h3 className="text-sm font-semibold text-gray-400
-          uppercase tracking-wider mb-3">
-          Corners
-        </h3>
-        <div className="grid grid-cols-2 gap-4">
-          <div className="space-y-2">
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">
-                Exp. Home
-              </span>
-              <span className="text-white font-medium">
-                {dec(corners.expected_home)}
-              </span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">
-                Exp. Away
-              </span>
-              <span className="text-white font-medium">
-                {dec(corners.expected_away)}
-              </span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">
-                Exp. Total
-              </span>
-              <span className="text-white font-medium">
-                {dec(corners.expected_total ||
-                  (corners.expected_home || 0) +
-                  (corners.expected_away || 0))}
-              </span>
-            </div>
-          </div>
-          <div className="space-y-2">
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">Over 8.5</span>
-              <span className="text-white font-medium">
-                {prob(corners.over_8_5)}
-              </span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">Over 9.5</span>
-              <span className="text-white font-medium">
-                {prob(corners.over_9_5)}
-              </span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">Over 10.5</span>
-              <span className="text-white font-medium">
-                {prob(corners.over_10_5)}
-              </span>
-            </div>
-            <div className="flex justify-between text-sm">
-              <span className="text-gray-400">Over 11.5</span>
-              <span className="text-white font-medium">
-                {prob(corners.over_11_5)}
-              </span>
-            </div>
-          </div>
-        </div>
-      </div>
+      <FirstGoalSection
+        homeTeam={data.home_team}
+        awayTeam={data.away_team}
+        firstGoal={data.first_goal}
+      />
 
       {/* Top Scorelines — formula engine only */}
       {topLines.length > 0 && (
