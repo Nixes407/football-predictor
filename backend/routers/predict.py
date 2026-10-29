@@ -27,7 +27,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from scipy.stats import poisson
 from supabase import create_client
@@ -48,13 +47,13 @@ except Exception as exc:
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 
-# The admin endpoints below import the database layer (and the one-off repair
-# script) from inside the request handler, i.e. by top-level module name.
-# ``database`` and ``scripts.fix_bsa_label`` only resolve while backend/ is on
-# sys.path, which is not guaranteed when the app is imported from another
-# directory (``uvicorn backend.main:app`` from the repository root, a script
-# that mounts the app, ...). ``/admin/fbref-check`` used to insert the path for
-# itself inside the handler; do it once, here, for every endpoint.
+# The admin endpoints below import the database layer from inside the request
+# handler, i.e. by top-level module name. ``database`` only resolves while
+# backend/ is on sys.path, which is not guaranteed when the app is imported
+# from another directory (``uvicorn backend.main:app`` from the repository
+# root, a script that mounts the app, ...). ``/admin/fbref-check`` used to
+# insert the path for itself inside the handler; do it once, here, for every
+# endpoint.
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
@@ -83,20 +82,6 @@ validate_feature_column_counts()
 # flight (e.g. the startup reload racing the GitHub Actions callback) wait this
 # long for it before answering 409. Kept well under the endpoint's 60 s budget.
 RELOAD_LOCK_TIMEOUT_SECONDS = 25
-
-# Training moved to GitHub Actions (7 GB runners). These endpoints are kept
-# only so an old cron/curl target gets an explicit 410 instead of running
-# builder.py/trainer.py on a 512 MB Render instance.
-_PIPELINE_MOVED_RESPONSE = {
-    "error": "training moved to GitHub Actions",
-    "status": "gone",
-    "detail": (
-        "builder.py and trainer.py now run in the daily GitHub Actions "
-        "workflow (.github/workflows/daily_fbref_update.yml). This service "
-        "only serves predictions. Use POST /predict/admin/reload-models to "
-        "re-download the pre-built artifacts from Supabase Storage."
-    ),
-}
 
 # Module-level artifact variables (all start as None)
 _result_model  = None
@@ -1613,28 +1598,10 @@ def diagnostics() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Training moved to GitHub Actions — heavy endpoints are permanently gone
+# Dormant FBref snapshot endpoints (kept: the aggregator still runs, but the
+# fbref_team_stats table feeds no model feature since the FBref features were
+# removed from the ML pipeline)
 # --------------------------------------------------------------------------- #
-# PRs #78/#80/#81 grew the training set from ~6,776 to 15,000+ rows and the
-# builder no longer fits in Render's 512 MB free tier: the service was OOM-killed
-# mid-pipeline and restarted by Render. builder.py and trainer.py now run in
-# .github/workflows/daily_fbref_update.yml on a 7 GB ubuntu-latest runner.
-#
-# These two routes are kept (instead of deleted) so any leftover cron job, curl
-# script or bookmark gets an explicit 410 Gone instead of a 404, and — most
-# importantly — so nothing can ever spawn the heavy pipeline on Render again.
-@router.post("/admin/run-pipeline", status_code=410)
-def run_pipeline(secret: str = "") -> JSONResponse:  # noqa: ARG001 - legacy arg
-    """Gone: the full pipeline now runs in GitHub Actions."""
-    return JSONResponse(status_code=410, content=_PIPELINE_MOVED_RESPONSE)
-
-
-@router.post("/admin/run-pipeline-fast", status_code=410)
-def run_pipeline_fast(secret: str = "") -> JSONResponse:  # noqa: ARG001 - legacy arg
-    """Gone: FBref + builder + trainer now run in GitHub Actions."""
-    return JSONResponse(status_code=410, content=_PIPELINE_MOVED_RESPONSE)
-
-
 @router.post(
     "/admin/run-fbref-scrape",
     responses={
@@ -2094,253 +2061,3 @@ def fotmob_team_names() -> dict:
             db.close()
     except Exception as exc:
         return {"error": str(exc)}
-
-
-# --------------------------------------------------------------------------- #
-# One-off Brazilian Série A label diagnostics / repair
-# --------------------------------------------------------------------------- #
-
-# football-data.org serves the Brazilian top flight as competition code "BSA".
-# Fixtures fetched before "BSA" was added to data/fixtures.LEAGUE_MAP were
-# stored in daily_matches under another competition's label, so both the label
-# the rows *should* carry and the stale one they currently carry are needed
-# here. The repair itself lives in backend/scripts/fix_bsa_label.py.
-BSA_LEAGUE = "BRA-Série A"
-STALE_BSA_LEAGUE = "BEL-Jupiler Pro League"
-
-# Rows returned per section. Enough to eyeball a result, small enough that the
-# JSON stays readable when a name pattern matches many seasons.
-_DIAGNOSTIC_ROW_LIMIT = 200
-
-
-def _daily_match_rows(rows) -> list[dict]:
-    """Serialize daily_matches rows for the diagnostic payload."""
-    return [
-        {
-            "id": row.id,
-            "external_id": row.external_id,
-            "match_date": row.match_date,
-            "home_team": row.home_team,
-            "away_team": row.away_team,
-            "league": row.league,
-            "season": row.season,
-            "status": row.status,
-        }
-        for row in rows
-    ]
-
-
-def _bsa_league_filter():
-    """SQLAlchemy filter selecting every Brazilian-labelled daily fixture.
-
-    Matches the label the fixtures should carry (``BRA-Série A``), the label
-    the pre-fix rows were written with (``BEL-Jupiler Pro League``) and the
-    Portuguese spelling (``Brasil``), all case-insensitively so a row stored as
-    ``BRA-SERIE A`` still shows up.
-    """
-    from sqlalchemy import or_
-
-    from database import DailyMatch
-
-    league = DailyMatch.league
-    return or_(
-        league.ilike("%Jupiler%"),
-        league.ilike("%Brasil%"),
-        league.ilike(BSA_LEAGUE),
-    )
-
-
-def _team_stats_rows_for(session, pattern: str) -> dict:
-    """Rows of team_season_stats / fbref_team_stats whose team matches.
-
-    ``pattern`` is a SQL LIKE pattern (``%deportivo%``). Returns
-    ``{"team_name_variants_found": [...], "rows": [...], "counts": {...}}``;
-    a table that is missing or unreadable contributes an ``errors`` entry
-    instead of failing the whole diagnostic.
-    """
-    from database import FBrefTeamStats, TeamSeasonStats
-
-    variants: list[str] = []
-    rows: list[dict] = []
-    errors: list[str] = []
-
-    # Column-limited queries on purpose: selecting whole ORM entities would
-    # need every mapped column to exist, and team_season_stats gains columns
-    # over time (misc_corners is applied by ensure_team_corners_column).
-    try:
-        team_rows = (
-            session.query(
-                TeamSeasonStats.team,
-                TeamSeasonStats.league,
-                TeamSeasonStats.season,
-                TeamSeasonStats.sh_goals,
-                TeamSeasonStats.sh_xg,
-                TeamSeasonStats.gk_ga,
-                TeamSeasonStats.gk_ga90,
-            )
-            .filter(TeamSeasonStats.team.ilike(pattern))
-            .order_by(
-                TeamSeasonStats.team,
-                TeamSeasonStats.league,
-                TeamSeasonStats.season,
-            )
-            .limit(_DIAGNOSTIC_ROW_LIMIT)
-            .all()
-        )
-    except Exception as exc:  # noqa: BLE001 - diagnostics report, never raise
-        team_rows = []
-        errors.append(f"team_season_stats: {exc}")
-
-    for team, league, season, goals, xg, ga, ga90 in team_rows:
-        if team not in variants:
-            variants.append(team)
-        rows.append(
-            {
-                "source": "team_season_stats",
-                "team": team,
-                "league": league,
-                "season": season,
-                "goals": goals,
-                "xg": xg,
-                "goals_against": ga,
-                "goals_against_per90": ga90,
-            }
-        )
-
-    try:
-        fbref_rows = (
-            session.query(
-                FBrefTeamStats.team,
-                FBrefTeamStats.league,
-                FBrefTeamStats.season,
-                FBrefTeamStats.games,
-                FBrefTeamStats.shots,
-                FBrefTeamStats.goals_per_shot,
-            )
-            .filter(FBrefTeamStats.team.ilike(pattern))
-            .order_by(
-                FBrefTeamStats.team,
-                FBrefTeamStats.league,
-                FBrefTeamStats.season,
-            )
-            .limit(_DIAGNOSTIC_ROW_LIMIT)
-            .all()
-        )
-    except Exception as exc:  # noqa: BLE001 - diagnostics report, never raise
-        fbref_rows = []
-        errors.append(f"fbref_team_stats: {exc}")
-
-    for team, league, season, games, shots, goals_per_shot in fbref_rows:
-        if team not in variants:
-            variants.append(team)
-        rows.append(
-            {
-                "source": "fbref_team_stats",
-                "team": team,
-                "league": league,
-                "season": season,
-                "games": games,
-                "shots": shots,
-                "goals_per_shot": goals_per_shot,
-            }
-        )
-
-    result = {
-        "team_name_variants_found": variants,
-        "rows": rows,
-        "counts": {
-            "team_season_stats": len(
-                [r for r in rows if r["source"] == "team_season_stats"]
-            ),
-            "fbref_team_stats": len(
-                [r for r in rows if r["source"] == "fbref_team_stats"]
-            ),
-        },
-    }
-    if errors:
-        result["errors"] = errors
-    return result
-
-
-@router.get("/admin/la-liga-check")
-def la_liga_check() -> dict:
-    """
-    Temporary diagnostic: what every Brazilian fixture in daily_matches is
-    labelled as, plus the Deportivo / Levante rows the La Liga predictor
-    would join against. Read-only, no secret required.
-
-    ``rows_needing_bsa_label_fix`` is the number of rows the one-off repair in
-    backend/scripts/fix_bsa_label.py would rewrite — 0 means the migration has
-    already been applied (or there was nothing to fix).
-    """
-    try:
-        from database import DailyMatch, session_scope
-
-        with session_scope() as session:
-            bsa_rows = _daily_match_rows(
-                session.query(DailyMatch)
-                .filter(_bsa_league_filter())
-                .order_by(DailyMatch.match_date.desc(), DailyMatch.id.desc())
-                .limit(_DIAGNOSTIC_ROW_LIMIT)
-                .all()
-            )
-            pending_fix = (
-                session.query(DailyMatch)
-                .filter(DailyMatch.league.ilike("%Jupiler%"))
-                .count()
-            )
-            deportivo = _team_stats_rows_for(session, "%deportivo%")
-            levante = _team_stats_rows_for(session, "%levante%")
-
-        return {
-            "bsa_stored_rows": bsa_rows,
-            "bsa_stored_row_count": len(bsa_rows),
-            "expected_bsa_league": BSA_LEAGUE,
-            "stale_bsa_league": STALE_BSA_LEAGUE,
-            "rows_needing_bsa_label_fix": pending_fix,
-            "deportivo_stats": deportivo,
-            "levante_stats": levante,
-        }
-    except Exception as exc:  # noqa: BLE001 - diagnostics report, never raise
-        print(f"[predict] WARNING: la-liga-check failed: {exc}")
-        return {"error": str(exc)}
-
-
-@router.get("/admin/fix-bsa-label")
-def fix_bsa_label(secret: str = "", dry_run: bool = False) -> dict:
-    """
-    Apply the one-off ``daily_matches`` label repair over HTTP, for a
-    deployment that has no shell: sets every Brazilian fixture still stored as
-    ``BEL-Jupiler Pro League`` to ``BRA-Série A``.
-
-    Requires PIPELINE_SECRET, like the other write endpoints. Idempotent —
-    a second call reports ``"updated": 0``. Pass ``dry_run=true`` to list the
-    rows without writing anything.
-
-    GET (not POST) so the repair can be triggered straight from a browser
-    address bar on a phone, where issuing a POST is not practical.
-    """
-    import os
-
-    expected = os.getenv("PIPELINE_SECRET", "")
-    if not expected or secret != expected:
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid or missing secret.",
-        )
-
-    from database import session_scope
-    from scripts.fix_bsa_label import apply_bsa_label_fix
-
-    try:
-        with session_scope() as session:
-            report = apply_bsa_label_fix(session, dry_run=dry_run)
-    except Exception as exc:  # noqa: BLE001 - report, never 500
-        print(f"[predict] WARNING: fix-bsa-label failed: {exc}")
-        return {"error": str(exc)}
-
-    print(
-        f"[predict] fix-bsa-label: updated {report['updated']} row(s) "
-        f"(dry_run={report['dry_run']})"
-    )
-    return report

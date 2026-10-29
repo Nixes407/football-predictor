@@ -155,8 +155,9 @@ restarted the service. Training therefore lives in GitHub Actions now:
   builder.py → trainer.py → upload to Supabase Storage bucket "models".
 - Render is notified with `POST /predict/admin/reload-models`, which only
   re-downloads the artifacts into memory.
-- `POST /predict/admin/run-pipeline` and `.../run-pipeline-fast` return
-  **410 Gone** (stubs; they can no longer spawn builder/trainer on Render).
+- The legacy `POST /predict/admin/run-pipeline` / `.../run-pipeline-fast`
+  routes were **removed** (they answered 410 Gone and are now plain 404s), so
+  nothing can start training on Render.
 - On startup the API reloads models from Supabase Storage in a background
   thread; it never auto-starts training.
 
@@ -174,9 +175,11 @@ restarted the service. Training therefore lives in GitHub Actions now:
 
 - `POST /predict/admin/reload-models?secret=X` — re-download the pre-built models + features.csv from Supabase Storage (~seconds)
 
-- `POST /predict/admin/run-pipeline` / `run-pipeline-fast` — **410 Gone**; training moved to GitHub Actions
+- `POST /predict/admin/run-fbref-scrape?secret=X` / `GET /predict/admin/fbref-scrape-status?secret=X` — dormant StatsBomb→FBref snapshot aggregator (`fbref_team_stats` feeds no model feature)
 
-- `GET /predict/admin/fix-bsa-label?secret=X` — one-off repair of stale `BEL-Jupiler Pro League` fixture labels; add `&dry_run=true` to preview. GET so it can be triggered from a phone browser
+- ~~`POST /predict/admin/run-pipeline` / `run-pipeline-fast`~~ — removed: training moved to GitHub Actions
+
+- ~~`GET /predict/admin/fix-bsa-label`~~ — removed: one-off `BEL-Jupiler Pro League` label repair, already applied (the idempotent script `backend/scripts/fix_bsa_label.py` remains for manual runs)
 
 ## Current Priorities (in order)
 

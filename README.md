@@ -164,8 +164,8 @@ required. Details in [`docs/deploy.md`](docs/deploy.md).
   (`.github/workflows/daily_fbref_update.yml`) runs the collectors, builder and
   trainer on a 7 GB runner, uploads the artifacts to Supabase Storage and then
   calls `POST /predict/admin/reload-models` on Render. The API itself never
-  trains: `run-pipeline` / `run-pipeline-fast` return **410 Gone**, and startup
-  only downloads the pre-built artifacts.
+  trains: the legacy `run-pipeline` / `run-pipeline-fast` routes were removed,
+  and startup only downloads the pre-built artifacts.
 - **No proxy layer.** `vercel.json` no longer rewrites `/api/*`; see
   [`docs/deploy.md`](docs/deploy.md) for the full setup and troubleshooting.
 

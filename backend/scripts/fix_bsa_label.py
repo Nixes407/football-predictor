@@ -36,9 +36,10 @@ Usage
 automatically (see ``backend/database.py``).  The script is idempotent: a second
 run reports ``updated 0``.
 
-The same repair is reachable over HTTP for a deployment that has no shell:
-``GET /predict/admin/fix-bsa-label?secret=...`` — see
-``backend/routers/predict.py``.
+The script is idempotent: a second run reports ``updated 0``.  It is a manual
+repair tool only — no workflow or API route calls it any more (the one-off
+``fix_bsa_label.yml`` workflow and the ``GET /predict/admin/fix-bsa-label``
+route were both retired once the stored rows had been corrected).
 """
 
 from __future__ import annotations
