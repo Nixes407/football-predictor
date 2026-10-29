@@ -159,7 +159,7 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 `models/trainer.py` uploads the artifacts to Supabase Storage by default. On the
 deployed backend, reload them with
 `POST /predict/admin/reload-models?secret=$PIPELINE_SECRET` — the legacy
-`run-pipeline` / `run-pipeline-fast` endpoints now return **410 Gone** because
+`run-pipeline` / `run-pipeline-fast` endpoints have been **removed** because
 training moved to GitHub Actions (the 512 MB Render instance OOMs on this
 dataset).
 

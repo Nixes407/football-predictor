@@ -3,8 +3,9 @@
 The Render free tier (512 MB) OOM-killed the service while builder.py ran on
 the expanded ~15,000-row dataset. These tests pin the new contract:
 
-* ``/admin/run-pipeline`` and ``/admin/run-pipeline-fast`` answer 410 Gone and
-  no longer import ``subprocess`` — Render can never spawn builder/trainer.
+* the predict router imports no ``subprocess``, and the retired
+  ``/admin/run-pipeline`` / ``/admin/run-pipeline-fast`` handlers are gone
+  entirely — Render can never spawn builder/trainer.
 * startup only reloads pre-built artifacts from Supabase Storage.
 * ``/admin/reload-models`` downloads the bucket into memory, reports
   ``features_rows`` + ``models_loaded``, and leaves the previously served
@@ -53,28 +54,6 @@ class HeavyEndpointsAreGoneTests(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".")[0])
         self.assertNotIn("subprocess", imported)
-
-    def test_run_pipeline_functions_only_return_the_gone_response(self):
-        functions = _functions(_source("routers/predict.py"))
-        for name in ("run_pipeline", "run_pipeline_fast"):
-            with self.subTest(function=name):
-                fn = functions[name]
-                # decorator: @router.post("/admin/...", status_code=410)
-                decorator = fn.decorator_list[0]
-                status_codes = {
-                    kw.value.value
-                    for kw in decorator.keywords
-                    if kw.arg == "status_code"
-                }
-                self.assertEqual(status_codes, {410})
-
-                calls = [
-                    node.func.id
-                    for node in ast.walk(fn)
-                    if isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Name)
-                ]
-                self.assertEqual(calls, ["JSONResponse"])
 
     def test_old_auto_start_is_gone_and_startup_only_reloads(self):
         predict_source = _source("routers/predict.py")
@@ -182,17 +161,6 @@ class ReloadEndpointTests(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # Tests
     # ------------------------------------------------------------------ #
-    def test_heavy_endpoints_return_410(self):
-        for path in ("/predict/admin/run-pipeline",
-                     "/predict/admin/run-pipeline-fast"):
-            with self.subTest(path=path):
-                response = self.client.post(path)
-                self.assertEqual(response.status_code, 410)
-                self.assertEqual(
-                    response.json()["error"],
-                    "training moved to GitHub Actions",
-                )
-
     def test_diagnostics_active_engine(self):
         """Task 4 regression: the label matches /match's "engine": "blended"."""
         response = self.client.get("/predict/admin/diagnostics")

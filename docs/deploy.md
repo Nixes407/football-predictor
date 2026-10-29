@@ -65,8 +65,9 @@ curl "https://your-backend.onrender.com/predict/admin/status"
 ```
 
 The legacy `POST /predict/admin/run-pipeline` and
-`POST /predict/admin/run-pipeline-fast` endpoints now return **410 Gone** — they
-are stubs so nothing can restart training on Render by accident.
+`POST /predict/admin/run-pipeline-fast` endpoints have been **removed** (they
+used to answer 410 Gone), so nothing can restart training on Render by
+accident.
 
 To train locally instead, run from `backend/` (then upload manually with the
 trainer, which does it by default):
