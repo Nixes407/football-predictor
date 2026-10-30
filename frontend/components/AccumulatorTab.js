@@ -6,7 +6,6 @@ const MARKETS = [
   'Home Win', 'Draw', 'Away Win',
   'Over 2.5', 'Under 2.5',
   'BTTS Yes', 'BTTS No',
-  'Over 9.5 Corners', 'Under 9.5 Corners',
 ];
 
 function getAcca() {
@@ -66,8 +65,14 @@ export default function AccumulatorTab() {
     return () => window.removeEventListener('storage', onStorage);
   }, []);
 
-  const combined = selections.reduce(
-    (acc, s) => acc * (s.probability / 100), 1
+  // Keep legacy unsupported selections in storage, but don't show or include
+  // them in the combined probability. Preserve their original indices so
+  // removing a visible pick never removes a different stored selection.
+  const visibleSelections = selections
+    .map((selection, index) => ({ selection, index }))
+    .filter(({ selection }) => MARKETS.includes(selection?.market));
+  const combined = visibleSelections.reduce(
+    (acc, { selection }) => acc * (selection.probability / 100), 1
   );
 
   function removeSelection(idx) {
@@ -77,8 +82,9 @@ export default function AccumulatorTab() {
   }
 
   function clearAll() {
-    saveAcca([]);
-    setSelections([]);
+    const retained = selections.filter((selection) => !MARKETS.includes(selection?.market));
+    saveAcca(retained);
+    setSelections(retained);
   }
 
   function handleAdd() {
@@ -110,7 +116,7 @@ export default function AccumulatorTab() {
         <h2 className="text-2xl font-bold gradient-text">
           Accumulator Builder
         </h2>
-        {selections.length > 0 && (
+        {visibleSelections.length > 0 && (
           <button
             onClick={clearAll}
             className="text-sm text-red-400 hover:text-red-300
@@ -122,7 +128,7 @@ export default function AccumulatorTab() {
       </div>
 
       {/* Selections list */}
-      {selections.length === 0 ? (
+      {visibleSelections.length === 0 ? (
         <div className="glass-card rounded-2xl p-8 text-center
           text-gray-400 mb-6">
           <p className="text-4xl mb-3">🎯</p>
@@ -133,7 +139,7 @@ export default function AccumulatorTab() {
         </div>
       ) : (
         <div className="glass-card rounded-2xl p-4 mb-6">
-          {selections.map((s, i) => (
+          {visibleSelections.map(({ selection: s, index: i }) => (
             <div
               key={i}
               className="flex items-center justify-between

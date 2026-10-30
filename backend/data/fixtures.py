@@ -10,6 +10,8 @@ import os
 import requests
 from datetime import date, datetime, timezone
 
+from data.league_config import CALENDAR_YEAR_LEAGUES
+
 # USA-MLS comes from FotMob. API-Football is gone: that account is suspended
 # and answers with errors, so nothing in this module may reach for it. The
 # collector is imported defensively because it pulls in the database layer,
@@ -207,9 +209,22 @@ def map_team_name(name: str) -> str:
     return TEAM_NAME_MAP.get(name, name)
 
 
-def derive_season(utc_date_str: str) -> str:
-    """Derive the football season, which starts in July, from a UTC date."""
+def derive_season(
+    utc_date_str: str,
+    league: str | None = None,
+    season_start_date: str | None = None,
+) -> str:
+    """Derive a season label, preserving the July rule outside Brazil.
+
+    Prefer the provider's actual BSA season start where present: a postponed
+    match played in January can still belong to the previous calendar season.
+    """
     match_date = date.fromisoformat(utc_date_str[:10])
+    if league in CALENDAR_YEAR_LEAGUES:
+        try:
+            return str(date.fromisoformat(str(season_start_date)[:10]).year)
+        except ValueError:
+            return str(match_date.year)
     if match_date.month >= 7:
         return f"{match_date.year}-{match_date.year + 1}"
     return f"{match_date.year - 1}-{match_date.year}"
@@ -322,6 +337,11 @@ def fetch_fixtures(target_date: str = None) -> list[dict]:
             for match in matches:
                 try:
                     utc_date = match["utcDate"]
+                    season_info = match.get("season")
+                    season_start = (
+                        season_info.get("startDate")
+                        if isinstance(season_info, dict) else None
+                    )
                     fixtures.append(
                         {
                             "external_id": str(match["id"]),
@@ -330,7 +350,7 @@ def fetch_fixtures(target_date: str = None) -> list[dict]:
                             "home_team": map_team_name(match["homeTeam"]["name"]),
                             "away_team": map_team_name(match["awayTeam"]["name"]),
                             "league": league_name,
-                            "season": derive_season(utc_date),
+                            "season": derive_season(utc_date, league_name, season_start),
                             "status": match["status"].lower(),
                         }
                     )

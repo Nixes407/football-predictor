@@ -13,6 +13,8 @@ pipeline has been run.
 from __future__ import annotations
 
 import copy
+import logging
+import math
 import os
 import shutil
 import sys
@@ -30,6 +32,45 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from scipy.stats import poisson
 from supabase import create_client
+
+
+def compute_first_goal_probs(
+    lambda_home: float, lambda_away: float,
+) -> dict[str, float]:
+    """First-goal probabilities from two independent Poisson processes."""
+    if lambda_home <= 0 and lambda_away <= 0:
+        return {"home": 0.0, "away": 0.0, "no_goal": 1.0}
+
+    total_rate = lambda_home + lambda_away
+    p_no_goal = math.exp(-total_rate)
+    p_at_least_one = 1.0 - p_no_goal
+    if (
+        math.isinf(total_rate)
+        and math.isfinite(lambda_home)
+        and math.isfinite(lambda_away)
+    ):
+        # The sum of two finite rates can overflow. Scaling both by the same
+        # factor preserves the requested rate ratios without overflowing.
+        scale = max(lambda_home, lambda_away)
+        home_scaled, away_scaled = lambda_home / scale, lambda_away / scale
+        home_share = home_scaled / (home_scaled + away_scaled)
+        away_share = away_scaled / (home_scaled + away_scaled)
+    else:
+        home_share = lambda_home / total_rate
+        away_share = lambda_away / total_rate
+    probabilities = {
+        "home": round(p_at_least_one * home_share, 4),
+        "away": round(p_at_least_one * away_share, 4),
+        "no_goal": round(p_no_goal, 4),
+    }
+    if not math.isclose(
+        sum(probabilities.values()), 1.0, rel_tol=0.0, abs_tol=0.001
+    ):
+        logging.getLogger(__name__).warning(
+            "First-goal probabilities do not sum to one: %s", probabilities
+        )
+    return probabilities
+
 
 try:
     from models.formula_engine import (
@@ -60,6 +101,9 @@ if str(BACKEND_DIR) not in sys.path:
 # Shared bucket manifest — the trainer uploads exactly what this file lists.
 import model_artifacts as artifacts  # noqa: E402  (needs the sys.path above)
 import fbref_scrape_runner  # noqa: E402  (background StatsBomb->FBref aggregator on Render)
+from data.league_config import (  # noqa: E402
+    BRA_LEAGUE, CALENDAR_YEAR_LEAGUES, MIN_ROWS_PER_LEAGUE, get_season_string,
+)
 
 # Feature definitions and assembly. The column lists are the SAME objects the
 # trainer fits on (``features/feature_columns.py``), and the feature *values*
@@ -1182,6 +1226,28 @@ def get_teams(league: str = "") -> dict:
     return {"teams": all_teams}
 
 
+def _brazil_ml_ready(league: str, home: str, away: str, model, features) -> bool:
+    """Do not present an unseen Brazilian league/team as a trained prediction.
+
+    The encoder and CSV can contain BSA even when its matches all fall into
+    the held-out test split. The result-model artifact records how many BSA
+    rows were actually used by its final fit; old artifacts have no such proof.
+    """
+    if league != BRA_LEAGUE:
+        return True
+    try:
+        trained_rows = int(getattr(model, "brazil_training_rows_", 0))
+    except (TypeError, ValueError):
+        return False
+    if trained_rows < MIN_ROWS_PER_LEAGUE or features is None:
+        return False
+    if not {"league", "home_team", "away_team"}.issubset(features.columns):
+        return False
+    brazil = features.loc[features["league"] == BRA_LEAGUE]
+    teams = set(brazil["home_team"].dropna()) | set(brazil["away_team"].dropna())
+    return home in teams and away in teams
+
+
 def _blend_predictions(
     formula_result: dict[str, Any],
     ml_result: dict[str, Any],
@@ -1268,6 +1334,19 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
     Run all prediction models for a given fixture
     and return full market probabilities.
     """
+    if req.league in CALENDAR_YEAR_LEAGUES:
+        supplied = getattr(req, "model_fields_set", None)
+        if supplied is None:  # Pydantic 1 compatibility
+            supplied = getattr(req, "__fields_set__", set())
+        req.season = (
+            get_season_string(req.league, req.season)
+            if "season" in supplied
+            else str(datetime.now(timezone.utc).year)
+        )
+    brazil_ml_ready = _brazil_ml_ready(
+        req.league, req.home_team, req.away_team, _result_model, _features_df
+    )
+
     # 1. Try formula_v1 -> store result as formula_result (or None if unavailable/error)
     formula_result = None
     if _formula_engine_available and formula_predict:
@@ -1300,7 +1379,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
     ])
 
     ml_result = None
-    if models_ready and _features_df is not None:
+    if models_ready and _features_df is not None and brazil_ml_ready:
         try:
             # Encode league and season (unseen -> fallback 0)
             league_enc = _encode_label(_le_league, req.league)
@@ -1392,10 +1471,8 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
                 "corners": {
                     "expected_home":  round(exp_home_corners, 3),
                     "expected_away":  round(exp_away_corners, 3),
-                    # The frontend reads expected_total / over_9_5 / over_11_5 and the
-                    # formula engine publishes all three; the ML path used to omit
-                    # them, which left those rows blank for every non-formula
-                    # prediction (and left no over_9_5 for fixtures.py to store).
+                    # Keep these existing markets for API consumers and
+                    # fixture storage, even though the UI no longer shows them.
                     "expected_total": round(exp_total_corners, 3),
                     "over_8_5":       round(over_corners_8_5, 4),
                     "over_9_5":       round(over_corners_9_5, 4),
@@ -1429,6 +1506,14 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         print(f"[predict] Using ml_only: "
               f"{req.home_team} vs {req.away_team}")
     else:
+        if not brazil_ml_ready and req.league == BRA_LEAGUE:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Brazilian Série A is not ready: collect enough finished "
+                    "matches for both teams and complete a model retrain."
+                ),
+            )
         if not models_ready:
             raise HTTPException(
                 status_code=503,
@@ -1457,7 +1542,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
     }[final_result["prediction_method"]]
 
     # Specialized classifiers override their specific fields AFTER blend
-    if _btts_model is not None and _features_df is not None:
+    if _btts_model is not None and _features_df is not None and brazil_ml_ready:
         try:
             league_enc_for_btts = _encode_label(_le_league, req.league)
             btts_prob = _get_btts_probability(
@@ -1471,7 +1556,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         except Exception as exc:
             print(f"[predict] WARNING: BTTS override failed: {exc}")
 
-    if _over25_model is not None and _features_df is not None:
+    if _over25_model is not None and _features_df is not None and brazil_ml_ready:
         try:
             league_enc_for_over25 = _encode_label(_le_league, req.league)
             over25_prob = _get_over25_probability(
@@ -1485,7 +1570,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         except Exception as exc:
             print(f"[predict] WARNING: Over 2.5 override failed: {exc}")
 
-    if _over95_corners_model is not None and _features_df is not None:
+    if _over95_corners_model is not None and _features_df is not None and brazil_ml_ready:
         try:
             league_enc_for_corners = _encode_label(_le_league, req.league)
             corners95_prob = _get_over95_corners_probability(
@@ -1503,6 +1588,16 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         final_result["xgb_1x2_active"] = bool(
             ml_result.get("xgb_1x2_active", False) if ml_result else False
         )
+
+    # Formula scorelines use the formula rates, even in a blended response.
+    # Those rates are exposed (rounded to three decimals) in the feature
+    # vector. ML-only responses have no scorelines, so use their goal rates.
+    rate_source = formula_result if formula_result is not None else final_result
+    goal_rates = rate_source["goals"]
+    formula_features = rate_source.get("feature_vector_used") or {}
+    lambda_home = formula_features.get("lambda_home", goal_rates["expected_home"])
+    lambda_away = formula_features.get("lambda_away", goal_rates["expected_away"])
+    final_result["first_goal"] = compute_first_goal_probs(lambda_home, lambda_away)
 
     return final_result
 

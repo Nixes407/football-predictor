@@ -1,13 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getApiBase } from '../lib/apiBase';
-
-const LEAGUE_FLAGS = {
-  'ENG-Premier League': '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'ESP-La Liga':        '🇪🇸',
-  'GER-Bundesliga':     '🇩🇪',
-  'ITA-Serie A':        '🇮🇹',
-  'FRA-Ligue 1':        '🇫🇷',
-};
+import { leagueFlag, leagueName } from '../lib/leagues';
 
 function AccuracyBar({ pct, color }) {
   return (
@@ -112,7 +105,7 @@ export default function StatsTab() {
                     <div className="flex justify-between
                       items-center mb-1">
                       <span className="text-sm text-white">
-                        {LEAGUE_FLAGS[league] || ''} {league}
+                        {leagueFlag(league)} {leagueName(league)}
                       </span>
                       <span className={`text-sm font-bold
                         ${pct >= 60

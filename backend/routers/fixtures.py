@@ -1,6 +1,7 @@
 """Endpoints for daily football fixtures and their stored predictions."""
 
 import json
+import math
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ from sqlalchemy import Column, Float, inspect, text
 from sqlalchemy.orm import Session
 
 from data.fixtures import fetch_fixtures
+from data.league_config import BRA_LEAGUE, get_season_string
 
 # Imported the same defensive way data/fixtures.py does: the spillover pass
 # must keep working (without MLS) if the collector is unavailable.
@@ -48,6 +50,7 @@ from routers.predict import (
     _poisson_btts,
     _poisson_over,
     _result_model,
+    compute_first_goal_probs,
     formula_predict,
 )
 
@@ -752,6 +755,22 @@ def _parse_utc(value) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _stored_fixture_season(row: DailyMatch, fresh: dict | None = None) -> str | None:
+    """Resolve legacy BSA labels for inference without updating stored rows."""
+    if row.league != BRA_LEAGUE:
+        return row.season
+    if fresh and fresh.get("season"):
+        return get_season_string(BRA_LEAGUE, fresh["season"])
+    season = row.season
+    if season and ("-" in season or "/" in season):
+        # Old fixtures used the European July boundary, so splitting the start
+        # year is wrong for a Brazilian match played between January and June.
+        played_at = _parse_utc(row.kickoff_time) or _parse_utc(row.match_date)
+        if played_at is not None:
+            return str(played_at.year)
+    return get_season_string(BRA_LEAGUE, season)
+
+
 @lru_cache(maxsize=2)
 def _fotmob_names_from_db(_time_bucket: int) -> dict[str, list[str]]:
     """Use committed stats when the collector's JSON is on another host."""
@@ -1038,7 +1057,10 @@ def _predict_fixture_values(
     # Preserve the tournament before replacing it with each team's
     # domestic league for team-name resolution and domestic stats.
     fixture_league = league
-    fotmob_names = _load_fotmob_names()
+    if fixture_league == BRA_LEAGUE:
+        season = (get_season_string(league, season) if season
+                  else str(datetime.now(timezone.utc).year))
+    fotmob_names = {} if fixture_league == BRA_LEAGUE else _load_fotmob_names()
     away_dom: str | None = None
     if fixture_league == UCL_LEAGUE:
         home_dom = _get_ucl_domestic_league(home_team)
@@ -1050,9 +1072,11 @@ def _predict_fixture_values(
         home_team = _find_fotmob_name(home_team, home_dom, fotmob_names)
         away_team = _find_fotmob_name(away_team, away_dom, fotmob_names)
         league = home_dom
-    else:
+    elif fixture_league != BRA_LEAGUE:
         home_team = _find_fotmob_name(home_team, league, fotmob_names)
         away_team = _find_fotmob_name(away_team, league, fotmob_names)
+    # BSA history and fixtures come from the same provider; keep those exact
+    # team names instead of replacing them with another provider's spelling.
 
     if fixture_league == UCL_LEAGUE:
         formula_result = _predict_with_formula(
@@ -1072,6 +1096,10 @@ def _predict_fixture_values(
         _ml_models_available()
         and features_df is not None
         and {"home_team", "away_team"}.issubset(features_df.columns)
+        and predict_module._brazil_ml_ready(
+            league, home_team, away_team,
+            _current_predictor_value("_result_model", _result_model), features_df,
+        )
     ):
         home_known = bool((
             (features_df["home_team"] == home_team)
@@ -1369,7 +1397,7 @@ def fill_missing_predictions(rows: list[DailyMatch], db: Session) -> int:
                     home_team=row.home_team,
                     away_team=row.away_team,
                     league=row.league,
-                    season=row.season,
+                    season=_stored_fixture_season(row),
                 )
                 for name in PREDICTION_FIELDS:
                     if values.get(name) is None:
@@ -1431,6 +1459,17 @@ def _row_to_dict(row: DailyMatch) -> dict:
     _with_derived_markets(values)
     for name in PREDICTION_FIELDS:
         data[name] = values.get(name)
+
+    # Daily fixtures store their own (possibly blended) expected goals. Derive
+    # this additive market without changing or writing any stored fields. An
+    # absent or invalid rate is not evidence of a guaranteed 0-0 draw.
+    home_goals = values["pred_home_goals"]
+    away_goals = values["pred_away_goals"]
+    if all(
+        rate is not None and math.isfinite(rate) and rate >= 0
+        for rate in (home_goals, away_goals)
+    ):
+        data["first_goal"] = compute_first_goal_probs(home_goals, away_goals)
 
     data["prediction_computed_at"] = row.prediction_computed_at
     data["has_prediction"] = (
@@ -1639,7 +1678,7 @@ def refresh_open_predictions(
                 home_team=row.home_team,
                 away_team=row.away_team,
                 league=row.league,
-                season=row.season,
+                season=_stored_fixture_season(row, fresh),
             )
             if _has_result_prediction(values):
                 _apply_prediction_values(row, values)

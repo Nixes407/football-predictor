@@ -447,14 +447,16 @@ def _get_seasons(league: str) -> list[str]:
     calendar-year league is never asked for a split-year season (or the
     reverse) even if FOTMOB_LEAGUES is edited with the wrong form.
     """
-    CALENDAR_YEAR_LEAGUES = {
+    # FotMob's provider-specific labels are independent of the match-history
+    # training labels. Keep the existing MLS/Norway behavior unchanged.
+    fotmob_calendar_years = {
         "USA-MLS",
         # Eliteserien runs March-December. FotMob lists its seasons as
         # "2026", "2025", ... (verified 2026-10-14), and a "2025/2026"
         # request silently returns the 2026 table.
         "NOR-Eliteserien",
     }
-    calendar_year = league in CALENDAR_YEAR_LEAGUES
+    calendar_year = league in fotmob_calendar_years
     config = FOTMOB_LEAGUES.get(league, {})
     seasons = []
     for key in ("prev_season", "season"):

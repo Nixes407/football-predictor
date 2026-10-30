@@ -7,7 +7,8 @@ Data collector for the Football Predictor backend.
     plus the ENG-Championship, POR-Primeira Liga, NED-Eredivisie and
     TUR-Süper Lig division files, and for NOR-Eliteserien / AUT-Bundesliga from
     football-data.co.uk's all-time "extra leagues" CSVs (goals and odds only).
-    All of it is stored in the ``matches`` table.
+    BRA-Série A is collected separately from the already-integrated
+    football-data.org API (finished scores only). All rows go to ``matches``.
 
 Elo ratings
     ``elo_ratings`` is filled by :mod:`data.elo`, which replays the stored
@@ -41,10 +42,10 @@ If a few teams keep being skipped, add them to soccerdata's optional
 
 from __future__ import annotations
 
-import itertools
 import math
 import os
 import sys
+import time
 from collections import Counter, defaultdict
 from datetime import date, datetime
 from pathlib import Path
@@ -91,6 +92,8 @@ try:
 except ImportError:  # pragma: no cover - depends on the environment
     _MISSING_DEPENDENCIES.append("SQLAlchemy/database")
 
+from data.league_config import BRA_LEAGUE, CALENDAR_YEAR_LEAGUES  # noqa: E402
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -108,7 +111,11 @@ LEAGUES: list[str] = [
     "TUR-Süper Lig",
     "NOR-Eliteserien",
     "AUT-Bundesliga",
+    BRA_LEAGUE,
 ]
+
+# The collector's public configuration was historically named LEAGUES.
+TRAINING_LEAGUES = LEAGUES
 
 # ---------------------------------------------------------------------------
 # League support beyond soccerdata's built-in list
@@ -190,6 +197,16 @@ def season_range(
     """
     last_year = int(current_season(today)[:4])
     return [f"{y}-{y + 1}" for y in range(first_year, last_year + 1)]
+
+
+def get_seasons_for_league(
+    league: str, today: date | None = None,
+) -> list[str]:
+    """Brazil uses calendar years; preserve the existing range for all others."""
+    if league in CALENDAR_YEAR_LEAGUES:
+        year = (today or date.today()).year
+        return [str(y) for y in range(FIRST_TRAINING_SEASON, year + 1)]
+    return season_range(today=today)
 
 
 SEASONS: list[str] = season_range()
@@ -351,6 +368,115 @@ def _derive_result(home_goals: int | None, away_goals: int | None) -> str | None
 # --------------------------------------------------------------------------- #
 # Match history
 # --------------------------------------------------------------------------- #
+
+
+_FOOTBALL_DATA_ORG_URL = "https://api.football-data.org/v4/competitions/{code}/matches"
+_FOOTBALL_DATA_ORG_INTERVAL = 6.5  # registered free tier: 10 requests/minute
+_last_football_data_request: float | None = None
+
+
+def _football_data_get(url: str, *, params: dict, headers: dict):
+    """Pace BSA requests and retry one rate-limit response, without logging keys."""
+    global _last_football_data_request
+    for attempt in range(2):
+        if _last_football_data_request is not None:
+            delay = _FOOTBALL_DATA_ORG_INTERVAL - (
+                time.monotonic() - _last_football_data_request
+            )
+            if delay > 0:
+                time.sleep(delay)
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+        finally:
+            _last_football_data_request = time.monotonic()
+        if getattr(response, "status_code", None) != 429 or attempt:
+            return response
+        try:
+            retry_after = float(response.headers.get("Retry-After", 60))
+            if not math.isfinite(retry_after):
+                retry_after = 60
+        except (TypeError, ValueError):
+            retry_after = 60
+        delay = min(60.0, max(1.0, retry_after))
+        print(f"[matches] football-data.org rate limit; retrying in {delay:g}s")
+        time.sleep(delay)
+    return response  # pragma: no cover - loop always returns on its last attempt
+
+
+def _load_brazilian_matches(season: str, api_key: str):
+    """Fetch one BSA season as a MatchHistory-shaped frame, or None on failure.
+
+    The API provides finished scores but not the shot/corner/odds columns in
+    the free result payload. Leave those fields absent rather than inventing
+    values. Team names are mapped exactly as the daily fixture feed maps them.
+    """
+    # Lazy import keeps the collector's optional-dependency diagnostics working
+    # even when requests (which the fixture module imports eagerly) is missing.
+    from data.fixtures import LEAGUE_MAP, map_team_name
+
+    code = next(code for code, name in LEAGUE_MAP.items() if name == BRA_LEAGUE)
+    url = _FOOTBALL_DATA_ORG_URL.format(code=code)
+    response = None
+    try:
+        response = _football_data_get(
+            url,
+            params={"season": int(season), "status": "FINISHED"},
+            headers={"X-Auth-Token": api_key},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        matches = payload.get("matches") if isinstance(payload, dict) else None
+        if not isinstance(matches, list):
+            raise ValueError("response 'matches' is not a list")
+    except Exception as exc:  # noqa: BLE001 - other seasons must still run
+        status = getattr(response, "status_code", None)
+        print(f"[matches] WARNING: football-data.org {code} {season} failed "
+              f"(HTTP {status or 'unavailable'}): {exc}. "
+              "Historical access may depend on the API plan.")
+        return None
+
+    records = []
+    for match in matches:
+        if not isinstance(match, dict) or match.get("status") != "FINISHED":
+            continue
+        source_season = match.get("season") or {}
+        if not isinstance(source_season, dict):
+            continue
+        start = source_season.get("startDate")
+        if start and str(start)[:4] != season:
+            print(f"[matches] WARNING: BSA {season}: ignored a match from "
+                  f"season {str(start)[:4]}")
+            continue
+        home_data, away_data = match.get("homeTeam"), match.get("awayTeam")
+        score_data = match.get("score")
+        if not all(isinstance(item, dict) for item in (home_data, away_data, score_data)):
+            continue
+        home, away = home_data.get("name"), away_data.get("name")
+        score = score_data.get("fullTime") or {}
+        if not isinstance(score, dict):
+            continue
+        hg, ag = score.get("home"), score.get("away")
+        if (
+            not isinstance(home, str) or not home.strip()
+            or not isinstance(away, str) or not away.strip()
+            or not isinstance(hg, int) or isinstance(hg, bool) or hg < 0
+            or not isinstance(ag, int) or isinstance(ag, bool) or ag < 0
+            or _clean_date(match.get("utcDate")) is None
+        ):
+            continue
+        home = map_team_name(home.strip())
+        away = map_team_name(away.strip())
+        if home == away:
+            continue
+        records.append({
+            "date": match["utcDate"], "home_team": home, "away_team": away,
+            "FTHG": hg, "FTAG": ag, "FTR": _derive_result(hg, ag),
+        })
+
+    # An empty but valid response (e.g. the season has not started) is not a
+    # collector failure. Preserve columns so the normal row builder can run.
+    columns = ["date", "home_team", "away_team", "FTHG", "FTAG", "FTR"]
+    return pd.DataFrame.from_records(records, columns=columns)
 
 
 def _scrape_matches(league: str, season: str):
@@ -611,43 +737,59 @@ def collect_match_history() -> dict[str, int]:
         return totals
 
     print("=" * 70)
-    print("[matches] Collecting match history from football-data.co.uk")
+    print("[matches] Collecting match history from football-data.co.uk and "
+          "football-data.org (BSA)")
     print(f"[matches] Leagues: {', '.join(LEAGUES)}")
-    print(f"[matches] Seasons: {', '.join(SEASONS)}")
+    print(f"[matches] Cross-year seasons: {', '.join(SEASONS)}")
     print("=" * 70)
 
     _register_extra_leagues_with_soccerdata()
 
-    for league, season in itertools.product(LEAGUES, SEASONS):
-        extra_cfg = EXTRA_CSV_LEAGUES.get(league)
-        if extra_cfg is not None:
-            frame = _load_extra_matches(league, extra_cfg, season)
-        else:
-            frame = _scrape_matches(league, season)
-        if frame is None:
-            totals["failed"] += 1
+    for league in LEAGUES:
+        seasons = get_seasons_for_league(league)
+        api_key = os.getenv("FOOTBALL_DATA_API_KEY", "").strip()
+        if league == BRA_LEAGUE and not api_key:
+            print("[matches] WARNING: FOOTBALL_DATA_API_KEY is not set; "
+                  "skipping Brazilian match collection")
+            totals["failed"] += len(seasons)
             continue
+        # Current season first: a plan that denies older seasons can still
+        # collect the most useful matches even if its historical calls fail.
+        if league == BRA_LEAGUE:
+            seasons = list(reversed(seasons))
 
-        try:
-            rows = _build_match_rows(frame, league, season)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[matches] WARNING: could not parse {league} {season}: {exc}")
-            totals["failed"] += 1
-            continue
+        for season in seasons:
+            extra_cfg = EXTRA_CSV_LEAGUES.get(league)
+            if league == BRA_LEAGUE:
+                frame = _load_brazilian_matches(season, api_key)
+            elif extra_cfg is not None:
+                frame = _load_extra_matches(league, extra_cfg, season)
+            else:
+                frame = _scrape_matches(league, season)
+            if frame is None:
+                totals["failed"] += 1
+                continue
 
-        try:
-            inserted, skipped = _upsert_matches(rows)
-        except Exception as exc:  # noqa: BLE001 - keep collecting other seasons
-            print(f"[matches] WARNING: could not store {league} {season}: {exc}")
-            totals["failed"] += 1
-            continue
+            try:
+                rows = _build_match_rows(frame, league, season)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[matches] WARNING: could not parse {league} {season}: {exc}")
+                totals["failed"] += 1
+                continue
 
-        totals["inserted"] += inserted
-        totals["skipped"] += skipped
-        print(
-            f"[matches] {league} {season}: {len(rows)} scraped -> "
-            f"{inserted} inserted, {skipped} skipped"
-        )
+            try:
+                inserted, skipped = _upsert_matches(rows)
+            except Exception as exc:  # noqa: BLE001 - keep collecting other seasons
+                print(f"[matches] WARNING: could not store {league} {season}: {exc}")
+                totals["failed"] += 1
+                continue
+
+            totals["inserted"] += inserted
+            totals["skipped"] += skipped
+            print(
+                f"[matches] {league} {season}: {len(rows)} scraped -> "
+                f"{inserted} inserted, {skipped} skipped"
+            )
 
     print(
         f"[matches] Done: {totals['inserted']} inserted, "

@@ -21,6 +21,7 @@ from sklearn.preprocessing import LabelEncoder
 from sqlalchemy import inspect, text
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from data.league_config import CALENDAR_YEAR_LEAGUES, get_season_string  # noqa: F401
 from database import session_scope
 
 # The model input columns live in ONE module, shared with the trainer and the
@@ -816,7 +817,9 @@ def build_feature_row(
         # Meta (kept for chronological splitting later)
         "date":      before_date,
         "league":    row.get("league"),
-        "season":    row.get("season"),
+        # Metadata is normalized in memory, never by rewriting DB rows. The
+        # builder reads all matches/Elo rather than querying season snapshots.
+        "season":    get_season_string(row.get("league"), row.get("season")),
         "home_team": home_team,
         "away_team": away_team,
 

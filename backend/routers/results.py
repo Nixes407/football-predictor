@@ -58,6 +58,11 @@ def fetch_results(target_date: str) -> list[dict]:
                     continue
 
                 utc_date = match["utcDate"]
+                season_info = match.get("season")
+                season_start = (
+                    season_info.get("startDate")
+                    if isinstance(season_info, dict) else None
+                )
                 full_time = match["score"]["fullTime"]
                 home_score = full_time["home"]
                 away_score = full_time["away"]
@@ -79,7 +84,7 @@ def fetch_results(target_date: str) -> list[dict]:
                         "home_team": map_team_name(match["homeTeam"]["name"]),
                         "away_team": map_team_name(match["awayTeam"]["name"]),
                         "league": LEAGUE_MAP[code],
-                        "season": derive_season(utc_date),
+                        "season": derive_season(utc_date, LEAGUE_MAP[code], season_start),
                         "status": "finished",
                         "home_score": home_score,
                         "away_score": away_score,

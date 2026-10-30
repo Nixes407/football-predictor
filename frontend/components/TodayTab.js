@@ -1,22 +1,9 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { getApiBase } from '../lib/apiBase';
-
-const LEAGUE_FLAGS = {
-  'ENG-Premier League': '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
-  'ESP-La Liga': '🇪🇸',
-  'GER-Bundesliga': '🇩🇪',
-  'ITA-Serie A': '🇮🇹',
-  'FRA-Ligue 1': '🇫🇷',
-};
-
-const LEAGUE_NAMES = {
-  'ENG-Premier League': 'Premier League',
-  'ESP-La Liga': 'La Liga',
-  'GER-Bundesliga': 'Bundesliga',
-  'ITA-Serie A': 'Serie A',
-  'FRA-Ligue 1': 'Ligue 1',
-};
+import { canonicalLeague, LEAGUE_FLAGS, leagueFlag, leagueName } from '../lib/leagues';
+import { probabilityOverGoals } from '../lib/predictionMarkets';
+import FirstGoalSection from './FirstGoalSection';
 
 function getConfidence(homeWin, draw, awayWin) {
   const maxProb = Math.max(homeWin, draw, awayWin);
@@ -71,7 +58,7 @@ function AccaButtons({ match, prediction }) {
   const [toast, setToast] = useState('');
 
   function handleAdd(market, prob) {
-    const ok = addToAcca(match, market, prob, match.league);
+    const ok = addToAcca(match, market, prob, canonicalLeague(match.league));
     if (ok) {
       setToast(`✅ ${market} added!`);
       setTimeout(() => setToast(''), 2000);
@@ -168,12 +155,16 @@ function PredictionPanel({ fixture }) {
   ];
 
   const quickMarkets = [
-    { label: 'Over 2.5', probability: fixture.pred_over_2_5 },
-    { label: 'BTTS', probability: fixture.pred_btts },
     {
-      label: 'Corners Over 9.5',
-      probability: fixture.pred_corners_over_9_5,
+      label: 'Over 1.5',
+      probability: probabilityOverGoals(fixture.pred_home_goals, fixture.pred_away_goals, 1),
     },
+    { label: 'Over 2.5', probability: fixture.pred_over_2_5 },
+    {
+      label: 'Over 3.5',
+      probability: probabilityOverGoals(fixture.pred_home_goals, fixture.pred_away_goals, 3),
+    },
+    { label: 'BTTS', probability: fixture.pred_btts },
   ];
 
   return (
@@ -212,9 +203,9 @@ function PredictionPanel({ fixture }) {
 
       <section className="glass-card rounded-2xl p-4 sm:p-5">
         <h4 className="text-sm font-bold uppercase tracking-wider mb-3 text-gray-400">
-          Quick Markets
+          Goals
         </h4>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="grid grid-cols-2 gap-3">
           {quickMarkets.map((market) => (
             <div
               key={market.label}
@@ -228,6 +219,12 @@ function PredictionPanel({ fixture }) {
           ))}
         </div>
       </section>
+
+      <FirstGoalSection
+        homeTeam={fixture.home_team}
+        awayTeam={fixture.away_team}
+        firstGoal={fixture.first_goal}
+      />
     </div>
   );
 }
@@ -276,7 +273,7 @@ export default function TodayTab() {
   // Group fixtures by league, keeping a stable league order.
   const grouped = {};
   for (const fx of fixtures) {
-    const league = fx.league || 'Other';
+    const league = canonicalLeague(fx.league) || 'Other';
     if (!grouped[league]) grouped[league] = [];
     grouped[league].push(fx);
   }
@@ -336,7 +333,7 @@ export default function TodayTab() {
               No matches today across tracked leagues
             </p>
             <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
-              Premier League · La Liga · Bundesliga · Serie A · Ligue 1
+              Including Premier League, La Liga and Brazilian Série A
             </p>
           </div>
         </div>
@@ -350,9 +347,9 @@ export default function TodayTab() {
             {/* League header */}
             <div className="flex items-center justify-between mb-3">
               <h3 className="text-lg font-bold flex items-center gap-2">
-                <span>{LEAGUE_FLAGS[league] || '🌍'}</span>
+                <span>{leagueFlag(league) || '🌍'}</span>
                 <span className="gradient-text">
-                  {LEAGUE_NAMES[league] || league}
+                  {leagueName(league)}
                 </span>
               </h3>
               <span className="badge-low text-xs font-semibold px-3 py-1 rounded-full">

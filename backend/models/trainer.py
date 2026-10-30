@@ -53,6 +53,7 @@ from supabase import create_client
 from xgboost import XGBClassifier
 
 import model_artifacts as artifacts
+from data.league_config import BRA_LEAGUE, MIN_ROWS_PER_LEAGUE
 from features.feature_columns import (  # noqa: E402 - needs _BACKEND_DIR on sys.path
     BTTS_FEATURE_COLS,
     FEATURE_COLS,
@@ -88,8 +89,8 @@ TARGET_COL = "target_result"
 #: Leagues whose rows are used to train every model. ``features.csv`` can
 #: contain more (or fewer) rows than this list describes: ``train_all_models``
 #: filters to exactly these competitions before the chronological split.
-#: The Big Five plus the six leagues added when the training dataset was
-#: expanded (see backend/data/collector.py, which ingests them).
+#: The original 11 European leagues plus Brazilian Série A
+#: (see backend/data/collector.py, which ingests them).
 TRAINING_LEAGUES: list[str] = [
     "ENG-Premier League",
     "ESP-La Liga",
@@ -102,6 +103,7 @@ TRAINING_LEAGUES: list[str] = [
     "TUR-Süper Lig",
     "NOR-Eliteserien",
     "AUT-Bundesliga",
+    BRA_LEAGUE,
 ]
 
 #: Canonical spelling per known alias/variant of the league names above.
@@ -170,6 +172,18 @@ def canonical_league(name: object) -> str | None:
     return canonical_normalised.get(normalised)
 
 
+def _brazil_row_count(df: pd.DataFrame, *, require_target: bool = False) -> int:
+    """Count Brazilian rows, optionally only those eligible for result fitting."""
+    if df is None or df.empty or "league" not in df.columns:
+        return 0
+    mask = df["league"].map(canonical_league).eq(BRA_LEAGUE)
+    if require_target:
+        if TARGET_COL not in df.columns:
+            return 0
+        mask &= df[TARGET_COL].notna()
+    return int(mask.sum())
+
+
 def filter_training_leagues(
     df: pd.DataFrame,
     leagues: Sequence[str] | None = None,
@@ -199,6 +213,15 @@ def filter_training_leagues(
 
     canonical = df["league"].map(canonical_league)
     keep = canonical.isin(set(canon_to_wanted))
+
+    # The existing leagues keep their original behavior. A newly introduced
+    # BSA category is omitted until it has enough examples to be meaningful.
+    brazil_mask = canonical.eq(BRA_LEAGUE) & keep
+    brazil_rows = int(brazil_mask.sum())
+    if BRA_LEAGUE in canon_to_wanted and brazil_rows < MIN_ROWS_PER_LEAGUE:
+        print(f"[trainer] WARNING: {BRA_LEAGUE} has {brazil_rows} rows; "
+              f"skipping it until at least {MIN_ROWS_PER_LEAGUE} are available")
+        keep &= ~brazil_mask
 
     counts = df.loc[keep, "league"].value_counts()
     renamed = counts.copy()
@@ -569,6 +592,12 @@ def train_result_model(
     print("=" * 70)
     model_path = Path(model_dir) / "result_model_v1.joblib"
     model_path.parent.mkdir(parents=True, exist_ok=True)
+    # Persist proof that the final (train + validation) estimator actually
+    # saw Brazilian examples. A new league may otherwise be present only in
+    # the chronologically later test split, or only in the encoder/CSV.
+    final_pipeline.brazil_training_rows_ = _brazil_row_count(
+        pd.concat([train_df, val_df], ignore_index=True), require_target=True
+    )
     joblib.dump(final_pipeline, model_path)
     print(f"[trainer] Saved pipeline -> {model_path}")
 
@@ -1482,8 +1511,8 @@ def train_all_models(
     Test is evaluated exactly once per model.
 
     ``leagues`` restricts training to the given competitions
-    (default: :data:`TRAINING_LEAGUES` — the Big Five plus the six
-    expanded-coverage leagues). Filtering happens before the
+    (default: :data:`TRAINING_LEAGUES` — the existing 11 European leagues
+    plus Brazilian Série A). Filtering happens before the
     chronological split, so every split and metric below describes
     exactly the selected leagues.
 
@@ -1514,15 +1543,32 @@ def train_all_models(
         print("[trainer] ERROR: league filtering removed every row — check "
               "that the features CSV uses the expected league names.")
         return {}
+    train_df, val_df, test_df = chronological_split(df)
+    brazil_fit_rows = _brazil_row_count(
+        pd.concat([train_df, val_df], ignore_index=True), require_target=True
+    )
+    if _brazil_row_count(df) and brazil_fit_rows < MIN_ROWS_PER_LEAGUE:
+        # Do not leak later Brazilian results into an earlier global split just
+        # to make the new league trainable. If it is too thin in the final fit,
+        # remove only BSA and reproduce the original split for other leagues.
+        print(f"[trainer] WARNING: only {brazil_fit_rows} {BRA_LEAGUE} rows "
+              f"are in train+validation; need {MIN_ROWS_PER_LEAGUE}. "
+              "Skipping Brazil until enough pre-test results are available.")
+        df = df.loc[df["league"].map(canonical_league) != BRA_LEAGUE].reset_index(drop=True)
+        if df.empty:
+            print("[trainer] ERROR: no training rows remain after skipping Brazil")
+            return {}
+        train_df, val_df, test_df = chronological_split(df)
+        brazil_fit_rows = 0
+
     features_rows = len(df)
     print(f"[trainer] features_rows for this training run: {features_rows} "
           f"(of {rows_before_filter} loaded)")
 
-    train_df, val_df, test_df = chronological_split(df)
-
     results = {
         "_dataset": {
             "features_rows": features_rows,
+            "brazil_trainval_rows": brazil_fit_rows,
             "features_rows_all_leagues": rows_before_filter,
             "leagues": list(TRAINING_LEAGUES if leagues is None else leagues),
             "n_train": int(len(train_df)),
