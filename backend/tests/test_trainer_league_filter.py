@@ -17,21 +17,18 @@ from models import trainer
 
 
 class TrainingLeagueListTests(unittest.TestCase):
-    def test_list_is_the_documented_eleven(self):
+    def test_list_is_the_documented_twelve(self):
         self.assertEqual(trainer.TRAINING_LEAGUES, [
             "ENG-Premier League", "ESP-La Liga", "GER-Bundesliga",
             "ITA-Serie A", "FRA-Ligue 1", "ENG-Championship",
             "POR-Primeira Liga", "NED-Eredivisie", "TUR-Süper Lig",
-            "NOR-Eliteserien", "AUT-Bundesliga",
+            "NOR-Eliteserien", "AUT-Bundesliga", "BRA-Série A",
         ])
 
-    def test_big_five_regressions_stay_absent(self):
-        # BSA (Brazil) and the Jupiler Pro League must not sneak in.
+    def test_unrelated_leagues_stay_absent(self):
         joined = " ".join(trainer.TRAINING_LEAGUES).casefold()
-        self.assertNotIn("brasileir", joined)
-        self.assertNotIn("série a", joined.replace("ita-série a", ""))
         self.assertNotIn("jupiler", joined)
-        self.assertNotIn("BEL-", joined)
+        self.assertNotIn("bel-", joined)
 
 
 class CanonicalLeagueNameTests(unittest.TestCase):
@@ -67,7 +64,7 @@ class CanonicalLeagueNameTests(unittest.TestCase):
                          "GER-Bundesliga")
 
     def test_unrelated_leagues_return_none(self):
-        for name in ["BEL-Jupiler Pro League", "BRA-Série A", "USA-MLS",
+        for name in ["BEL-Jupiler Pro League", "USA-MLS",
                      "UEFA-Champions League", "", None, float("nan")]:
             self.assertIsNone(trainer.canonical_league(name))
 

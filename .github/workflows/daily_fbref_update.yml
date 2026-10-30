@@ -6,7 +6,7 @@ name: Daily Data Collection + Model Retrain
 #   GitHub Actions, ubuntu-latest, 7 GB RAM:
 #     [1/5] StatsBomb collector
 #     [2/5] FotMob collector (+ Understat backup)
-#     [3/5] Match collector (football-data.co.uk via soccerdata)
+#     [3/5] Match collector (football-data.co.uk; football-data.org for BSA)
 #     [5/5] builder.py -> features.csv (62 features), trainer.py -> 9 models
 #           -> upload every artifact to Supabase Storage bucket "models"
 #           (the 46 all-zero FBref snapshot features were removed from the ML
@@ -46,6 +46,8 @@ env:
   #                             the previous workflow already use.
   # PIPELINE_SECRET             shared secret for /predict/admin/reload-models
   # RENDER_BACKEND              https://football-predictor-kyk5.onrender.com
+  # FOOTBALL_DATA_API_KEY       optional for the rest of the pipeline, but
+  #                             required by the BSA match-history collector.
   # API_FOOTBALL_KEY            optional, legacy collector (free plan is
   #                             limited; the step never blocks the pipeline)
   # ───────────────────────────────────────────────────────────────────────────
@@ -134,26 +136,29 @@ jobs:
           echo "==> Understat backup complete"
 
       # ── [3/5] Match collector ─────────────────────────────────────────────
-      # football-data.co.uk historical results (all 11 TRAINING_LEAGUES).
+      # football-data.co.uk historical results (the original 11 leagues), plus
+      # football-data.org BSA results when FOOTBALL_DATA_API_KEY is configured.
       # Incremental: matches ON CONFLICT DO NOTHING. continue-on-error: true —
       # a partial scrape must not block training on the rows that are already
-      # in the database. Elo is NOT produced here any more: it is computed
-      # from these matches by the dedicated [4/5] step below, because the
-      # ClubElo scrape this step used to run stored zero rows whenever
-      # api.clubelo.com was unreachable or a team name did not resolve, and
-      # still exited 0.
+      # in the database. The collector also does a best-effort Elo replay;
+      # the separate required [4/5] step checks it again before training.
       - name: "[3/5] Run Match Collector"
         id: matches
         working-directory: backend
         continue-on-error: true
+        env:
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
         run: |
           # set +e: capture the exit code instead of letting `bash -e` abort the
           # step before the RC check below can log the warning.
           set +e
-          echo "==> [3/5] Collecting historical matches from football-data.co.uk..."
-          echo "    Leagues: ENG-Premier League, ESP-La Liga, GER-Bundesliga, ITA-Serie A, FRA-Ligue 1, ENG-Championship, POR-Primeira Liga, NED-Eredivisie, TUR-Süper Lig, NOR-Eliteserien, AUT-Bundesliga (11 leagues)"
-          echo "    Seasons: dynamic range 2021-2022 .. current season (season_range() from data/collector.py)"
+          echo "==> [3/5] Collecting historical matches from football-data.co.uk and BSA from football-data.org..."
+          echo "    Leagues: the existing 11 plus BRA-Série A (from data/collector.py)"
+          echo "    Seasons: 2021-2022 .. current European season; Brazil 2021 .. current year"
           echo "    Mode: incremental upsert — ON CONFLICT DO NOTHING (matches)"
+          if [ -z "${FOOTBALL_DATA_API_KEY:-}" ]; then
+            echo "::warning::FOOTBALL_DATA_API_KEY is missing; Brazilian match collection will be skipped."
+          fi
           python data/collector.py
           RC=$?
           if [ $RC -ne 0 ]; then
@@ -161,7 +166,7 @@ jobs:
             echo "         Existing matches are preserved; only missing league-seasons failed."
             exit 0
           fi
-          echo "==> Match collection complete (all 11 leagues, incremental)"
+          echo "==> Match collection complete (incremental; see per-league warnings above)"
 
       # Kept in case the API-Football account is restored. Non-blocking: the
       # free plan rejects 2025+ seasons and run_all() exits 1 in that case.

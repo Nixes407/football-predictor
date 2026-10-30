@@ -61,12 +61,11 @@ Rows are never written for a match whose outcome cannot be determined, and a
 rating is never written as ``None``/``NaN``: existing non-null values are only
 ever replaced by another real, finite rating.
 
-A replay does overwrite a rating that came from somewhere else (e.g. rows an
-old ClubElo run left behind). That is intentional: ``elo_difference`` is a
-model input, so every team's rating has to sit on one scale. ClubElo rates
-Liverpool ~2047 while a computed rating starts at 1500 — merging the two into
-one table would make the difference between two teams meaningless depending on
-which source happened to cover them.
+For the original leagues, a replay overwrites a rating that came from
+somewhere else (e.g. rows an old ClubElo run left behind), to keep ratings on
+one scale. For newly ingested BRA-Série A, existing non-null ratings/league
+values are preserved instead; this protects data already in the database but
+means a later historical backfill cannot revise those stored Brazilian ratings.
 """
 
 from __future__ import annotations
@@ -83,9 +82,10 @@ _BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from sqlalchemy import func, inspect, select  # noqa: E402
+from sqlalchemy import case, func, inspect, or_, select  # noqa: E402
 from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: E402
 
+from data.league_config import BRA_LEAGUE  # noqa: E402
 from database import EloRating, Match, engine, session_scope  # noqa: E402
 
 # --------------------------------------------------------------------------- #
@@ -378,7 +378,9 @@ def upsert_elo_rows(rows: Iterable[Mapping[str, Any]]) -> int:
     backends fall back to an equivalent per-row merge.
 
     Only finite, non-null ratings are written, so this can never blank an
-    existing value. Returns the number of rows sent to the database.
+    existing value. Brazilian conflicts additionally preserve existing non-null
+    values; the original leagues retain their established refresh behavior.
+    Returns the number of rows sent to the database.
     """
     payload: dict[tuple[str, date_type], dict[str, Any]] = {}
     for row in rows:
@@ -409,11 +411,23 @@ def upsert_elo_rows(rows: Iterable[Mapping[str, Any]]) -> int:
         if is_postgres:
             for chunk in _chunked(values):
                 statement = pg_insert(EloRating).values(list(chunk))
+                brazil_conflict = or_(
+                    EloRating.league == BRA_LEAGUE,
+                    statement.excluded.league == BRA_LEAGUE,
+                )
                 statement = statement.on_conflict_do_update(
                     index_elements=["team", "date"],
                     set_={
-                        "elo": statement.excluded.elo,
-                        "league": statement.excluded.league,
+                        "elo": case(
+                            (brazil_conflict, func.coalesce(
+                                EloRating.elo, statement.excluded.elo)),
+                            else_=statement.excluded.elo,
+                        ),
+                        "league": case(
+                            (brazil_conflict, func.coalesce(
+                                EloRating.league, statement.excluded.league)),
+                            else_=statement.excluded.league,
+                        ),
                     },
                 )
                 session.execute(statement)
@@ -429,6 +443,11 @@ def upsert_elo_rows(rows: Iterable[Mapping[str, Any]]) -> int:
                 )
                 if existing is None:
                     session.add(EloRating(**row))
+                elif existing.league == BRA_LEAGUE or row["league"] == BRA_LEAGUE:
+                    if existing.elo is None:
+                        existing.elo = row["elo"]
+                    if existing.league is None:
+                        existing.league = row["league"]
                 else:
                     existing.elo = row["elo"]
                     existing.league = row["league"]

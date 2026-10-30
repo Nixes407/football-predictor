@@ -101,6 +101,9 @@ if str(BACKEND_DIR) not in sys.path:
 # Shared bucket manifest — the trainer uploads exactly what this file lists.
 import model_artifacts as artifacts  # noqa: E402  (needs the sys.path above)
 import fbref_scrape_runner  # noqa: E402  (background StatsBomb->FBref aggregator on Render)
+from data.league_config import (  # noqa: E402
+    BRA_LEAGUE, CALENDAR_YEAR_LEAGUES, MIN_ROWS_PER_LEAGUE, get_season_string,
+)
 
 # Feature definitions and assembly. The column lists are the SAME objects the
 # trainer fits on (``features/feature_columns.py``), and the feature *values*
@@ -1223,6 +1226,28 @@ def get_teams(league: str = "") -> dict:
     return {"teams": all_teams}
 
 
+def _brazil_ml_ready(league: str, home: str, away: str, model, features) -> bool:
+    """Do not present an unseen Brazilian league/team as a trained prediction.
+
+    The encoder and CSV can contain BSA even when its matches all fall into
+    the held-out test split. The result-model artifact records how many BSA
+    rows were actually used by its final fit; old artifacts have no such proof.
+    """
+    if league != BRA_LEAGUE:
+        return True
+    try:
+        trained_rows = int(getattr(model, "brazil_training_rows_", 0))
+    except (TypeError, ValueError):
+        return False
+    if trained_rows < MIN_ROWS_PER_LEAGUE or features is None:
+        return False
+    if not {"league", "home_team", "away_team"}.issubset(features.columns):
+        return False
+    brazil = features.loc[features["league"] == BRA_LEAGUE]
+    teams = set(brazil["home_team"].dropna()) | set(brazil["away_team"].dropna())
+    return home in teams and away in teams
+
+
 def _blend_predictions(
     formula_result: dict[str, Any],
     ml_result: dict[str, Any],
@@ -1309,6 +1334,19 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
     Run all prediction models for a given fixture
     and return full market probabilities.
     """
+    if req.league in CALENDAR_YEAR_LEAGUES:
+        supplied = getattr(req, "model_fields_set", None)
+        if supplied is None:  # Pydantic 1 compatibility
+            supplied = getattr(req, "__fields_set__", set())
+        req.season = (
+            get_season_string(req.league, req.season)
+            if "season" in supplied
+            else str(datetime.now(timezone.utc).year)
+        )
+    brazil_ml_ready = _brazil_ml_ready(
+        req.league, req.home_team, req.away_team, _result_model, _features_df
+    )
+
     # 1. Try formula_v1 -> store result as formula_result (or None if unavailable/error)
     formula_result = None
     if _formula_engine_available and formula_predict:
@@ -1341,7 +1379,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
     ])
 
     ml_result = None
-    if models_ready and _features_df is not None:
+    if models_ready and _features_df is not None and brazil_ml_ready:
         try:
             # Encode league and season (unseen -> fallback 0)
             league_enc = _encode_label(_le_league, req.league)
@@ -1468,6 +1506,14 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         print(f"[predict] Using ml_only: "
               f"{req.home_team} vs {req.away_team}")
     else:
+        if not brazil_ml_ready and req.league == BRA_LEAGUE:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Brazilian Série A is not ready: collect enough finished "
+                    "matches for both teams and complete a model retrain."
+                ),
+            )
         if not models_ready:
             raise HTTPException(
                 status_code=503,
@@ -1496,7 +1542,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
     }[final_result["prediction_method"]]
 
     # Specialized classifiers override their specific fields AFTER blend
-    if _btts_model is not None and _features_df is not None:
+    if _btts_model is not None and _features_df is not None and brazil_ml_ready:
         try:
             league_enc_for_btts = _encode_label(_le_league, req.league)
             btts_prob = _get_btts_probability(
@@ -1510,7 +1556,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         except Exception as exc:
             print(f"[predict] WARNING: BTTS override failed: {exc}")
 
-    if _over25_model is not None and _features_df is not None:
+    if _over25_model is not None and _features_df is not None and brazil_ml_ready:
         try:
             league_enc_for_over25 = _encode_label(_le_league, req.league)
             over25_prob = _get_over25_probability(
@@ -1524,7 +1570,7 @@ def predict_match(req: MatchRequest) -> dict[str, Any]:
         except Exception as exc:
             print(f"[predict] WARNING: Over 2.5 override failed: {exc}")
 
-    if _over95_corners_model is not None and _features_df is not None:
+    if _over95_corners_model is not None and _features_df is not None and brazil_ml_ready:
         try:
             league_enc_for_corners = _encode_label(_le_league, req.league)
             corners95_prob = _get_over95_corners_probability(
